@@ -1,0 +1,15 @@
+[package]
+name = "tunnel-lattice"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to compose with the rest of the Lattice networking stack."
+readme = "README.md"
+
+[dependencies]

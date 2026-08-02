@@ -1,0 +1,24 @@
+version = 1
+SPDX-PackageName = "tunnel-lattice"
+SPDX-PackageSupplier = "Tunnel Lattice Contributors"
+SPDX-PackageDownloadLocation = "https://github.com/F000NKKK/tunnel-lattice"
+
+[[annotations]]
+path = "**"
+SPDX-FileCopyrightText = "Tunnel Lattice Contributors"
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = "LICENSE"
+SPDX-FileCopyrightText = "Tunnel Lattice Contributors"
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = [
+    "CHANGELOG.md",
+    "**.gitignore",
+    "**.gitattributes",
+    "**.editorconfig",
+]
+SPDX-FileCopyrightText = "Tunnel Lattice Contributors"
+SPDX-License-Identifier = "CC0-1.0"
