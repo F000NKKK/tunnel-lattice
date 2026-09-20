@@ -1,0 +1,23 @@
+[package]
+name = "tunnel-lattice-platform"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Generic provider traits and Capability contract between the model and platform backends. Depends only on tunnel-lattice-core — never on tunnel-lattice-model."
+readme = "README.md"
+
+[features]
+# No optional dependency needed: AsyncPacketIo uses `impl Future` directly,
+# so this crate stays runtime-agnostic even with the feature on (see
+# tunnel-lattice-async's README for where an actual Tokio dependency lives).
+async = []
+
+[dependencies]
+tunnel-lattice-core = { workspace = true }
+bitflags = { workspace = true }
