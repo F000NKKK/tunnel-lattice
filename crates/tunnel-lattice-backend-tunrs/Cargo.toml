@@ -1,0 +1,25 @@
+[package]
+name = "tunnel-lattice-backend-tunrs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "tun-rs-backed cross-platform TUN/TAP backend for Tunnel Lattice, implementing tunnel-lattice-platform's provider traits."
+readme = "README.md"
+
+[features]
+# NOT YET VERIFIED against tun-rs's actual published feature names/API —
+# see this crate's README, "Unverified against upstream." Adjust the
+# `tun-rs` feature name below once confirmed on docs.rs/crates.io.
+async = ["tunnel-lattice-platform/async", "tun-rs/async"]
+
+[dependencies]
+tunnel-lattice-core = { workspace = true }
+tunnel-lattice-model = { workspace = true }
+tunnel-lattice-platform = { workspace = true }
+tun-rs = { workspace = true }
