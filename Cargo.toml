@@ -12,3 +12,26 @@ documentation = "https://docs.rs/tunnel-lattice"
 authors = ["Tunnel Lattice Contributors", "F000NK"]
 categories = ["network-programming", "os"]
 keywords = ["cross-platform","rust","networking","tunnel","tun"]
+
+# Single source of truth for every internal crate's version + path, mirroring
+# net-lattice's workspace-dependency pattern (see ARCHITECTURE.md's API
+# Stability Rules for why each crate's version is independent).
+[workspace.dependencies]
+tunnel-lattice-core = { path = "crates/tunnel-lattice-core", version = "0.1.0" }
+tunnel-lattice-model = { path = "crates/tunnel-lattice-model", version = "0.1.0" }
+tunnel-lattice-platform = { path = "crates/tunnel-lattice-platform", version = "0.1.0" }
+tunnel-lattice-backend-tunrs = { path = "crates/tunnel-lattice-backend-tunrs", version = "0.1.0" }
+tunnel-lattice-async = { path = "crates/tunnel-lattice-async", version = "0.1.0" }
+tunnel-lattice = { path = "crates/tunnel-lattice", version = "0.1.0" }
+
+bitflags = "2"
+futures = "0.3"
+tokio = { version = "1", default-features = false }
+
+# Initial TUN/TAP backend (see ARCHITECTURE.md, "Backend replacement plan"):
+# tun-rs is itself cross-platform (Linux/Windows/macOS/*BSD/iOS/Android), so
+# tunnel-lattice-backend-tunrs is one shared crate rather than net-lattice's
+# per-OS split. Version pinned loosely; verify against docs.rs/crates.io
+# before bumping — its exact synchronous/async API surface was not
+# independently re-verified while drafting this workspace.
+tun-rs = { version = "2", default-features = false }

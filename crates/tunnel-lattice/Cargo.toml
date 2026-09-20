@@ -1,6 +1,6 @@
 [package]
 name = "tunnel-lattice"
-version = "0.0.0"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,4 +12,22 @@ keywords.workspace = true
 description = "Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to compose with the rest of the Lattice networking stack."
 readme = "README.md"
 
+[features]
+# Selects the tun-rs-backed implementation. This is a Cargo feature, not a
+# target_os cfg gate, deliberately: unlike net-lattice's per-OS backends
+# (mutually exclusive by construction), a future non-tun-rs backend is
+# meant to sit ALONGSIDE this one behind the same trait surface, so the
+# facade must be able to pick between them per build rather than always
+# picking whichever OS it's compiled for. See ARCHITECTURE.md, "Backend
+# replacement plan."
+tun-rs = ["dep:tunnel-lattice-backend-tunrs"]
+async = ["dep:tunnel-lattice-async", "tunnel-lattice-platform/async", "tunnel-lattice-backend-tunrs?/async"]
+
+default = ["tun-rs"]
+
 [dependencies]
+tunnel-lattice-core = { workspace = true }
+tunnel-lattice-model = { workspace = true }
+tunnel-lattice-platform = { workspace = true }
+tunnel-lattice-backend-tunrs = { workspace = true, optional = true }
+tunnel-lattice-async = { workspace = true, optional = true }
