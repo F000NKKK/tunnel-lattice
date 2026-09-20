@@ -4,13 +4,15 @@ Thank you for your interest in contributing to Tunnel Lattice.
 
 ## Project Status
 
-Tunnel Lattice is in the bootstrap stage: repository workflow, policies, and
-packaging scaffolding are in place, ported from
-[net-lattice](https://github.com/F000NKKK/net-lattice). No implementation code
-or public API exists yet. The most valuable contributions right now are:
+Tunnel Lattice has a working crate architecture (see
+[ARCHITECTURE.md](ARCHITECTURE.md)) but no published release yet — nothing in
+the public API is frozen. The most valuable contributions right now are:
 
-- Feedback on the project's vision, scope, and roadmap (see [README.md](README.md))
-- Discussion of API design and architecture for the first implementation stage
+- Feedback on the crate architecture and API shape (see
+  [ARCHITECTURE.md](ARCHITECTURE.md))
+- Verifying `tunnel-lattice-backend-tunrs`'s `tun-rs` usage on Windows and
+  macOS (developed and CI-checked so far without a native build on every
+  platform — see that crate's README)
 - Documentation and tooling improvements
 
 Please check open issues and discussions before starting significant work, to

@@ -1,13 +1,46 @@
 # Tunnel Lattice
 
-Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to compose with the rest of the Lattice networking stack.
+Кроссплатформенная Rust-библиотека для туннельных интерфейсов TUN/TAP,
+рассчитанная на совместную работу с остальным стеком Lattice.
 
 ## Статус
 
-**Стадия инициализации.** Репозиторий пока содержит только служебную
-инфраструктуру, политики и упаковку, перенесённые из
-[net-lattice](https://github.com/F000NKKK/net-lattice) — первого крейта
-экосистемы Lattice. Реализация ещё не начата, релизов не публиковалось.
+**Пререлиз, идёт активное проектирование/реализация.** Релиз ещё не
+опубликован (см. `SUPPORT.md`). В воркспейсе уже есть реальная архитектура
+крейтов — см. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md), — но ничего в ней
+не заморожено по API: любой тип, трейт и Cargo-фича могут измениться до
+выхода `0.1.0`.
+
+## Что делает библиотека
+
+- Создаёт и настраивает устройства TUN (сырой IP) и TAP (кадры Ethernet) на
+  Linux, Windows и macOS через крейт `tun-rs`;
+- Передаёт пакеты через открытое устройство: синхронно по умолчанию и, с
+  опциональной фичей `async`, через `futures::Stream` — асинхронный рантайм
+  подключается только при включении этой фичи;
+- Перечитывает и изменяет MTU и административное состояние открытого
+  устройства.
+
+Tunnel Lattice не назначает IP-адреса созданным интерфейсам — за настройку
+сети ОС после создания устройства отвечает `net-lattice` (см. ниже).
+
+## Быстрый старт
+
+```rust,no_run
+use tunnel_lattice::{DeviceConfig, DeviceKind, Result, Tunnel};
+
+fn main() -> Result<()> {
+    let tunnel = Tunnel::connect();
+    let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1500))?;
+    let mut buf = vec![0u8; 1500];
+    let len = device.recv(&mut buf)?;
+    println!("{len} bytes");
+    Ok(())
+}
+```
+
+Флаги фич и более полный обзор использования — в
+`crates/tunnel-lattice/README.md`.
 
 ## Экосистема Lattice
 
@@ -21,8 +54,9 @@ Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to compose w
 
 ## Участие в разработке
 
-См. [CONTRIBUTING.md](CONTRIBUTING.md). На этой стадии наиболее ценна обратная
-связь по объёму и направлению API.
+См. [CONTRIBUTING.md](CONTRIBUTING.md). На этой стадии наиболее ценна
+обратная связь по архитектуре крейтов и форме API в
+[ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
 
 ## Лицензия
 

@@ -27,6 +27,13 @@ informed as the issue is investigated and resolved.
 
 ## Scope
 
-Tunnel Lattice is in the bootstrap stage and has no implementation code yet, so there
-is no functional scope to report against. This file will be updated once the
-first release defines a supported surface.
+In scope: `tunnel-lattice-backend-tunrs`'s handling of untrusted packet data
+read from an open device, and any privilege-boundary bug in device creation
+or MTU/administrative-state mutation.
+
+Out of scope: `tun-rs` itself (report upstream), and any code path only
+reachable with attacker-controlled `Cargo.toml`/build configuration.
+
+No release has been published yet — see `SUPPORT.md` for current status.
+This file will be updated once a first release defines a supported version
+line.

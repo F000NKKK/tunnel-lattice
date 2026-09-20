@@ -1,14 +1,45 @@
 # Tunnel Lattice
 
-Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to compose with the rest of the Lattice networking stack.
+Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
+compose with the rest of the Lattice networking stack.
 
 ## Status
 
-**Bootstrap stage.** This repository currently contains repository workflow,
-policies, and packaging scaffolding ported from
-[net-lattice](https://github.com/F000NKKK/net-lattice), the first crate in the
-Lattice networking ecosystem. No implementation code has landed yet and no
-version has been published.
+**Pre-release, active design/implementation.** No version has been
+published yet (see `SUPPORT.md`). The workspace now has a real crate
+architecture — see [ARCHITECTURE.md](ARCHITECTURE.md) — but nothing in it is
+API-frozen; every type, trait, and feature flag may still change before
+`0.1.0` ships.
+
+## What it does
+
+- Creates and configures TUN (raw IP) and TAP (Ethernet-framed) devices on
+  Linux, Windows, and macOS through the `tun-rs` crate;
+- Transfers packets on an open device, synchronously by default and, with
+  the optional `async` feature, through a `futures::Stream` — no async
+  runtime is pulled in unless that feature is enabled;
+- Re-reads and patches an open device's MTU and administrative state.
+
+Tunnel Lattice does not assign IP addresses to the interfaces it creates —
+see `net-lattice` below for OS network configuration once a device exists.
+
+## Quick start
+
+```rust,no_run
+use tunnel_lattice::{DeviceConfig, DeviceKind, Result, Tunnel};
+
+fn main() -> Result<()> {
+    let tunnel = Tunnel::connect();
+    let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1500))?;
+    let mut buf = vec![0u8; 1500];
+    let len = device.recv(&mut buf)?;
+    println!("{len} bytes");
+    Ok(())
+}
+```
+
+See `crates/tunnel-lattice/README.md` for feature flags and a fuller usage
+walkthrough.
 
 ## The Lattice ecosystem
 
@@ -22,8 +53,9 @@ version has been published.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Feedback on scope and API direction is
-the most valuable contribution at this stage.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Feedback on the crate architecture
+and API shape in [ARCHITECTURE.md](ARCHITECTURE.md) is the most valuable
+contribution at this stage.
 
 ## License
 
