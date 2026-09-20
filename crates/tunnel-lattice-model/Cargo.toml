@@ -1,0 +1,16 @@
+[package]
+name = "tunnel-lattice-model"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Operating-system-independent TUN/TAP domain types for Tunnel Lattice. Models data and contracts; never inspects or mutates the host system."
+readme = "README.md"
+
+[dependencies]
+tunnel-lattice-core = { workspace = true }
