@@ -13,13 +13,22 @@ description = "tun-rs-backed cross-platform TUN/TAP backend for Tunnel Lattice, 
 readme = "README.md"
 
 [features]
-# NOT YET VERIFIED against tun-rs's actual published feature names/API —
-# see this crate's README, "Unverified against upstream." Adjust the
-# `tun-rs` feature name below once confirmed on docs.rs/crates.io.
-async = ["tunnel-lattice-platform/async", "tun-rs/async"]
+# Internal marker: "we have a tun_rs::AsyncDevice handle", turned on by
+# whichever concrete async runtime feature below is selected. Never enable
+# this directly.
+async = ["tunnel-lattice-platform/async", "dep:futures"]
+# `async-io`/`tokio` select tun-rs's own two mutually exclusive async
+# backends (verified in tun-rs 2.8.11's Cargo.toml: `async_io` = async-io +
+# `blocking`, no tokio dependency; `async_tokio` = tokio + `blocking`).
+# Enable exactly one — enabling both lets tun-rs's own cfg priority pick
+# `async_tokio` silently, which is confusing, so treat that combination as
+# unsupported even though Cargo itself won't reject it.
+async-io = ["async", "tun-rs/async_io"]
+tokio = ["async", "tun-rs/async_tokio"]
 
 [dependencies]
 tunnel-lattice-core = { workspace = true }
 tunnel-lattice-model = { workspace = true }
 tunnel-lattice-platform = { workspace = true }
 tun-rs = { workspace = true }
+futures = { workspace = true, optional = true }
