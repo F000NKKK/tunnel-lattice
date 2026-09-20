@@ -41,11 +41,22 @@ impl TunRsBackend {
 }
 
 /// An open `tun-rs` TUN/TAP device.
+///
+/// Holds exactly one underlying `tun-rs` handle, never both: `SyncDevice`
+/// has no `try_clone` on macOS/Windows (only on Linux), so this crate never
+/// clones a handle to keep a sync and an async view side by side. With the
+/// `async` feature, `handle` is a `tun_rs::AsyncDevice` built directly via
+/// `DeviceBuilder::build_async`; [`PacketIo`] is then implemented by
+/// blocking on the async methods (`futures::executor::block_on`).
+/// `SyncDevice`/`AsyncDevice` both deref to the same `tun_rs::DeviceImpl`,
+/// so device metadata (name/mtu/if_index/enabled) reads identically either
+/// way.
 pub struct TunRsDevice {
     kind: DeviceKind,
-    sync: tun_rs::SyncDevice,
     #[cfg(feature = "async")]
-    async_device: tun_rs::AsyncDevice,
+    handle: tun_rs::AsyncDevice,
+    #[cfg(not(feature = "async"))]
+    handle: tun_rs::SyncDevice,
 }
 
 fn io_error(err: std::io::Error) -> Error {
@@ -89,40 +100,50 @@ impl DeviceProvider for TunRsBackend {
             builder = builder.mtu(mtu);
         }
 
-        let sync = builder.build_sync().map_err(io_error)?;
         #[cfg(feature = "async")]
-        let async_device = {
-            let cloned = sync.try_clone().map_err(io_error)?;
-            tun_rs::AsyncDevice::new(cloned).map_err(io_error)?
-        };
+        let handle = builder.build_async().map_err(io_error)?;
+        #[cfg(not(feature = "async"))]
+        let handle = builder.build_sync().map_err(io_error)?;
 
         Ok(TunRsDevice {
             kind: config.kind,
-            sync,
-            #[cfg(feature = "async")]
-            async_device,
+            handle,
         })
     }
 }
 
 impl PacketIo for TunRsDevice {
     fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        self.sync.recv(buf).map_err(io_error)
+        #[cfg(feature = "async")]
+        {
+            futures::executor::block_on(self.handle.recv(buf)).map_err(io_error)
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            self.handle.recv(buf).map_err(io_error)
+        }
     }
 
     fn send(&self, buf: &[u8]) -> Result<usize> {
-        self.sync.send(buf).map_err(io_error)
+        #[cfg(feature = "async")]
+        {
+            futures::executor::block_on(self.handle.send(buf)).map_err(io_error)
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            self.handle.send(buf).map_err(io_error)
+        }
     }
 }
 
 #[cfg(feature = "async")]
 impl AsyncPacketIo for TunRsDevice {
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        self.async_device.recv(buf).await.map_err(io_error)
+        self.handle.recv(buf).await.map_err(io_error)
     }
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
-        self.async_device.send(buf).await.map_err(io_error)
+        self.handle.send(buf).await.map_err(io_error)
     }
 }
 
