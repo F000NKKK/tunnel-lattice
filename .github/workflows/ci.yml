@@ -1,10 +1,12 @@
 name: CI
 
-# Bootstrap-stage CI: this repository has no platform-specific backend
-# code yet, so this runs plain fmt/clippy/check/test/doc across the three
-# platforms the Tunnel Lattice ecosystem targets. Widen this workflow (coverage,
-# privileged jobs, per-crate matrices) once real platform code lands —
-# see net-lattice's .github/workflows/ci.yml for the pattern to grow into.
+# Runs fmt/clippy/check/test/doc across the three platforms tunnel-lattice
+# targets, on GitHub's native runners for each OS — not cross-compiled — so
+# tun-rs and tunnel-lattice-backend-tunrs are actually compiled and tested
+# per platform, not just on Linux. Creating/opening a real TUN/TAP device
+# needs elevated privileges this job does not have, so ordinary tests here
+# cover construction/model logic; add a privileged job (see net-lattice's
+# `.github/workflows/ci.yml` for the pattern) once device-level tests land.
 
 on:
   push:

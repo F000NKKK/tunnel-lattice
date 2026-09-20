@@ -19,3 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Capability::NATIVE_ASYNC`) when available and falling back to
   `tunnel-lattice-async`'s thread-based adapter otherwise. No async runtime
   dependency is imposed when the feature is off.
+- `scripts/release.sh`/`scripts/gh_release.sh`, ported from `net-lattice`:
+  per-crate version bump/publish with dependency-ordered cascades, and
+  idempotent git tag/GitHub release backfill from crates.io state.
