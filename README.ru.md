@@ -1,5 +1,18 @@
 # Tunnel Lattice
 
+**Языки**
+
+🇺🇸 [English](README.md) | 🇷🇺 **Русский**
+
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
+[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
+[![CI](https://github.com/F000NKKK/tunnel-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/tunnel-lattice/actions/workflows/ci.yml)
+
+![Linux](https://img.shields.io/badge/Linux-in%20progress-yellow)
+![Windows](https://img.shields.io/badge/Windows-in%20progress-yellow)
+![macOS](https://img.shields.io/badge/macOS-in%20progress-yellow)
+
 Кроссплатформенная Rust-библиотека для туннельных интерфейсов TUN/TAP,
 рассчитанная на совместную работу с остальным стеком Lattice.
 
