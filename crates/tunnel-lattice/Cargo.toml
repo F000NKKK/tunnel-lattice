@@ -21,7 +21,21 @@ readme = "README.md"
 # picking whichever OS it's compiled for. See ARCHITECTURE.md, "Backend
 # replacement plan."
 tun-rs = ["dep:tunnel-lattice-backend-tunrs"]
-async = ["dep:tunnel-lattice-async", "tunnel-lattice-platform/async", "tunnel-lattice-backend-tunrs?/async"]
+# Two runtime choices, never both: `async-io` avoids a tokio dependency
+# entirely (tun-rs's `async_io` feature, backed by the `async-io`/`blocking`
+# crates); `tokio` pulls tokio in through tun-rs's `async_tokio` feature.
+# Neither is in `default` — the facade stays runtime-agnostic until a
+# caller opts in. See `tunnel-lattice-backend-tunrs/Cargo.toml`.
+async-io = [
+    "dep:tunnel-lattice-async",
+    "tunnel-lattice-platform/async",
+    "tunnel-lattice-backend-tunrs?/async-io",
+]
+tokio = [
+    "dep:tunnel-lattice-async",
+    "tunnel-lattice-platform/async",
+    "tunnel-lattice-backend-tunrs?/tokio",
+]
 
 default = ["tun-rs"]
 
