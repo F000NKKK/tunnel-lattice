@@ -151,14 +151,22 @@ impl DeviceObserver for TunRsDevice {
     type Device = Device;
 
     fn snapshot(&self) -> Result<Device> {
-        let id = DeviceId::new(u64::from(self.sync.if_index().map_err(io_error)?));
-        let name = self.sync.name().map_err(io_error)?;
-        let mtu = u32::from(self.sync.mtu().map_err(io_error)?);
-        let admin_state = if self.sync.is_running().map_err(io_error)? {
+        let id = DeviceId::new(u64::from(self.handle.if_index().map_err(io_error)?));
+        let name = self.handle.name().map_err(io_error)?;
+        let mtu = u32::from(self.handle.mtu().map_err(io_error)?);
+        // `is_running` (IFF_UP | IFF_RUNNING) is a Linux-only read on
+        // `tun_rs::DeviceImpl`; macOS/Windows/BSD only expose a write-only
+        // `enabled(bool)` setter, with no corresponding getter to read
+        // administrative state back. Report `Unknown` there rather than
+        // guessing from `enabled`'s absence.
+        #[cfg(target_os = "linux")]
+        let admin_state = if self.handle.is_running().map_err(io_error)? {
             AdminState::Up
         } else {
             AdminState::Down
         };
+        #[cfg(not(target_os = "linux"))]
+        let admin_state = AdminState::Unknown;
 
         Ok(Device::new(id, name, self.kind, mtu, admin_state))
     }
@@ -170,12 +178,12 @@ impl DeviceMutator for TunRsDevice {
     fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()> {
         if let Some(mtu) = patch.mtu() {
             let mtu = u16::try_from(mtu).map_err(|_| Error::InvalidState)?;
-            self.sync.set_mtu(mtu).map_err(io_error)?;
+            self.handle.set_mtu(mtu).map_err(io_error)?;
         }
         if let Some(admin_state) = patch.admin_state() {
             use tunnel_lattice_model::DesiredAdminState;
             let enable = matches!(admin_state, DesiredAdminState::Up);
-            self.sync.enabled(enable).map_err(io_error)?;
+            self.handle.enabled(enable).map_err(io_error)?;
         }
         Ok(())
     }
