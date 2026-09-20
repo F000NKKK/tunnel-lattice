@@ -20,9 +20,10 @@ async = ["tunnel-lattice-platform/async", "dep:futures"]
 # `async-io`/`tokio` select tun-rs's own two mutually exclusive async
 # backends (verified in tun-rs 2.8.11's Cargo.toml: `async_io` = async-io +
 # `blocking`, no tokio dependency; `async_tokio` = tokio + `blocking`).
-# Enable exactly one — enabling both lets tun-rs's own cfg priority pick
-# `async_tokio` silently, which is confusing, so treat that combination as
-# unsupported even though Cargo itself won't reject it.
+# Enable exactly one — tun-rs itself hard-errors
+# ("More than one asynchronous runtime is simultaneously specified in
+# features") if both are active in the same build, so `--all-features` is
+# not a valid way to build this crate; test each feature set separately.
 async-io = ["async", "tun-rs/async_io"]
 tokio = ["async", "tun-rs/async_tokio"]
 
