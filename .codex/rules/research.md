@@ -9,7 +9,10 @@
 - Check prior evidence recorded as comments on the active YouTrack Epic/
   Story/Task via the REST API before re-deriving it; see
   `rules/youtrack.md`.
-- Inspect all three backend implementations before claiming platform parity.
+- Test/inspect Linux, Windows, and macOS behavior separately before claiming
+  platform parity, even while there is only one backend crate
+  (`tunnel-lattice-backend-tunrs`) — see `ARCHITECTURE.md`, "Backend
+  replacement plan."
 - Separate compile-time provider contracts, runtime capabilities, native
   privilege requirements, and eventual event delivery in findings.
 - Cite exact paths and symbols in audit reports; avoid unsupported assumptions.

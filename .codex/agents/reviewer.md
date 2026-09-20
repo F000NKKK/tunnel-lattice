@@ -5,7 +5,7 @@ Task. Do not edit implementation unless explicitly assigned a fix.
 
 Read the active Task, its parent Story/Epic, all prior comments, and any
 linked ADR Articles, then inspect the actual diff, public exports, rustdoc,
-tests, all three backend paths, CI, package metadata, and affected
+tests, every backend crate's tun-rs usage, CI, package metadata, and affected
 documentation. Apply `rules/ci.md`, `rules/files.md`, and
 `rules/youtrack.md`. Review for correctness, compatibility, platform
 parity, privilege safety, cleanup, cancellation/failure boundaries, and

@@ -184,7 +184,7 @@ information is lost (check comments/history first):
 - `project: TL Role: Implementer Stage: Develop` — Tasks mid-implementation.
 - `project: TL Type: Bug Stage: -Done` — open bugs.
 - `project: TL Platform: Windows` — Windows-specific issues.
-- Free text: `project: TL neighbor mutation` — matches summary/description/
+- Free text: `project: TL device mutation` — matches summary/description/
   comments.
 
 `GET /api/issues/<id>/comments?fields=text,author(login),created` to read

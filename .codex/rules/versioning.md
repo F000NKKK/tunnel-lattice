@@ -1,19 +1,21 @@
 # Release and versioning rules
 
-- One roadmap Sprint maps to one release version. Sprint `0.18` ships as
-  crate version `0.18.x`, Sprint `0.19` ships as `0.19.x`, and so on. The
+- One roadmap Sprint maps to one release version. Sprint `0.1` ships as
+  crate version `0.1.x`, Sprint `0.2` ships as `0.2.x`, and so on. The
   YouTrack `Sprint` custom field and the crate's SemVer minor version march
   together pre-1.0 — do not invent a different mapping when filing or
   scoping issues.
-- Tunnel Lattice's Stage 0.21 compatibility audit (`ARCHITECTURE.md`'s roadmap
-  gate for 1.0) is complete — the public-API freeze, `Addition` tier
-  (ADR-0014), `Error` `#[non_exhaustive]` (ADR-0015), and full rustdoc
-  coverage are all done. The path to `1.0.0` is closed; publication is a
-  user-invoked release-script action, not further roadmap work. Before this
-  point, a Sprint's release was allowed to change the public API
-  meaningfully as normal roadmap evolution, provided the change was recorded
-  in an ADR (see `rules/youtrack.md`'s ADR section) and in `CHANGELOG.md`; a
-  pre-1.0 minor bump was never a compatibility guarantee.
+- Tunnel Lattice has not reached `1.0.0` and has no compatibility-audit gate
+  defined yet — nothing in this workspace is API-frozen (see
+  `ARCHITECTURE.md`, "Frozen public API surface"). Before `1.0.0`, a Sprint's
+  release is allowed to change the public API meaningfully as normal roadmap
+  evolution, provided the change is recorded in an ADR (see
+  `rules/youtrack.md`'s ADR section) and in `CHANGELOG.md`; a
+  pre-1.0 minor bump is never a compatibility guarantee. Mirror
+  `net-lattice`'s own `versioning.md` (in the sibling Lattice ecosystem) for
+  what the eventual path-to-1.0 gate should look like once this project is
+  mature enough to define one — do not invent a `1.0` gate here until the
+  user asks for one.
 - Once a crate reaches `1.0.0`, this changes: within one major version
   (`1.x`, `2.x`, ...), the public API must not change in a breaking way —
   ordinary SemVer discipline applies (new public items are additive minor
@@ -34,6 +36,6 @@
   comment instead of guessing at or editing the number.
 - When a crate's version does change (by the user), `CHANGELOG.md`,
   `SECURITY.md`'s supported-version table, and `SUPPORT.md`'s project-status
-  summary must be reviewed together per `rules/files.md` — a stale "current
-  supported line" statement in `SECURITY.md` or `SUPPORT.md` is exactly the
-  kind of drift this rule exists to prevent.
+  summary must be reviewed together per `rules/files.md` — a stale
+  "current supported line" statement in `SECURITY.md` or `SUPPORT.md` is
+  exactly the kind of drift this rule exists to prevent.
