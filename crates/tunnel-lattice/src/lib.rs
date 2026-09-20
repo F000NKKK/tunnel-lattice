@@ -29,11 +29,16 @@
 //!   Cargo feature rather than a `target_os` cfg gate so a future
 //!   alternative backend can sit alongside it instead of replacing it — see
 //!   the workspace `ARCHITECTURE.md`, "Backend replacement plan."
-//! - `async`: adds [`Handle::packet_stream`], a `futures::Stream` of
-//!   received packets. Uses a backend's native async I/O path when it
-//!   reports `Capability::NATIVE_ASYNC`; otherwise falls back to
+//! - `async-io`/`tokio`: mutually exclusive, matching `tun-rs`'s own two
+//!   async backends (enabling both is a compile error). Either one adds
+//!   `Handle::packet_stream`, a `futures::Stream` of received packets. Uses
+//!   a backend's native async I/O path when it reports
+//!   `Capability::NATIVE_ASYNC`; otherwise falls back to
 //!   `tunnel-lattice-async`'s thread-based adapter. No async runtime is
-//!   forced on a caller that does not enable this feature.
+//!   forced on a caller that enables neither feature. `packet_stream` is
+//!   referenced here as plain text, not an intra-doc link, because it only
+//!   exists under these features and this crate's default `cargo doc`
+//!   build (no features beyond `tun-rs`) cannot resolve it.
 
 #![warn(missing_docs)]
 
@@ -88,9 +93,10 @@ impl Tunnel<tunnel_lattice_backend_tunrs::TunRsBackend> {
 /// An open TUN/TAP device.
 ///
 /// Wraps the backend's device handle in an `Arc` unconditionally (not only
-/// under the `async` feature) so [`Handle::packet_stream`] can share it with
-/// a background worker thread without a separate wrapping step at the call
-/// site.
+/// under the `async-io`/`tokio` features) so `Handle::packet_stream` can
+/// share it with a background worker thread without a separate wrapping
+/// step at the call site. Referenced as plain text, not an intra-doc link,
+/// for the same reason as the crate-level docs above.
 pub struct Handle<D> {
     device: std::sync::Arc<D>,
 }
