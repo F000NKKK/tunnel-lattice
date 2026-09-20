@@ -21,12 +21,24 @@ env:
 
 jobs:
   ci:
-    name: ci (${{ matrix.os }})
+    name: ci (${{ matrix.os }}, ${{ matrix.features.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # tun-rs hard-errors ("More than one asynchronous runtime is
+        # simultaneously specified in features") if its async-io and tokio
+        # backends are both enabled at once, so `--all-features` is not a
+        # valid way to build this workspace. Exercise the three supported,
+        # mutually exclusive feature sets instead.
+        features:
+          - name: default
+            flags: ""
+          - name: async-io
+            flags: "--no-default-features --features tunnel-lattice/tun-rs,tunnel-lattice/async-io"
+          - name: tokio
+            flags: "--no-default-features --features tunnel-lattice/tun-rs,tunnel-lattice/tokio"
     steps:
       - uses: actions/checkout@v7
 
@@ -36,18 +48,21 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.features.name }}
 
       - name: cargo fmt --check
         run: cargo fmt --check
+        if: matrix.features.name == 'default'
 
-      - name: cargo clippy --workspace --all-targets --all-features -- -D warnings
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets ${{ matrix.features.flags }} -- -D warnings
 
-      - name: cargo check --workspace --all-features
-        run: cargo check --workspace --all-features
+      - name: cargo check --workspace
+        run: cargo check --workspace ${{ matrix.features.flags }}
 
-      - name: cargo test --workspace --all-features
-        run: cargo test --workspace --all-features
+      - name: cargo test --workspace
+        run: cargo test --workspace ${{ matrix.features.flags }}
 
-      - name: cargo doc --no-deps --workspace --all-features
-        run: cargo doc --no-deps --workspace --all-features
+      - name: cargo doc --no-deps --workspace
+        run: cargo doc --no-deps --workspace ${{ matrix.features.flags }}
