@@ -1,0 +1,19 @@
+[package]
+name = "tunnel-lattice-async"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Runtime-agnostic futures Stream/Sink adapter over a synchronous PacketIo device, for backends with no native async path."
+readme = "README.md"
+
+[dependencies]
+tunnel-lattice-core = { workspace = true }
+tunnel-lattice-platform = { workspace = true, features = ["async"] }
+
+futures = { workspace = true }
