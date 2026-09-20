@@ -7,12 +7,13 @@ implementation task.
 
 ## Project context
 
-Tunnel Lattice is a Rust workspace with independent crates for core errors and
-IDs, IP types, domain models, generic platform traits, Linux/Windows/macOS
-backends, a runtime-independent async adapter, and the public facade. Treat
-`index.md`, the architecture documents, and the active YouTrack Epic/Task as
-the source of current release and roadmap facts; never hardcode a
-remembered stage.
+Tunnel Lattice is a Rust workspace with independent crates for core errors
+and IDs, TUN/TAP domain models, generic platform traits, a `tun-rs`-backed
+device backend (one shared crate today — see `ARCHITECTURE.md`, "Backend
+replacement plan," for why, unlike `net-lattice`'s per-OS backend split), a
+runtime-independent async adapter, and the public facade. Treat `index.md`,
+the architecture documents, and the active YouTrack Epic/Task as the source
+of current release and roadmap facts; never hardcode a remembered stage.
 
 Read first:
 

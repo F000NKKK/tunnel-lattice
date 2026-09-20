@@ -4,7 +4,9 @@ This directory contains reusable repository workflow, not the state of one
 roadmap stage. Task-specific plans, evidence, and decisions live in the
 YouTrack project `TL` (https://hush.youtrack.cloud/projects/TL), reached via
 the YouTrack REST API — see `rules/youtrack.md`. The former file-based
-`.ai/<task-name>/` workspace is retired.
+`.ai/<task-name>/` workspace is retired. **The `TL` project does not exist
+yet**; this workflow documents the convention to follow once the user
+creates it.
 
 ## Load order
 
