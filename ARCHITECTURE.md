@@ -107,8 +107,24 @@ non-blocking I/O (an async-registered file descriptor, overlapped I/O, ...).
 `tun_rs::AsyncDevice` handle (built via `DeviceBuilder::build_async`, not
 cloned from a separate sync handle — `tun_rs::SyncDevice::try_clone` only
 exists on Linux) and reports `Capability::NATIVE_ASYNC`; its blocking
-`PacketIo` impl then blocks on the same async methods
-(`futures::executor::block_on`) rather than keeping a second handle.
+`PacketIo` impl then blocks on the same async methods rather than keeping a
+second handle — but *how* it blocks differs by which of the two mutually
+exclusive async backends is active, and the difference matters:
+`async-io`'s `AsyncDevice` (built on the runtime-agnostic `async-io`/
+`blocking` crates) is blocked on with `futures::executor::block_on`, while
+`tokio`'s must instead go through `tokio::runtime::Handle::current().
+block_on` — `futures::executor::block_on` never polls Tokio's own I/O
+driver, so a Tokio-backed `recv`/`send` would otherwise hang forever waiting
+for a readiness notification the driver never delivers. This was found and
+fixed by an isolated repro against `tun-rs` directly (confirmed with a real
+device under `CAP_NET_ADMIN`: `send()` deadlocked past a 10-second timeout
+before the fix, completed immediately after). It also means the `tokio`
+feature requires a **multi-threaded** Tokio runtime on the calling thread —
+`Handle::block_on` only drives that runtime's I/O reactor on the
+`multi_thread` flavor; on `current_thread`, only `Runtime::block_on` (called
+on the owned value, not a `Handle`) does, so a `current_thread` runtime
+reproduces the same hang. See `tunnel-lattice-backend-tunrs`'s README,
+"`tokio` requires a multi-threaded runtime."
 
 `tunnel-lattice-async` provides a fallback for a backend with no native async
 path: `from_device` spawns one blocking worker thread per device bridging
