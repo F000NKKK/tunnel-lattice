@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-Tunnel Lattice has not published a release yet. There is no supported version line;
-security fixes will target the latest development state on `main` until a
-first release ships.
+Only the latest published `0.x` release is supported. Pre-1.0, a new minor
+release may include breaking changes (see `versioning.md`); security fixes
+target the latest release and `main`, not older `0.x` versions.
 
 ## Reporting a Vulnerability
 
