@@ -49,6 +49,28 @@ pub use tunnel_lattice_model::{
 pub use tunnel_lattice_platform::{Capability, CapabilityProvider};
 use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
 
+/// An open device handle bound to this facade's concrete model types.
+///
+/// A single named bound for what `Tunnel::open` accepts and `Handle` wraps,
+/// instead of repeating the same four-trait list on both `impl` blocks —
+/// blanket-implemented for every type that satisfies it, so no backend ever
+/// implements this trait by name.
+pub trait ConnectedDevice:
+    PacketIo
+    + DeviceObserver<Device = Device>
+    + DeviceMutator<DeviceConfigPatch = DeviceConfigPatch>
+    + CapabilityProvider
+{
+}
+
+impl<T> ConnectedDevice for T where
+    T: PacketIo
+        + DeviceObserver<Device = Device>
+        + DeviceMutator<DeviceConfigPatch = DeviceConfigPatch>
+        + CapabilityProvider
+{
+}
+
 /// A connected backend for creating and operating TUN/TAP devices.
 ///
 /// Generic over the backend the same way `net_lattice::Lattice<Backend>`
@@ -62,10 +84,7 @@ pub struct Tunnel<B> {
 impl<B> Tunnel<B>
 where
     B: DeviceProvider<DeviceConfig = DeviceConfig>,
-    B::Device: PacketIo
-        + DeviceObserver<Device = Device>
-        + DeviceMutator<DeviceConfigPatch = DeviceConfigPatch>
-        + CapabilityProvider,
+    B::Device: ConnectedDevice,
 {
     /// Opens a new device matching `config`.
     pub fn open(&self, config: DeviceConfig) -> Result<Handle<B::Device>> {
@@ -103,10 +122,7 @@ pub struct Handle<D> {
 
 impl<D> Handle<D>
 where
-    D: PacketIo
-        + DeviceObserver<Device = Device>
-        + DeviceMutator<DeviceConfigPatch = DeviceConfigPatch>
-        + CapabilityProvider,
+    D: ConnectedDevice,
 {
     /// Reads one packet into `buf`, returning the number of bytes written.
     pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {

@@ -191,12 +191,14 @@ impl DeviceMutator for TunRsDevice {
 
 impl CapabilityProvider for TunRsDevice {
     fn capabilities(&self) -> Capability {
-        #[allow(unused_mut)]
-        let mut caps = Capability::DEVICE_MUTATION | Capability::TAP_DEVICES;
+        let base = Capability::DEVICE_MUTATION | Capability::TAP_DEVICES;
         #[cfg(feature = "async")]
         {
-            caps |= Capability::NATIVE_ASYNC;
+            base | Capability::NATIVE_ASYNC
         }
-        caps
+        #[cfg(not(feature = "async"))]
+        {
+            base
+        }
     }
 }

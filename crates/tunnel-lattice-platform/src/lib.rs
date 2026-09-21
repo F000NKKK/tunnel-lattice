@@ -21,18 +21,18 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "async")]
+mod async_packet_io;
 mod capability;
 mod device_mutator;
 mod device_observer;
 mod device_provider;
 mod packet_io;
-#[cfg(feature = "async")]
-mod tokio_packet_io;
 
+#[cfg(feature = "async")]
+pub use async_packet_io::AsyncPacketIo;
 pub use capability::{Capability, CapabilityProvider};
 pub use device_mutator::DeviceMutator;
 pub use device_observer::DeviceObserver;
 pub use device_provider::DeviceProvider;
 pub use packet_io::PacketIo;
-#[cfg(feature = "async")]
-pub use tokio_packet_io::AsyncPacketIo;
