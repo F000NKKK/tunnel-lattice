@@ -24,6 +24,8 @@ use tunnel_lattice_platform::AsyncPacketIo;
 use tunnel_lattice_platform::{
     Capability, CapabilityProvider, DeviceMutator, DeviceObserver, DeviceProvider, PacketIo,
 };
+#[cfg(target_os = "linux")]
+use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 
 /// The `tun-rs`-backed implementation of Tunnel Lattice's provider traits.
 ///
@@ -60,6 +62,17 @@ pub struct TunRsDevice {
 }
 
 fn io_error(err: std::io::Error) -> Error {
+    // `tun-rs` reports operations that are semantically unsupported by the
+    // current device configuration (e.g. cloning a queue on a device that
+    // wasn't opened with multi-queue) as `io::ErrorKind::Unsupported` with
+    // no raw OS error code — `Error::Platform(..(0))` would be as
+    // unhelpful here as the wintun.dll-missing case was for a genuinely
+    // OS-level failure (see this crate's README). `ErrorKind::Unsupported`
+    // is a portable Rust-level signal, not an OS one, so it maps directly
+    // onto our own `Error::Unsupported` instead.
+    if err.kind() == std::io::ErrorKind::Unsupported {
+        return Error::Unsupported;
+    }
     #[cfg(target_os = "linux")]
     {
         Error::Platform(PlatformErrorCode::Linux(err.raw_os_error().unwrap_or(0)))
@@ -92,6 +105,15 @@ impl DeviceProvider for TunRsBackend {
             _ => return Err(Error::Unsupported),
         };
         let mut builder = tun_rs::DeviceBuilder::new().layer(layer);
+        // `DeviceBuilder::multi_queue` only exists on Linux in `tun-rs`
+        // itself (not merely a no-op elsewhere) — `IFF_MULTI_QUEUE` has no
+        // equivalent concept on macOS/Windows, so there is nothing to call
+        // there. `DeviceConfig::multi_queue`'s own docs already say the
+        // request is ignored off Linux; this is that ignoring.
+        #[cfg(target_os = "linux")]
+        {
+            builder = builder.multi_queue(config.multi_queue);
+        }
         if let Some(name) = config.name {
             builder = builder.name(name);
         }
@@ -233,9 +255,29 @@ impl DeviceMutator for TunRsDevice {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl PersistentDevice for TunRsDevice {
+    fn persist(&self) -> Result<()> {
+        self.handle.persist().map_err(io_error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MultiQueueProvider for TunRsDevice {
+    fn additional_queue(&self) -> Result<Self> {
+        let handle = self.handle.try_clone().map_err(io_error)?;
+        Ok(TunRsDevice {
+            kind: self.kind,
+            handle,
+        })
+    }
+}
+
 impl CapabilityProvider for TunRsDevice {
     fn capabilities(&self) -> Capability {
         let base = Capability::DEVICE_MUTATION | Capability::TAP_DEVICES;
+        #[cfg(target_os = "linux")]
+        let base = base | Capability::PERSISTENT_DEVICES | Capability::MULTI_QUEUE;
         #[cfg(feature = "async")]
         {
             base | Capability::NATIVE_ASYNC
@@ -398,5 +440,92 @@ mod privileged_tests {
             result.is_ok() || matches!(result, Err(Error::Platform(_))),
             "send on a freshly opened device should succeed or report a platform error, not panic: {result:?}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn persist_marks_a_real_device_persistent() {
+        use tunnel_lattice_platform::PersistentDevice;
+
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a TUN device");
+
+        // `persist()` succeeding is the whole observable contract here —
+        // `tun-rs` exposes no getter to read the persistent flag back, and
+        // actually leaving a persistent interface behind after this test
+        // process exits would violate this crate's own privileged-test
+        // convention of never touching state outside what the test itself
+        // owns and tears down (see `privileged_tests`'s module docs). A
+        // real end-to-end "survives process exit" check belongs in a
+        // separate, explicitly destructive test outside the default
+        // `--ignored` run, not here.
+        device.persist().expect("mark the device persistent");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn additional_queue_requires_multi_queue_to_have_been_requested() {
+        use tunnel_lattice_platform::MultiQueueProvider;
+
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a TUN device (multi_queue not requested)");
+
+        let result = device.additional_queue();
+        assert!(
+            matches!(result.err(), Some(Error::Unsupported)),
+            "cloning a queue on a non-multi-queue device should report Unsupported, not a raw platform error"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn additional_queue_clones_an_independent_queue_on_a_multi_queue_device() {
+        use tunnel_lattice_platform::MultiQueueProvider;
+
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun).with_multi_queue(true))
+            .expect("open a multi-queue TUN device");
+
+        let queue = device
+            .additional_queue()
+            .expect("clone a second queue on a multi-queue device");
+
+        // Both queues observe the same underlying interface (same name),
+        // confirming this cloned a queue on one device rather than
+        // accidentally creating a second, unrelated one.
+        let name = device.snapshot().expect("snapshot original queue").name;
+        let queue_name = queue.snapshot().expect("snapshot cloned queue").name;
+        assert_eq!(name, queue_name);
+
+        // Dropping the clone first does not affect the original queue —
+        // exercises the "independent handles" half of Handle's ownership
+        // contract (see tunnel-lattice's rustdoc) at the backend level.
+        drop(queue);
+        device
+            .snapshot()
+            .expect("original queue still usable after the clone was dropped");
     }
 }
