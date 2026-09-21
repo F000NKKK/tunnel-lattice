@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0]
+
 - Added `tunnel_lattice_platform::PersistentDevice` (`Handle::persist`) and
   `MultiQueueProvider` (`Handle::additional_queue`), both gated by their
   matching `Capability` flag and implemented only on Linux in

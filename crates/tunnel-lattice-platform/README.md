@@ -14,6 +14,12 @@ on `tunnel-lattice-model`.
   state back;
 - `DeviceMutator: DeviceObserver`, changing an open device's MTU or
   administrative state, gated by `Capability::DEVICE_MUTATION`;
+- `PersistentDevice`, marking an open device to survive process exit,
+  gated by `Capability::PERSISTENT_DEVICES`;
+- `MultiQueueProvider`, duplicating a hardware-scheduled queue on the same
+  device for another thread, gated by `Capability::MULTI_QUEUE` — distinct
+  from ordinary multi-threaded use of `PacketIo`, which is always safe on
+  every backend since `recv`/`send` take `&self`; see that trait's docs;
 - `Capability`, a `bitflags` set of runtime-dependent feature flags
   (`DEVICE_MUTATION`, `PERSISTENT_DEVICES`, `TAP_DEVICES`, `MULTI_QUEUE`,
   `NATIVE_ASYNC`) plus `CapabilityProvider` to report which a connected

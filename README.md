@@ -21,7 +21,7 @@ compose with the rest of the Lattice networking stack.
 
 ## Status
 
-**`0.2.0` published, active design/implementation.** See
+**`0.3.0` published, active design/implementation.** See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the crate architecture — nothing in
 it is API-frozen yet; every type, trait, and feature flag may still change
 in a future `0.x` release (see `versioning.md`'s pre-1.0 policy).

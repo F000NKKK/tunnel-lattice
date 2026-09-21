@@ -3,7 +3,7 @@
 Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
 compose with the rest of the Lattice networking stack.
 
-`0.2.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
+`0.3.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
 describe the current crate design, but nothing in the workspace is
 API-frozen — do not assume any stability guarantee from this file.
 
@@ -49,7 +49,7 @@ sdk-lattice      Application-facing SDK composing the crates above
 
 ## Current release and roadmap
 
-Published stage baseline: `tunnel-lattice 0.2.0` (see `SECURITY.md`'s
+Published stage baseline: `tunnel-lattice 0.3.0` (see `SECURITY.md`'s
 supported-version table). Read the current workspace version from
 `crates/tunnel-lattice/Cargo.toml`; do not duplicate a patch version here.
 Roadmap/version tracking lives in the YouTrack project `TL`
@@ -74,7 +74,7 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   (both fixed; see `CHANGELOG.md`'s `[0.2.0]` entry). All 36 `ci`/
   `privileged` jobs (3 OS × 3 feature sets, both workflows) pass on GitHub
   Actions as of `0.2.0`.
-- **0.3 (done):** `Capability::PERSISTENT_DEVICES`/`PersistentDevice`
+- **0.3 (done, released):** `Capability::PERSISTENT_DEVICES`/`PersistentDevice`
   (`Handle::persist`) and `Capability::MULTI_QUEUE`/`MultiQueueProvider`
   (`Handle::additional_queue`), both Linux-only in
   `tunnel-lattice-backend-tunrs` (verified against `tun-rs`'s source: the
