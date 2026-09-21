@@ -12,13 +12,17 @@ bitflags::bitflags! {
         /// The backend can change an open device's MTU or administrative
         /// state after creation, through [`crate::DeviceMutator`].
         const DEVICE_MUTATION = 1 << 0;
-        /// The backend can attach to a pre-existing persistent device by
-        /// name, rather than only ever creating a fresh, non-persistent one.
+        /// The backend implements [`crate::PersistentDevice`], and attaches
+        /// to a pre-existing persistent device requested by name rather
+        /// than only ever creating a fresh, non-persistent one (the latter
+        /// is ordinary kernel `TUNSETIFF`-by-name behavior on Linux, not
+        /// something this crate implements itself).
         const PERSISTENT_DEVICES = 1 << 1;
         /// The backend can open a TAP (Ethernet-framed) device, not only TUN.
         /// Some platforms/drivers support TUN only.
         const TAP_DEVICES = 1 << 2;
-        /// The backend can open more than one queue on the same device for
+        /// The backend implements [`crate::MultiQueueProvider`]: it can
+        /// duplicate a hardware-scheduled queue on the same device for
         /// multi-threaded packet I/O (Linux `IFF_MULTI_QUEUE`).
         const MULTI_QUEUE = 1 << 3;
         /// The backend implements [`crate::AsyncPacketIo`] natively, so
