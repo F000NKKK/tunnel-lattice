@@ -90,6 +90,20 @@ fn main() -> Result<()> {
 Флаги фич и более полный обзор использования — в
 `crates/tunnel-lattice/README.md`.
 
+## Крейты воркспейса
+
+Воркспейс разбит на сфокусированные крейты. У каждого — свой README с
+описанием области ответственности и примером использования:
+
+| Крейт | Назначение |
+| --- | --- |
+| [`tunnel-lattice`](crates/tunnel-lattice/README.md) | Публичный фасад: `Tunnel`/`Handle`, выбор backend'а через Cargo-фичи |
+| [`tunnel-lattice-model`](crates/tunnel-lattice-model/README.md) | Наблюдаемые/желаемые типы устройства (`Device`, `DeviceConfig`, `DeviceConfigPatch`) |
+| [`tunnel-lattice-platform`](crates/tunnel-lattice-platform/README.md) | Трейты провайдера и контракт `Capability` |
+| [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Общие ошибки, результаты и идентификаторы |
+| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Независимый от рантайма адаптер `futures::Stream` для backend'ов без нативного async |
+| [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | Кроссплатформенная реализация TUN/TAP на базе `tun-rs` |
+
 ## Экосистема Lattice
 
 | Крейт | Назначение |

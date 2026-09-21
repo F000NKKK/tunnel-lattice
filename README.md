@@ -90,6 +90,20 @@ fn main() -> Result<()> {
 See `crates/tunnel-lattice/README.md` for feature flags and a fuller usage
 walkthrough.
 
+## Workspace crates
+
+The workspace is split into focused crates. Each crate has its own
+crate-level README with its scope and a usage example:
+
+| Crate | Purpose |
+| --- | --- |
+| [`tunnel-lattice`](crates/tunnel-lattice/README.md) | Public facade: `Tunnel`/`Handle`, feature-gated backend selection |
+| [`tunnel-lattice-model`](crates/tunnel-lattice-model/README.md) | Observed/desired device types (`Device`, `DeviceConfig`, `DeviceConfigPatch`) |
+| [`tunnel-lattice-platform`](crates/tunnel-lattice-platform/README.md) | Provider traits and `Capability` contract |
+| [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Shared errors, results, and IDs |
+| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Runtime-independent `futures::Stream` adapter for backends without native async |
+| [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | `tun-rs`-backed cross-platform TUN/TAP implementation |
+
 ## The Lattice ecosystem
 
 | Crate | Purpose |
