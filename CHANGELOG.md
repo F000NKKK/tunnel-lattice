@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tunnel-lattice`'s facade gained `ConnectedDevice`, a named bound for
   "an open device handle usable through `Tunnel`/`Handle`", replacing a
   four-trait bound list duplicated across both types.
+- **Fixed a real deadlock in `tunnel-lattice-backend-tunrs`'s `tokio`
+  feature:** `PacketIo::recv`/`send` blocked on a Tokio-backed `AsyncDevice`
+  via `futures::executor::block_on`, which never polls Tokio's own I/O
+  driver — a plain `send()` call hung forever (confirmed against a real
+  device under `CAP_NET_ADMIN`, deadlocked past a 10-second timeout). Now
+  blocks via `tokio::runtime::Handle::current().block_on` instead, which
+  requires (and now documents) that a caller using the `tokio` feature run
+  with a **multi-threaded** Tokio runtime — `current_thread` reproduces the
+  same hang, since only `Runtime::block_on` (not `Handle::block_on`) drives
+  that flavor's I/O reactor. Added `#[ignore]`d privileged tests
+  (`tunnel-lattice-backend-tunrs::privileged_tests`) that open, mutate, and
+  tear down a real device under each feature set, plus a `privileged` CI job
+  that runs them with `sudo`/Administrator on all three target platforms —
+  this bug was only found by actually running the new tests against a real
+  device, not by reading `tun-rs`'s source.
 
 ## [0.1.0]
 
