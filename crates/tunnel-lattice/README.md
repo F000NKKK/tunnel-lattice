@@ -43,11 +43,15 @@ fn main() -> Result<()> {
   feature, not a `target_os` cfg gate, so a future non-`tun-rs` backend can
   be added alongside it rather than replacing it — see the workspace
   `ARCHITECTURE.md`, "Backend replacement plan."
-- `async` — adds `Handle::packet_stream`, a `futures::Stream` of received
-  packets. Uses a backend's native async path when it reports
-  `Capability::NATIVE_ASYNC` (as `tunnel-lattice-backend-tunrs` does);
-  otherwise falls back to `tunnel-lattice-async`'s thread-based adapter. No
-  async runtime dependency is imposed when this feature is off.
+- `async-io` / `tokio` (mutually exclusive; enabling both is a compile
+  error from `tun-rs`) — either adds `Handle::packet_stream`, a
+  `futures::Stream` of received packets. `async-io` selects `tun-rs`'s
+  `async-io`/`blocking`-based backend (no tokio dependency); `tokio` selects
+  its tokio-based one. Uses a backend's native async path when it reports
+  `Capability::NATIVE_ASYNC` (as `tunnel-lattice-backend-tunrs` does with
+  either feature); otherwise falls back to `tunnel-lattice-async`'s
+  thread-based adapter. No async runtime dependency is imposed when neither
+  feature is enabled.
 
 ## Platform and privilege notes
 
