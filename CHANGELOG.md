@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0]
+
 - **Fixed `Handle::packet_stream`'s cancellation:** it previously always
   used `tunnel-lattice-async`'s thread-based bridge, regardless of whether
   the backend also implemented `AsyncPacketIo`/reported

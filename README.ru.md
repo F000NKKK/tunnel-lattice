@@ -21,7 +21,7 @@
 
 ## Статус
 
-**Опубликована `0.3.0`, идёт активное проектирование/реализация.** См.
+**Опубликована `0.4.0`, идёт активное проектирование/реализация.** См.
 [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md) — архитектура крейтов уже реальная,
 но ничего в ней не заморожено по API: любой тип, трейт и Cargo-фича могут
 измениться в будущем `0.x`-релизе (см. предрелизную политику в
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
 | [`tunnel-lattice-model`](crates/tunnel-lattice-model/README.md) | Наблюдаемые/желаемые типы устройства (`Device`, `DeviceConfig`, `DeviceConfigPatch`) |
 | [`tunnel-lattice-platform`](crates/tunnel-lattice-platform/README.md) | Трейты провайдера и контракт `Capability` |
 | [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Общие ошибки, результаты и идентификаторы |
-| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Независимый от рантайма адаптер `futures::Stream` для backend'ов без нативного async |
+| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Независимый от рантайма `futures::Stream`: нативно поверх `AsyncPacketIo` backend'а, иначе через поток-мост |
 | [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | Кроссплатформенная реализация TUN/TAP на базе `tun-rs` |
 
 ## Экосистема Lattice

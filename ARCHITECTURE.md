@@ -92,7 +92,7 @@ at the boundary; callers never match on a raw `errno`/`DWORD` directly.
 
 ## Frozen public API surface
 
-`0.3.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
+`0.4.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
 workspace is API-frozen; every type, trait, and feature flag described here
 may still change in a future `0.x` release (see `versioning.md`'s pre-1.0
 policy). See `index.md`, "Current release and roadmap," for the stage this

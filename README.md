@@ -21,7 +21,7 @@ compose with the rest of the Lattice networking stack.
 
 ## Status
 
-**`0.3.0` published, active design/implementation.** See
+**`0.4.0` published, active design/implementation.** See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the crate architecture — nothing in
 it is API-frozen yet; every type, trait, and feature flag may still change
 in a future `0.x` release (see `versioning.md`'s pre-1.0 policy).
@@ -104,7 +104,7 @@ crate-level README with its scope and a usage example:
 | [`tunnel-lattice-model`](crates/tunnel-lattice-model/README.md) | Observed/desired device types (`Device`, `DeviceConfig`, `DeviceConfigPatch`) |
 | [`tunnel-lattice-platform`](crates/tunnel-lattice-platform/README.md) | Provider traits and `Capability` contract |
 | [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Shared errors, results, and IDs |
-| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Runtime-independent `futures::Stream` adapter for backends without native async |
+| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Runtime-independent `futures::Stream`: native over a backend's `AsyncPacketIo`, thread-bridged otherwise |
 | [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | `tun-rs`-backed cross-platform TUN/TAP implementation |
 
 ## The Lattice ecosystem

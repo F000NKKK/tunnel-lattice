@@ -3,7 +3,7 @@
 Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
 compose with the rest of the Lattice networking stack.
 
-`0.3.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
+`0.4.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
 describe the current crate design, but nothing in the workspace is
 API-frozen — do not assume any stability guarantee from this file.
 
@@ -49,7 +49,7 @@ sdk-lattice      Application-facing SDK composing the crates above
 
 ## Current release and roadmap
 
-Published stage baseline: `tunnel-lattice 0.3.0` (see `SECURITY.md`'s
+Published stage baseline: `tunnel-lattice 0.4.0` (see `SECURITY.md`'s
 supported-version table). Read the current workspace version from
 `crates/tunnel-lattice/Cargo.toml`; do not duplicate a patch version here.
 Roadmap/version tracking lives in the YouTrack project `TL`
@@ -86,7 +86,7 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   always safe on every platform without needing multi-queue at all) —
   raised as a pre-1.0 concern worth fixing now rather than leaving implicit.
   Verified against a real device under `CAP_NET_ADMIN`, not only compiled.
-- **0.4 (done):** cancellable `PacketStream` shutdown. `Handle::
+- **0.4 (done, released):** cancellable `PacketStream` shutdown. `Handle::
   packet_stream` now dispatches to `tunnel-lattice-async::from_async_device`
   (built directly on `AsyncPacketIo` via `futures::stream::unfold`, no
   worker thread) whenever `Capability::NATIVE_ASYNC` is set, instead of
