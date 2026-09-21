@@ -21,23 +21,56 @@ compose with the rest of the Lattice networking stack.
 
 ## Status
 
-**Pre-release, active design/implementation.** No version has been
-published yet (see `SUPPORT.md`). The workspace now has a real crate
-architecture — see [ARCHITECTURE.md](ARCHITECTURE.md) — but nothing in it is
-API-frozen; every type, trait, and feature flag may still change before
-`0.1.0` ships.
+**`0.1.0` published, active design/implementation.** See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the crate architecture — nothing in
+it is API-frozen yet; every type, trait, and feature flag may still change
+in a future `0.x` release (see `versioning.md`'s pre-1.0 policy).
 
 ## What it does
 
 - Creates and configures TUN (raw IP) and TAP (Ethernet-framed) devices on
   Linux, Windows, and macOS through the `tun-rs` crate;
 - Transfers packets on an open device, synchronously by default and, with
-  the optional `async` feature, through a `futures::Stream` — no async
-  runtime is pulled in unless that feature is enabled;
+  the optional `async-io` or `tokio` feature (mutually exclusive), through a
+  `futures::Stream` — no async runtime is pulled in unless one of them is
+  enabled;
 - Re-reads and patches an open device's MTU and administrative state.
 
 Tunnel Lattice does not assign IP addresses to the interfaces it creates —
-see `net-lattice` below for OS network configuration once a device exists.
+see "Interop with net-lattice" below.
+
+## Interop with net-lattice
+
+Tunnel Lattice and `net-lattice` never share a process-independent object
+identity: a `tunnel_lattice::DeviceId` and a `net_lattice::InterfaceId` are
+distinct phantom-typed wrappers even when their underlying native index
+happens to coincide, so the two crates never let you pass one where the
+other is expected by accident. Bridge them through the OS-assigned
+**interface name** instead — the one field both sides expose in the same
+shape:
+
+```rust,no_run
+use net_lattice::Lattice;
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+let tunnel = Tunnel::connect();
+let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun))?;
+let snapshot = device.snapshot()?; // has `snapshot.name`, e.g. "tun0"
+
+let lattice = Lattice::connect()?;
+let interface = lattice
+    .interfaces()?
+    .into_iter()
+    .find(|i| i.name == snapshot.name)
+    .ok_or(net_lattice::Error::NotFound)?;
+// assign an address, bring it up, etc. through `net-lattice` from here.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`name` is advisory on `DeviceConfig` (see its docs) — a backend may assign a
+different name than requested, especially on Windows — so always read the
+name back from `snapshot()`/the returned `Device`, never from the
+`DeviceConfig` you passed in.
 
 ## Quick start
 
