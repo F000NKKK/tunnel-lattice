@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0]
+
 - Fixed `tunnel-lattice-backend-tunrs` failing to build on macOS/Windows CI:
   `tun_rs::SyncDevice::try_clone`/`is_running` only exist on Linux.
   `TunRsDevice` now holds exactly one handle (never clones one), and

@@ -3,7 +3,7 @@
 Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
 compose with the rest of the Lattice networking stack.
 
-`0.1.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
+`0.2.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
 describe the current crate design, but nothing in the workspace is
 API-frozen — do not assume any stability guarantee from this file.
 
@@ -49,13 +49,13 @@ sdk-lattice      Application-facing SDK composing the crates above
 
 ## Current release and roadmap
 
-Published stage baseline: `tunnel-lattice 0.1.0` (see `SECURITY.md`'s
+Published stage baseline: `tunnel-lattice 0.2.0` (see `SECURITY.md`'s
 supported-version table). Read the current workspace version from
 `crates/tunnel-lattice/Cargo.toml`; do not duplicate a patch version here.
 Roadmap/version tracking lives in the YouTrack project `TL`
 (`@.claude/rules/youtrack.md`) — Sprint entries map 1:1 to the stages below.
 
-- **0.1 (done, published):** repository bootstrap; initial crate
+- **0.1 (done, released):** repository bootstrap; initial crate
   architecture (`-core`, `-model`, `-platform`, `-backend-tunrs`, `-async`,
   facade); `tun-rs`-backed sync `PacketIo` with MTU/administrative-state
   mutation; optional `async-io`/`tokio` features (mutually exclusive) adding
@@ -63,7 +63,7 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   `Capability::NATIVE_ASYNC` and falling back to `tunnel-lattice-async`'s
   thread-based adapter otherwise; `scripts/release.sh`/`gh_release.sh`
   release automation ported from `net-lattice`.
-- **0.2 (done):** privileged per-platform CI. Added `#[ignore]`d
+- **0.2 (done, released):** privileged per-platform CI. Added `#[ignore]`d
   `privileged_tests` to `tunnel-lattice-backend-tunrs` (open/mutate/tear
   down a real device) and a `privileged` CI job running them with `sudo`/
   Administrator on Linux, Windows, and macOS across all three feature sets
@@ -71,9 +71,9 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   ci.md`'s "test platforms separately" rule. This surfaced two real defects
   that reading `tun-rs`'s source alone never would have: a genuine deadlock
   in the `tokio` feature, and a missing `wintun.dll` on Windows runners
-  (both fixed; see `CHANGELOG.md`'s `[Unreleased]` entry). All 36 `ci`/
+  (both fixed; see `CHANGELOG.md`'s `[0.2.0]` entry). All 36 `ci`/
   `privileged` jobs (3 OS × 3 feature sets, both workflows) pass on GitHub
-  Actions as of the fix landing on `main`.
+  Actions as of `0.2.0`.
 - **0.3 (proposed):** `Capability::PERSISTENT_DEVICES` and
   `Capability::MULTI_QUEUE`. Both bits are already defined in
   `tunnel-lattice-platform::Capability`, but no backend sets either one yet
@@ -101,10 +101,17 @@ Roadmap/version tracking lives in the YouTrack project `TL`
 
 ## Useful commands
 
+`--all-features` is not valid for this workspace: `tun-rs` hard-errors if
+its `async-io` and `tokio` backends are both enabled at once. Exercise the
+three supported, mutually exclusive feature sets separately instead —
+mirroring `.github/workflows/ci.yml`'s matrix:
+
 ```text
 cargo fmt --all -- --check
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --workspace --all-features --no-deps
+cargo test --workspace
+cargo test --workspace --no-default-features --features tunnel-lattice/tun-rs,tunnel-lattice/async-io
+cargo test --workspace --no-default-features --features tunnel-lattice/tun-rs,tunnel-lattice/tokio
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
 git diff --check
 ```
