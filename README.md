@@ -12,9 +12,9 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
 [![CI](https://github.com/F000NKKK/tunnel-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/tunnel-lattice/actions/workflows/ci.yml)
 
-![Linux](https://img.shields.io/badge/Linux-in%20progress-yellow)
-![Windows](https://img.shields.io/badge/Windows-in%20progress-yellow)
-![macOS](https://img.shields.io/badge/macOS-in%20progress-yellow)
+![Linux](https://img.shields.io/badge/Linux-supported-success)
+![Windows](https://img.shields.io/badge/Windows-supported-success)
+![macOS](https://img.shields.io/badge/macOS-supported-success)
 
 Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
 compose with the rest of the Lattice networking stack.
