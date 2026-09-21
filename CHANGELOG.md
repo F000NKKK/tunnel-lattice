@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added `tunnel_lattice_platform::PersistentDevice` (`Handle::persist`) and
+  `MultiQueueProvider` (`Handle::additional_queue`), both gated by their
+  matching `Capability` flag and implemented only on Linux in
+  `tunnel-lattice-backend-tunrs` — verified against `tun-rs`'s source that
+  the underlying `persist`/`multi_queue`/`try_clone` calls genuinely don't
+  exist on macOS/Windows (not merely no-ops there). `DeviceConfig` gained
+  `multi_queue`/`with_multi_queue` to request `IFF_MULTI_QUEUE` at open
+  time; `additional_queue` on a device that didn't request it returns
+  `Error::Unsupported`, mapped from `tun-rs`'s own
+  `io::ErrorKind::Unsupported` rather than a meaningless `Error::Platform`
+  code (`io_error` now checks for this portable error kind generally, not
+  only for this one call site).
+- `tunnel_lattice::Handle<D>` is now `Clone` (a cheap `Arc::clone`), making
+  explicit a sharing model that was previously only used internally by
+  `packet_stream`: `PacketIo::recv`/`send` take `&self` on every platform
+  this crate ships, so multiple threads sharing one `Handle` clone can
+  already call them concurrently without any capability check — verified
+  against `tun-rs`'s own `recv`/`send` signatures on Linux, macOS, and
+  Windows, and against Wintun's documented thread-safety for concurrent
+  session calls. Documented as an explicit ownership/concurrency contract
+  (who owns the device, what Drop does, how this differs from
+  `additional_queue`) in `ARCHITECTURE.md` and `Handle`'s own rustdoc,
+  before `1.0` rather than left implicit.
+
 ## [0.2.0]
 
 - Fixed `tunnel-lattice-backend-tunrs` failing to build on macOS/Windows CI:

@@ -15,12 +15,26 @@ application-facing Tunnel Lattice crate.
   state;
 - `Handle::apply(DeviceConfigPatch)`, changing an open device's MTU or
   administrative state;
+- `Handle::persist`/`Handle::additional_queue`, on backends that implement
+  `PersistentDevice`/`MultiQueueProvider` (Linux only, via
+  `tunnel-lattice-backend-tunrs` — see "Persistent devices and multi-queue"
+  below);
 - with the `async-io` or `tokio` feature (mutually exclusive):
   `Handle::packet_stream`, a `futures::Stream` of received packets.
 
 This crate does not assign IP addresses to the interfaces it creates — see
 `net-lattice` in the sibling Lattice ecosystem for OS network configuration
 once a device exists.
+
+## Ownership: `Handle` is `Clone`
+
+`Handle<D>` wraps its device in an `Arc` and can be cloned cheaply to share
+one open device across threads — `recv`/`send` take `&self`, so concurrent
+calls through separate clones are always safe. The device stays open until
+every `Handle` clone (and any `PacketStream` derived from one) has been
+dropped; there is no explicit close method. See `ARCHITECTURE.md`'s
+"Ownership and concurrency contract" for the full write-up, including how
+this differs from `additional_queue`'s independent hardware queue.
 
 ## Quick start
 
@@ -63,6 +77,30 @@ fn main() -> Result<()> {
   first `recv`/`send` call hangs forever. See that crate's README, "`tokio`
   requires a multi-threaded runtime," for why. Prefer `async-io` if a
   single-threaded runtime is a hard requirement.
+
+## Persistent devices and multi-queue
+
+Both Linux-only, gated by `Capability::PERSISTENT_DEVICES`/
+`Capability::MULTI_QUEUE`:
+
+```rust,no_run
+# #[cfg(target_os = "linux")]
+# fn main() -> tunnel_lattice::Result<()> {
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+let tunnel = Tunnel::connect();
+let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_multi_queue(true))?;
+device.persist()?; // survives this process exiting
+let second_queue = device.additional_queue()?; // independent hardware queue
+# Ok(())
+# }
+# #[cfg(not(target_os = "linux"))]
+# fn main() {}
+```
+
+`additional_queue` on a device not opened with `with_multi_queue(true)`
+returns `Error::Unsupported`. Multi-queue is a throughput optimization, not
+a requirement for sharing a device across threads — see "Ownership" above.
 
 ## Platform and privilege notes
 

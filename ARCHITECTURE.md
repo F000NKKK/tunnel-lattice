@@ -98,6 +98,71 @@ may still change in a future `0.x` release (see `versioning.md`'s pre-1.0
 policy). See `index.md`, "Current release and roadmap," for the stage this
 freeze is scheduled at (`1.0`, unscheduled) and what ships before it.
 
+## Ownership and concurrency contract
+
+`tunnel_lattice::Handle<D>` wraps its backend device in an `Arc<D>` and is
+itself `Clone` (a cheap `Arc::clone`, not a device duplication) — this is a
+deliberate, explicit contract, not an implementation detail of
+`packet_stream`'s internal sharing:
+
+- **Multiple readers/writers sharing one `Handle` clone are always safe, on
+  every backend.** `PacketIo::recv`/`send` take `&self`; this is verified
+  against `tun-rs`'s own signatures on Linux, macOS, and Windows (all three
+  declare `recv`/`send` as `fn(&self, ...)`), and Windows's Wintun sessions
+  are documented thread-safe for concurrent `WintunReceivePacket`/
+  `WintunSendPacket` calls specifically so this holds without any special
+  handling on our side. No capability check or feature gates this — sharing
+  a `Handle` clone across threads and calling `recv`/`send` concurrently is
+  the baseline, portable multiplexing story.
+- **`Handle::additional_queue`** (gated by `D: MultiQueueProvider`, see
+  below) is a *different, stronger* thing: an independent `Handle` over a
+  second OS-scheduled queue, not a second reference to the same one. The
+  two `Handle`s returned this way share no `Arc`; dropping one has no
+  effect on the other.
+- **Drop closes the device once every clone (`Handle` or `PacketStream`) of
+  its `Arc` is gone**, via `D`'s own `Drop` impl (`tun_rs::SyncDevice`/
+  `AsyncDevice` close their file descriptor there). There is no explicit
+  "close" method — letting every reference drop is the only way, and a
+  `PacketStream` created from a `Handle` holds its own `Arc` clone
+  independent of the `Handle` it came from, so either can outlive the
+  other.
+
+See `tunnel_lattice::Handle`'s own rustdoc for the full contract; this
+section exists so the answer to "who owns the device, can I share it,
+what happens on drop" is recorded before `1.0`, not left implicit in code
+someone has to read to find out.
+
+## Persistent devices and multi-queue
+
+`Capability::PERSISTENT_DEVICES` (`tunnel_lattice_platform::PersistentDevice`)
+and `Capability::MULTI_QUEUE` (`tunnel_lattice_platform::MultiQueueProvider`)
+are both Linux-only in `tunnel-lattice-backend-tunrs` — verified directly in
+`tun-rs`'s source, not assumed: `DeviceImpl::persist`, `DeviceBuilder::
+multi_queue`, and `SyncDevice`/`AsyncDevice::try_clone` are all
+`#[cfg(target_os = "linux")]` in `tun-rs` itself, with no equivalent on
+macOS/Windows at all (not merely "ignored" — the methods don't exist there).
+Both platform traits are still declared unconditionally in
+`tunnel-lattice-platform`, since the contract itself is generic; only the
+`tunnel-lattice-backend-tunrs` implementation is `#[cfg(target_os =
+"linux")]`-gated, the same pattern as `AdminState` read-back.
+
+- **Persistence** (`Handle::persist`) marks an open device to survive
+  process exit. Attaching to an existing persistent device by name needs no
+  code here: it's ordinary Linux `TUNSETIFF`-by-name kernel behavior, not
+  something `DeviceProvider::open` implements specially — request the same
+  `DeviceConfig::name` and the kernel does the rest. There is no
+  "un-persist": `tun-rs` only exposes setting the flag, never clearing it.
+- **Multi-queue** (`DeviceConfig::with_multi_queue`, `Handle::
+  additional_queue`) requests `IFF_MULTI_QUEUE` at open time and, once
+  granted, duplicates a genuinely independent, hardware-scheduled queue on
+  the same device (`tun-rs`'s `try_clone`) — distinct from the "naive"
+  multiplexing described above, which needs no multi-queue request at all
+  and works on every platform. Calling `additional_queue` on a device that
+  wasn't opened with `with_multi_queue(true)` returns
+  `Error::Unsupported` (mapped from `tun-rs`'s own
+  `io::ErrorKind::Unsupported` — a portable signal distinct from a raw OS
+  error code, unlike the `Error::Platform` cases elsewhere in this crate).
+
 ## Async design
 
 `tunnel-lattice-platform`'s `async` feature adds `AsyncPacketIo`, an

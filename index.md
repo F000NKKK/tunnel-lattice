@@ -74,12 +74,18 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   (both fixed; see `CHANGELOG.md`'s `[0.2.0]` entry). All 36 `ci`/
   `privileged` jobs (3 OS × 3 feature sets, both workflows) pass on GitHub
   Actions as of `0.2.0`.
-- **0.3 (proposed):** `Capability::PERSISTENT_DEVICES` and
-  `Capability::MULTI_QUEUE`. Both bits are already defined in
-  `tunnel-lattice-platform::Capability`, but no backend sets either one yet
-  — `tun-rs` supports attaching to a persistent Linux TUN by name and
-  opening multi-queue devices, so this is `tunnel-lattice-backend-tunrs`
-  work, not a new contract.
+- **0.3 (done):** `Capability::PERSISTENT_DEVICES`/`PersistentDevice`
+  (`Handle::persist`) and `Capability::MULTI_QUEUE`/`MultiQueueProvider`
+  (`Handle::additional_queue`), both Linux-only in
+  `tunnel-lattice-backend-tunrs` (verified against `tun-rs`'s source: the
+  underlying calls don't exist at all off Linux, not merely no-ops).
+  `DeviceConfig::with_multi_queue` requests `IFF_MULTI_QUEUE` at open time.
+  Also made `Handle<D>` explicitly `Clone` and wrote down its full
+  ownership/concurrency contract in `ARCHITECTURE.md` (who owns the device,
+  what `Drop` does, why concurrent `recv`/`send` through a shared clone is
+  always safe on every platform without needing multi-queue at all) —
+  raised as a pre-1.0 concern worth fixing now rather than leaving implicit.
+  Verified against a real device under `CAP_NET_ADMIN`, not only compiled.
 - **0.4 (proposed):** cancellable `PacketStream` shutdown. `tunnel-lattice-
   async::PacketStream::drop` currently cannot unblock a worker thread parked
   inside a blocking `recv` with no further packets arriving — a documented

@@ -27,6 +27,11 @@
   `AdminState`) is exact only on Linux (`tun_rs`'s `is_running`); macOS,
   Windows, and BSD expose only a write-only `enabled(bool)` setter with no
   corresponding getter, so `snapshot()` reports `AdminState::Unknown` there.
+- `PersistentDevice`/`MultiQueueProvider`, both Linux-only: `TunRsDevice`
+  implements them on Linux and does not implement them at all elsewhere
+  (verified in `tun-rs`'s source — the underlying `persist`/`multi_queue`/
+  `try_clone` methods are `#[cfg(target_os = "linux")]` there too, not
+  merely no-ops off Linux). See "Persistent devices and multi-queue" below.
 
 ## Feature flags
 
@@ -71,6 +76,27 @@ job) rather than committing the binary to the repository. TAP mode instead
 needs the separate [tap-windows](https://build.openvpn.net/downloads/releases/)
 driver installed — see `tun-rs`'s own README for details neither this crate
 nor `tunnel-lattice` re-derives.
+
+## Persistent devices and multi-queue
+
+Both gated by `Capability::PERSISTENT_DEVICES`/`Capability::MULTI_QUEUE`,
+Linux-only:
+
+- `Handle::persist` marks an open device to survive process exit
+  (`TUNSETPERSIST`). There is no un-persist — `tun-rs` only exposes setting
+  the flag.
+- `DeviceConfig::with_multi_queue(true)` requests `IFF_MULTI_QUEUE` at open
+  time; `Handle::additional_queue` then duplicates a genuinely independent,
+  hardware-scheduled queue on the same device (`tun-rs`'s `try_clone`).
+  Calling it on a device that wasn't opened with multi-queue requested
+  returns `Error::Unsupported` (mapped from `tun-rs`'s own
+  `io::ErrorKind::Unsupported`, not a raw platform error code).
+
+Multi-queue is a throughput optimization, not a prerequisite for concurrent
+access: `PacketIo::recv`/`send` take `&self` on every platform this crate
+supports, so sharing one `Handle` clone across threads and calling them
+concurrently is always safe — see `tunnel_lattice::Handle`'s rustdoc and
+`ARCHITECTURE.md`'s "Ownership and concurrency contract."
 
 ## Why this is one shared crate, not three
 
