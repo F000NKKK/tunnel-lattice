@@ -9,7 +9,7 @@ homepage.workspace = true
 documentation.workspace = true
 categories.workspace = true
 keywords.workspace = true
-description = "Runtime-agnostic futures Stream/Sink adapter over a synchronous PacketIo device, for backends with no native async path."
+description = "Runtime-agnostic futures Stream adapter for Tunnel Lattice: native over AsyncPacketIo when available, thread-bridged over PacketIo otherwise."
 readme = "README.md"
 
 [dependencies]
