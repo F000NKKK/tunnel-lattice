@@ -95,7 +95,8 @@ at the boundary; callers never match on a raw `errno`/`DWORD` directly.
 `0.1.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
 workspace is API-frozen; every type, trait, and feature flag described here
 may still change in a future `0.x` release (see `versioning.md`'s pre-1.0
-policy).
+policy). See `index.md`, "Current release and roadmap," for the stage this
+freeze is scheduled at (`1.0`, unscheduled) and what ships before it.
 
 ## Async design
 
