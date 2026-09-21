@@ -3,10 +3,12 @@ name: CI
 # Runs fmt/clippy/check/test/doc across the three platforms tunnel-lattice
 # targets, on GitHub's native runners for each OS — not cross-compiled — so
 # tun-rs and tunnel-lattice-backend-tunrs are actually compiled and tested
-# per platform, not just on Linux. Creating/opening a real TUN/TAP device
-# needs elevated privileges this job does not have, so ordinary tests here
-# cover construction/model logic; add a privileged job (see net-lattice's
-# `.github/workflows/ci.yml` for the pattern) once device-level tests land.
+# per platform, not just on Linux. The `ci` job's tests do not have the
+# privilege to open a real TUN/TAP device, so they cover construction/model
+# logic only; the `privileged` job below (mirroring net-lattice's own
+# pattern) actually opens, mutates, and tears down a real device on each
+# platform via `tunnel-lattice-backend-tunrs`'s `#[ignore]`d
+# `privileged_tests`.
 
 on:
   push:
@@ -66,3 +68,41 @@ jobs:
 
       - name: cargo doc --no-deps --workspace
         run: cargo doc --no-deps --workspace ${{ matrix.features.flags }}
+
+  privileged:
+    name: privileged (${{ matrix.os }}, ${{ matrix.features.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        features:
+          - name: default
+            flags: ""
+          - name: async-io
+            flags: "--no-default-features --features tunnel-lattice-backend-tunrs/async-io"
+          - name: tokio
+            flags: "--no-default-features --features tunnel-lattice-backend-tunrs/tokio"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: privileged-${{ matrix.features.name }}
+
+      # `-p tunnel-lattice-backend-tunrs` only: `privileged_tests` lives
+      # there, and building the rest of the workspace under `sudo`/as
+      # Administrator is unnecessary privilege widening for no benefit.
+      - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored (Linux/macOS, sudo)
+        if: matrix.os != 'windows-latest'
+        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --nocapture
+
+      # windows-latest runners already execute as Administrator; opening a
+      # TUN/TAP device there does not need an explicit elevation step the
+      # way `sudo` provides one on Linux/macOS.
+      - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --nocapture

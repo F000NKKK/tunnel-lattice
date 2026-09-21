@@ -12,11 +12,15 @@
   `DeviceObserver`, `DeviceMutator` (MTU and administrative state), and
   `CapabilityProvider`. It holds exactly one underlying `tun-rs` handle —
   never both a sync and an async one, since `tun_rs::SyncDevice::try_clone`
-  only exists on Linux. With this crate's `async-io`/`tokio` feature, that
-  handle is a `tun_rs::AsyncDevice` (built via `DeviceBuilder::build_async`)
-  and `PacketIo` blocks on its async methods
-  (`futures::executor::block_on`); this crate then also implements the
-  native `AsyncPacketIo` directly on the same handle, reporting
+  only exists on Linux. With `async-io`, that handle is a
+  `tun_rs::AsyncDevice` and `PacketIo` blocks on its async methods via
+  `futures::executor::block_on`. With `tokio`, `PacketIo` instead blocks via
+  `tokio::runtime::Handle::current().block_on` — required because a
+  Tokio-backed `AsyncDevice`'s readiness is only ever delivered by Tokio's
+  own I/O driver, which `futures::executor::block_on` never polls (a real
+  `send()` call hangs forever otherwise; see the "Runtime requirement"
+  caveat below). Either way, this crate also implements the native
+  `AsyncPacketIo` directly on the same handle, reporting
   `Capability::NATIVE_ASYNC`. Without either feature, the handle is a
   `tun_rs::SyncDevice` and `PacketIo` calls it directly.
 - Administrative-state read-back (`DeviceObserver::snapshot`'s
