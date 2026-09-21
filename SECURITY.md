@@ -8,8 +8,8 @@ target the latest release and `main`, not older `0.x` versions.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | ✅ |
-| < 0.1.0 | ❌ |
+| 0.2.x   | ✅ |
+| < 0.2.0 | ❌ |
 
 ## Reporting a Vulnerability
 
