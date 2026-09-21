@@ -6,6 +6,11 @@ Only the latest published `0.x` release is supported. Pre-1.0, a new minor
 release may include breaking changes (see `versioning.md`); security fixes
 target the latest release and `main`, not older `0.x` versions.
 
+| Version | Supported |
+| ------- | --------- |
+| 0.1.x   | ✅ |
+| < 0.1.0 | ❌ |
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in Tunnel Lattice, please **do not** open a
@@ -33,7 +38,3 @@ or MTU/administrative-state mutation.
 
 Out of scope: `tun-rs` itself (report upstream), and any code path only
 reachable with attacker-controlled `Cargo.toml`/build configuration.
-
-No release has been published yet — see `SUPPORT.md` for current status.
-This file will be updated once a first release defines a supported version
-line.
