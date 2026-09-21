@@ -31,7 +31,10 @@ async = ["dep:tunnel-lattice-async", "tunnel-lattice-platform/async"]
 # Neither is in `default` — the facade stays runtime-agnostic until a
 # caller opts in. See `tunnel-lattice-backend-tunrs/Cargo.toml`.
 async-io = ["async", "tunnel-lattice-backend-tunrs?/async-io"]
-tokio = ["async", "tunnel-lattice-backend-tunrs?/tokio"]
+# `dep:tokio` is only ever compiled into `privileged_tests` (a `#[cfg(test)]`
+# module) — see `tunnel-lattice-backend-tunrs`'s Cargo.toml for why a Tokio
+# runtime must be entered before calling into a Tokio-backed device at all.
+tokio = ["async", "tunnel-lattice-backend-tunrs?/tokio", "dep:tokio"]
 
 default = ["tun-rs"]
 
@@ -41,3 +44,7 @@ tunnel-lattice-model = { workspace = true }
 tunnel-lattice-platform = { workspace = true }
 tunnel-lattice-backend-tunrs = { workspace = true, optional = true }
 tunnel-lattice-async = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"], optional = true }
+
+[dev-dependencies]
+futures = { workspace = true }

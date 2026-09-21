@@ -46,6 +46,8 @@ pub use tunnel_lattice_core::{Error, Result};
 pub use tunnel_lattice_model::{
     AdminState, DesiredAdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
 };
+#[cfg(feature = "async")]
+use tunnel_lattice_platform::AsyncPacketIo;
 pub use tunnel_lattice_platform::{
     Capability, CapabilityProvider, MultiQueueProvider, PersistentDevice,
 };
@@ -229,17 +231,94 @@ where
 #[cfg(feature = "async")]
 impl<D> Handle<D>
 where
-    D: PacketIo + Send + Sync + 'static,
+    D: PacketIo + AsyncPacketIo + CapabilityProvider + Send + Sync + 'static,
 {
-    /// Returns a `futures::Stream` of received packets, backed by
-    /// `tunnel-lattice-async`'s thread-based adapter over [`PacketIo`].
+    /// Returns a `futures::Stream` of received packets.
     ///
-    /// `mtu` bounds the per-packet receive buffer. Prefer a backend's
-    /// native `AsyncPacketIo` path directly when it reports
-    /// `Capability::NATIVE_ASYNC` — this method always uses the generic
-    /// adapter regardless of that capability; see `tunnel-lattice-async`'s
-    /// README for why.
+    /// `mtu` bounds the per-packet receive buffer. Uses
+    /// `tunnel-lattice-async::from_async_device` (no worker thread; dropping
+    /// the stream drops the in-flight `recv` future, which is genuine,
+    /// immediate cancellation) when the device reports
+    /// `Capability::NATIVE_ASYNC`; otherwise falls back to
+    /// `from_device`'s thread-based bridge over [`PacketIo`], which cannot
+    /// guarantee prompt shutdown — see that function's rustdoc. Every
+    /// backend `tunnel-lattice` ships as of this method's `D: AsyncPacketIo`
+    /// bound always implements `AsyncPacketIo` whenever this method is
+    /// reachable at all (it requires the `async` feature, which is what
+    /// makes a backend build its async-capable handle in the first place),
+    /// so the fallback path exists for a hypothetical future backend with
+    /// no native async support, not for anything shipped today.
     pub fn packet_stream(&self, mtu: usize) -> tunnel_lattice_async::PacketStream {
-        tunnel_lattice_async::from_device(std::sync::Arc::clone(&self.device), mtu)
+        if self
+            .device
+            .capabilities()
+            .contains(Capability::NATIVE_ASYNC)
+        {
+            tunnel_lattice_async::from_async_device(std::sync::Arc::clone(&self.device), mtu)
+        } else {
+            tunnel_lattice_async::from_device(std::sync::Arc::clone(&self.device), mtu)
+        }
+    }
+}
+
+/// Privileged, `async`-feature-only tests exercising `Handle::packet_stream`
+/// against a real device — see `tunnel-lattice-backend-tunrs`'s
+/// `privileged_tests` module for why these are `#[ignore]`d and how to run
+/// them, and `tunnel-lattice-async`'s own unit tests for the
+/// cancellation-semantics proof against a mock (no privilege needed there).
+#[cfg(all(test, feature = "async", feature = "tun-rs"))]
+mod privileged_tests {
+    use futures::FutureExt;
+
+    use super::*;
+
+    #[cfg(feature = "tokio")]
+    fn enter_tokio_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("build a Tokio runtime")
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn packet_stream_dispatches_to_the_native_no_thread_path() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let tunnel = Tunnel::connect();
+        let device = tunnel
+            .open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))
+            .expect("open a TUN device");
+
+        assert!(
+            device.capabilities().contains(Capability::NATIVE_ASYNC),
+            "tunnel-lattice-backend-tunrs reports NATIVE_ASYNC whenever \
+             an async feature is enabled, which is the only way this test \
+             itself gets compiled in"
+        );
+
+        let mut stream = device.packet_stream(1400);
+        // A freshly created Linux TUN device is not actually silent: the
+        // kernel sends IPv6 neighbor-discovery traffic (router
+        // solicitation) onto it almost immediately, confirmed by an
+        // earlier run of this test printing a real received packet here.
+        // So this deliberately does not assert Pending vs. Ready either
+        // way — only that whatever comes back is a well-formed item, not
+        // an error from the dispatch itself.
+        if let Some(item) = futures::StreamExt::next(&mut stream)
+            .now_or_never()
+            .flatten()
+        {
+            item.expect("a resolved item from the native path must be Ok, not a dispatch error");
+        }
+        // Reaching this line at all is the proof: dropping a real device's
+        // in-flight (or just-completed) `AsyncPacketIo::recv` future
+        // completes synchronously, with no worker thread left parked in a
+        // blocking recv the way the pre-0.4 thread-bridge path could leave
+        // one behind.
+        drop(stream);
     }
 }
