@@ -52,6 +52,26 @@ directly (not a bug specific to this crate) and is exercised by this crate's
 `privileged_tests`. Prefer the `async-io` feature instead if a
 single-threaded runtime is a hard requirement.
 
+## Windows requires `wintun.dll`
+
+`tun_rs::DeviceBuilder::build_sync`/`build_async` for a TUN device (the kind
+this crate's `privileged_tests` and the facade's Quick Start both use) loads
+`wintun.dll` at runtime on Windows — `tun-rs` does not link or vendor it.
+Without it present, `TunRsBackend::open` fails with a generic
+`Error::Platform(PlatformErrorCode::Windows(0))`: `raw_os_error()` returns
+`None` because "DLL not found" isn't a Win32 error at all, so this crate's
+`io_error` mapping falls back to `0` — confirmed on a real CI run before the
+fix below, not a hypothetical failure mode.
+
+Download the matching architecture's `wintun.dll` from
+[wintun.net](https://www.wintun.net/) and place it next to your
+application's executable, or anywhere on `PATH`. This project's own CI
+downloads it at job time (see `.github/workflows/ci.yml`'s `privileged`
+job) rather than committing the binary to the repository. TAP mode instead
+needs the separate [tap-windows](https://build.openvpn.net/downloads/releases/)
+driver installed — see `tun-rs`'s own README for details neither this crate
+nor `tunnel-lattice` re-derives.
+
 ## Why this is one shared crate, not three
 
 `tun-rs` already abstracts Linux/Windows/macOS/BSD TUN/TAP differences

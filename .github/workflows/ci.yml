@@ -93,6 +93,24 @@ jobs:
         with:
           key: privileged-${{ matrix.features.name }}
 
+      # tun-rs's TUN mode on Windows loads wintun.dll at runtime (not linked
+      # at build time) and does not vendor it — see tun-rs's own README,
+      # "Windows" / "wintun.dll not found." Without this, every
+      # `TunRsBackend::open` call on Windows fails with a generic
+      # `Platform(Windows(0))` (confirmed on a real run: no raw OS error
+      # code, because tun-rs's own "DLL not found" error isn't a Win32 error
+      # at all). Pinned to 0.14.1, the same long-standing stable build
+      # WireGuard itself ships. Downloaded at CI time rather than committed
+      # to the repo to avoid bundling a third-party binary and its license
+      # question into version control.
+      - name: Download wintun.dll (tun-rs's Windows TUN backend)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun
+          echo "$PWD\wintun\wintun\bin\amd64" | Out-File -FilePath $env:GITHUB_PATH -Append
+
       # `-p tunnel-lattice-backend-tunrs` only: `privileged_tests` lives
       # there, and building the rest of the workspace under `sudo`/as
       # Administrator is unnecessary privilege widening for no benefit.
