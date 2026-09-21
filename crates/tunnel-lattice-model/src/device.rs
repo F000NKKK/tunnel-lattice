@@ -69,16 +69,23 @@ pub struct DeviceConfig {
     pub name: Option<String>,
     /// A requested MTU, applied at creation where the platform allows it.
     pub mtu: Option<u32>,
+    /// Requests a hardware-scheduled multi-queue device
+    /// (`Capability::MULTI_QUEUE`), so a later `additional_queue` call can
+    /// duplicate an independent queue for another thread. Ignored where the
+    /// backend/platform has no such concept — this is a request, not a
+    /// guarantee; check `Capability::MULTI_QUEUE` before relying on it.
+    pub multi_queue: bool,
 }
 
 impl DeviceConfig {
     /// Creates a device-creation descriptor for `kind` with no name or MTU
-    /// preference — the backend chooses both.
+    /// preference — the backend chooses both — and multi-queue disabled.
     pub const fn new(kind: DeviceKind) -> Self {
         Self {
             kind,
             name: None,
             mtu: None,
+            multi_queue: false,
         }
     }
 
@@ -93,6 +100,14 @@ impl DeviceConfig {
     #[must_use]
     pub const fn with_mtu(mut self, mtu: u32) -> Self {
         self.mtu = Some(mtu);
+        self
+    }
+
+    /// Requests a hardware-scheduled multi-queue device (see the field's
+    /// docs). No effect where the platform ignores the request.
+    #[must_use]
+    pub const fn with_multi_queue(mut self, multi_queue: bool) -> Self {
+        self.multi_queue = multi_queue;
         self
     }
 }
