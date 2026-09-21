@@ -112,27 +112,41 @@ impl DeviceProvider for TunRsBackend {
     }
 }
 
-impl PacketIo for TunRsDevice {
-    fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+impl TunRsDevice {
+    /// Blocking receive on whichever handle this build holds — the async
+    /// build blocks on `AsyncDevice::recv` rather than keeping a second
+    /// blocking-capable handle around (see [`TunRsDevice`]'s docs).
+    fn blocking_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(feature = "async")]
         {
-            futures::executor::block_on(self.handle.recv(buf)).map_err(io_error)
+            futures::executor::block_on(self.handle.recv(buf))
         }
         #[cfg(not(feature = "async"))]
         {
-            self.handle.recv(buf).map_err(io_error)
+            self.handle.recv(buf)
         }
     }
 
-    fn send(&self, buf: &[u8]) -> Result<usize> {
+    /// Blocking send; see [`Self::blocking_recv`].
+    fn blocking_send(&self, buf: &[u8]) -> std::io::Result<usize> {
         #[cfg(feature = "async")]
         {
-            futures::executor::block_on(self.handle.send(buf)).map_err(io_error)
+            futures::executor::block_on(self.handle.send(buf))
         }
         #[cfg(not(feature = "async"))]
         {
-            self.handle.send(buf).map_err(io_error)
+            self.handle.send(buf)
         }
+    }
+}
+
+impl PacketIo for TunRsDevice {
+    fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        self.blocking_recv(buf).map_err(io_error)
+    }
+
+    fn send(&self, buf: &[u8]) -> Result<usize> {
+        self.blocking_send(buf).map_err(io_error)
     }
 }
 
