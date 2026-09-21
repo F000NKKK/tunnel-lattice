@@ -63,18 +63,17 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   `Capability::NATIVE_ASYNC` and falling back to `tunnel-lattice-async`'s
   thread-based adapter otherwise; `scripts/release.sh`/`gh_release.sh`
   release automation ported from `net-lattice`.
-- **0.2 (in progress):** privileged per-platform CI. Added `#[ignore]`d
+- **0.2 (done):** privileged per-platform CI. Added `#[ignore]`d
   `privileged_tests` to `tunnel-lattice-backend-tunrs` (open/mutate/tear
   down a real device) and a `privileged` CI job running them with `sudo`/
   Administrator on Linux, Windows, and macOS across all three feature sets
   — mirroring `net-lattice`'s privileged-job pattern, per `.claude/rules/
-  ci.md`'s "test platforms separately" rule. Verified locally on Linux under
-  real `CAP_NET_ADMIN` (a rootless container, not just compiling): this
-  found and fixed a genuine deadlock in the `tokio` feature (see
-  `CHANGELOG.md`'s `[Unreleased]` entry) that reading `tun-rs`'s source
-  alone would never have surfaced. Remaining: confirm the Windows/macOS legs
-  actually pass once this lands on GitHub Actions — the local run only
-  covers Linux.
+  ci.md`'s "test platforms separately" rule. This surfaced two real defects
+  that reading `tun-rs`'s source alone never would have: a genuine deadlock
+  in the `tokio` feature, and a missing `wintun.dll` on Windows runners
+  (both fixed; see `CHANGELOG.md`'s `[Unreleased]` entry). All 36 `ci`/
+  `privileged` jobs (3 OS × 3 feature sets, both workflows) pass on GitHub
+  Actions as of the fix landing on `main`.
 - **0.3 (proposed):** `Capability::PERSISTENT_DEVICES` and
   `Capability::MULTI_QUEUE`. Both bits are already defined in
   `tunnel-lattice-platform::Capability`, but no backend sets either one yet
