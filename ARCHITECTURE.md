@@ -191,21 +191,40 @@ on the owned value, not a `Handle`) does, so a `current_thread` runtime
 reproduces the same hang. See `tunnel-lattice-backend-tunrs`'s README,
 "`tokio` requires a multi-threaded runtime."
 
-`tunnel-lattice-async` provides a fallback for a backend with no native async
-path: `from_device` spawns one blocking worker thread per device bridging
-`PacketIo::recv` onto a `futures::Stream`. This is also why a *new* backend
-never needs its own async story to get one for free: implementing `PacketIo`
-alone already makes it usable through `tunnel-lattice-async`, and
-`AsyncPacketIo` is purely an additive optimization for a backend with a
-genuine native path — the facade's `Handle<D>` and `ConnectedDevice` bound
-are identical either way (see `tunnel-lattice`'s rustdoc).
+`tunnel-lattice-async` provides two ways to build the `futures::Stream`
+`Handle::packet_stream` returns: `from_async_device`, wrapping a backend's
+`AsyncPacketIo` directly with no worker thread at all (built on
+`futures::stream::unfold` over repeated `recv().await` calls), and
+`from_device`, the original thread-based bridge over blocking `PacketIo`
+for a backend with no native async path. `Handle::packet_stream` picks
+between them at runtime by checking `Capability::NATIVE_ASYNC` — this is
+also why a *new* backend never needs its own async story to get a stream at
+all: implementing `PacketIo` alone already makes it usable through
+`from_device`, and `AsyncPacketIo` is an additive optimization that
+`packet_stream` prefers automatically once implemented, not something a
+caller has to opt into by name.
+
+This distinction is not cosmetic. `from_async_device`'s stream is
+*genuinely* cancellable: dropping it drops the boxed, currently-polled
+`AsyncPacketIo::recv` future, which is ordinary Rust future-drop semantics
+— nothing is left running. `from_device`'s worker thread has no such
+guarantee: dropping the stream can only set a flag the thread checks
+*between* `recv` calls, so a worker parked inside a blocking `recv` with no
+further packets arriving keeps running until the device itself unblocks it
+(this remains `from_device`'s documented limitation for whatever backend
+actually needs it — a hypothetical one with no native async path at all;
+every backend `tunnel-lattice` ships as of this crate implements
+`AsyncPacketIo` whenever `packet_stream` is reachable in the first place, so
+`from_device` is not on the path any shipped build actually takes).
+`Handle::packet_stream`'s bound was tightened accordingly to require
+`AsyncPacketIo` (previously only `PacketIo`) — a pre-1.0 additive-in-effect
+change (see `versioning.md`) recorded as `TL-A-1`'s ADR index entry for this
+decision.
 
 Neither crate depends on Tokio, async-std, or smol directly by default —
 `tunnel-lattice`'s `async-io`/`tokio` features (mutually exclusive; enabling
 both is a compile error from `tun-rs` itself) are opt-in, so a caller who
-enables neither pulls in no async runtime at all. Known limitation: the
-thread-based adapter cannot forcibly cancel a worker blocked inside `recv`
-with no further packets arriving — see `tunnel-lattice-async`'s rustdoc.
+enables neither pulls in no async runtime at all.
 
 ## Platform and privilege notes
 

@@ -61,11 +61,13 @@ fn main() -> Result<()> {
   error from `tun-rs`) — either adds `Handle::packet_stream`, a
   `futures::Stream` of received packets. `async-io` selects `tun-rs`'s
   `async-io`/`blocking`-based backend (no tokio dependency); `tokio` selects
-  its tokio-based one. Uses a backend's native async path when it reports
-  `Capability::NATIVE_ASYNC` (as `tunnel-lattice-backend-tunrs` does with
-  either feature); otherwise falls back to `tunnel-lattice-async`'s
-  thread-based adapter. No async runtime dependency is imposed when neither
-  feature is enabled.
+  its tokio-based one. Uses a backend's native async path (no worker
+  thread; dropping the stream genuinely cancels the in-flight `recv`) when
+  it reports `Capability::NATIVE_ASYNC` — `tunnel-lattice-backend-tunrs`
+  does with either feature, which is the case whenever this method is
+  reachable at all — otherwise falls back to `tunnel-lattice-async`'s
+  thread-based adapter, whose shutdown is best-effort only. No async
+  runtime dependency is imposed when neither feature is enabled.
 
   **With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
   multi-threaded Tokio runtime entered on the calling thread**

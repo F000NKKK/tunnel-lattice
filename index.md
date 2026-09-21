@@ -86,12 +86,20 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   always safe on every platform without needing multi-queue at all) —
   raised as a pre-1.0 concern worth fixing now rather than leaving implicit.
   Verified against a real device under `CAP_NET_ADMIN`, not only compiled.
-- **0.4 (proposed):** cancellable `PacketStream` shutdown. `tunnel-lattice-
-  async::PacketStream::drop` currently cannot unblock a worker thread parked
-  inside a blocking `recv` with no further packets arriving — a documented
-  bootstrap-stage limitation (see the type's rustdoc and `ARCHITECTURE.md`,
-  "Async design"), not a hypothetical one. Needs either a cancellable `recv`
-  variant on `PacketIo` or a documented per-backend unblocking mechanism.
+- **0.4 (done):** cancellable `PacketStream` shutdown. `Handle::
+  packet_stream` now dispatches to `tunnel-lattice-async::from_async_device`
+  (built directly on `AsyncPacketIo` via `futures::stream::unfold`, no
+  worker thread) whenever `Capability::NATIVE_ASYNC` is set, instead of
+  always using the thread-bridge — dropping the stream now drops the
+  in-flight `recv` future, genuine cancellation rather than a best-effort
+  flag a parked worker thread might never check. `tun-rs`'s own
+  `InterruptEvent` mechanism was investigated first and ruled out: it's
+  only public on `SyncDevice`, never `AsyncDevice`, so it could not have
+  reached the actual problem (`packet_stream` is only reachable when the
+  handle is already async). See ADR-0001 (`TL-A-2`) for the full design
+  rationale and alternatives considered. Verified against a real device
+  under `CAP_NET_ADMIN` on both `async-io` and `tokio` builds, plus two
+  non-privileged unit tests against mock `AsyncPacketIo` implementations.
 - **Unscheduled:** a hand-written per-OS TUN/TAP backend (`tunnel-lattice-
   backend-linux`/`-windows`/`-darwin`, mirroring `net-lattice`'s split) to
   eventually let `tun-rs` be dropped, per the original design goal recorded

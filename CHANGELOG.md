@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Fixed `Handle::packet_stream`'s cancellation:** it previously always
+  used `tunnel-lattice-async`'s thread-based bridge, regardless of whether
+  the backend also implemented `AsyncPacketIo`/reported
+  `Capability::NATIVE_ASYNC` — meaning dropping the stream could only set a
+  flag a worker thread checks *between* `recv` calls, never join it, so a
+  worker parked in a blocking `recv` with no further packets kept running
+  until the device itself unblocked it. Now `packet_stream` dispatches to a
+  new `tunnel_lattice_async::from_async_device` when `Capability::
+  NATIVE_ASYNC` is set: no worker thread at all, built directly from
+  `AsyncPacketIo::recv` via `futures::stream::unfold`, so dropping the
+  stream drops the in-flight future — genuine, immediate cancellation, the
+  same as dropping any other future. `Handle::packet_stream`'s bound
+  tightened from `PacketIo` to `PacketIo + AsyncPacketIo +
+  CapabilityProvider` accordingly (every backend `tunnel-lattice` ships
+  already satisfies this whenever the method is reachable at all). Full
+  rationale and alternatives considered recorded as an ADR. Investigated
+  `tun-rs`'s own `InterruptEvent`/`recv_intr` mechanism first; found it's
+  only public on `SyncDevice`, not `AsyncDevice`, so it could not have
+  fixed this specific problem regardless.
+
 ## [0.3.0]
 
 - Added `tunnel_lattice_platform::PersistentDevice` (`Handle::persist`) and
