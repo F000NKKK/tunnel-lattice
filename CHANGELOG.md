@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that runs them with `sudo`/Administrator on all three target platforms —
   this bug was only found by actually running the new tests against a real
   device, not by reading `tun-rs`'s source.
+- Documented (`tunnel-lattice-backend-tunrs`'s and `tunnel-lattice`'s
+  READMEs) that `wintun.dll` must ship alongside a Windows application using
+  this crate's default TUN backend — `tun-rs` loads it at runtime and does
+  not vendor it, and its absence surfaces as an unhelpful
+  `Error::Platform(PlatformErrorCode::Windows(0))` with no OS error code
+  rather than a named "DLL not found" error. Found via the `privileged` CI
+  job's real Windows runs, all three of which failed this way before the
+  job was updated to download `wintun.dll` (pinned to the 0.14.1 build) and
+  add it to `PATH`.
 
 ## [0.1.0]
 
