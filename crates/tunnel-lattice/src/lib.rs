@@ -46,7 +46,9 @@ pub use tunnel_lattice_core::{Error, Result};
 pub use tunnel_lattice_model::{
     AdminState, DesiredAdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
 };
-pub use tunnel_lattice_platform::{Capability, CapabilityProvider};
+pub use tunnel_lattice_platform::{
+    Capability, CapabilityProvider, MultiQueueProvider, PersistentDevice,
+};
 use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
 
 /// An open device handle bound to this facade's concrete model types.
@@ -111,13 +113,59 @@ impl Tunnel<tunnel_lattice_backend_tunrs::TunRsBackend> {
 
 /// An open TUN/TAP device.
 ///
-/// Wraps the backend's device handle in an `Arc` unconditionally (not only
-/// under the `async-io`/`tokio` features) so `Handle::packet_stream` can
-/// share it with a background worker thread without a separate wrapping
-/// step at the call site. Referenced as plain text, not an intra-doc link,
-/// for the same reason as the crate-level docs above.
+/// ## Ownership and concurrency contract
+///
+/// `Handle<D>` wraps the backend's device handle in an `Arc<D>` — there is
+/// no single owner in the usual sense; the underlying device stays open for
+/// as long as *any* clone of the `Arc` is alive, and `Handle` is [`Clone`]
+/// specifically to make that sharing explicit and deliberate rather than an
+/// implementation detail only `packet_stream` uses internally.
+///
+/// - **Multiple readers/writers are always safe on every backend.**
+///   [`PacketIo::recv`]/[`PacketIo::send`] take `&self`, not `&mut self` —
+///   this is a property of the trait, not an accident, and every backend
+///   this crate ships (`tunnel-lattice-backend-tunrs`, on Linux, macOS, and
+///   Windows) is verified safe for concurrent `recv`/`send` from multiple
+///   threads sharing one `Handle` clone. This "naive" multiplexing needs no
+///   feature or capability check; see `ARCHITECTURE.md`'s async design
+///   notes for why `tun-rs`'s own `recv`/`send` signatures already commit
+///   to this.
+/// - **`additional_queue` (with `D: MultiQueueProvider`) is a different,
+///   stronger thing**: it returns an independent `Handle` over a *second*
+///   OS-level queue on the same device (Linux `IFF_MULTI_QUEUE` only —
+///   `Capability::MULTI_QUEUE`), for hardware-scheduled per-CPU
+///   distribution instead of every thread contending on one queue. The two
+///   returned handles do not share an `Arc`: dropping one does not affect
+///   the other, and each closes only its own queue on drop.
+/// - **Drop closes the device once every clone is gone.** `D`'s own `Drop`
+///   impl (e.g. `tun_rs::SyncDevice`/`AsyncDevice`'s, which close the
+///   underlying file descriptor) runs when the last `Arc<D>` referencing it
+///   is dropped — which may be a `Handle` clone, a live `PacketStream`,
+///   or both, in any order. No `Handle` method explicitly "closes" a
+///   device; there is nothing to call beyond letting every reference drop.
+/// - **`packet_stream` holds its own `Arc` clone**, independent of the
+///   `Handle` it was created from — dropping the original `Handle` while a
+///   `PacketStream` is still alive does not close the device early, and
+///   vice versa. See `tunnel_lattice_async::PacketStream`'s own docs for
+///   its worker-thread shutdown caveat on `Drop` (a known limitation, not
+///   related to this ownership model).
+///
+/// Referenced as plain text, not an intra-doc link, for the same reason as
+/// the crate-level docs above (`packet_stream` only exists under the
+/// `async-io`/`tokio` features).
 pub struct Handle<D> {
     device: std::sync::Arc<D>,
+}
+
+impl<D> Clone for Handle<D> {
+    /// Cheap: clones the underlying `Arc<D>`, not the device itself — see
+    /// the type's docs on what sharing a clone means for concurrent access
+    /// and `Drop`.
+    fn clone(&self) -> Self {
+        Handle {
+            device: std::sync::Arc::clone(&self.device),
+        }
+    }
 }
 
 impl<D> Handle<D>
@@ -147,6 +195,34 @@ where
     /// Returns the runtime-dependent capabilities this device has available.
     pub fn capabilities(&self) -> Capability {
         self.device.capabilities()
+    }
+}
+
+impl<D> Handle<D>
+where
+    D: PersistentDevice,
+{
+    /// Marks this device persistent — see [`PersistentDevice`]'s docs.
+    /// Requires `Capability::PERSISTENT_DEVICES`; only `TunRsDevice` on
+    /// Linux implements this today.
+    pub fn persist(&self) -> Result<()> {
+        self.device.persist()
+    }
+}
+
+impl<D> Handle<D>
+where
+    D: MultiQueueProvider,
+{
+    /// Duplicates this device's hardware-scheduled queue for use from
+    /// another thread — see [`MultiQueueProvider`]'s docs. Requires
+    /// `Capability::MULTI_QUEUE` and that the device was opened with
+    /// `DeviceConfig::with_multi_queue(true)`; only `TunRsDevice` on Linux
+    /// implements this today.
+    pub fn additional_queue(&self) -> Result<Handle<D>> {
+        Ok(Handle {
+            device: std::sync::Arc::new(self.device.additional_queue()?),
+        })
     }
 }
 
