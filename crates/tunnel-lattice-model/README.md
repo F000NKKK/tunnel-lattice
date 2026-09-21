@@ -31,8 +31,12 @@ crate — Tunnel Lattice creates and configures the virtual interface only).
 ```rust
 use tunnel_lattice_model::{DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, DesiredAdminState};
 
-let config = DeviceConfig::new(DeviceKind::Tun).with_name("tun0").with_mtu(1500);
+let config = DeviceConfig::new(DeviceKind::Tun)
+    .with_name("tun0")
+    .with_mtu(1500)
+    .with_multi_queue(true);
 assert_eq!(config.kind, DeviceKind::Tun);
+assert!(config.multi_queue);
 
 let patch = DeviceConfigPatch::new(DeviceId::new(1), Some(DesiredAdminState::Up), None)?;
 assert_eq!(patch.admin_state(), Some(DesiredAdminState::Up));
