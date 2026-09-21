@@ -17,12 +17,12 @@ keywords = ["cross-platform","rust","networking","tunnel","tun"]
 # net-lattice's workspace-dependency pattern (see ARCHITECTURE.md's API
 # Stability Rules for why each crate's version is independent).
 [workspace.dependencies]
-tunnel-lattice-core = { path = "crates/tunnel-lattice-core", version = "0.1.0" }
-tunnel-lattice-model = { path = "crates/tunnel-lattice-model", version = "0.1.0" }
-tunnel-lattice-platform = { path = "crates/tunnel-lattice-platform", version = "0.1.0" }
-tunnel-lattice-backend-tunrs = { path = "crates/tunnel-lattice-backend-tunrs", version = "0.1.0" }
-tunnel-lattice-async = { path = "crates/tunnel-lattice-async", version = "0.1.0" }
-tunnel-lattice = { path = "crates/tunnel-lattice", version = "0.1.0" }
+tunnel-lattice-core = { path = "crates/tunnel-lattice-core", version = "0.2.0" }
+tunnel-lattice-model = { path = "crates/tunnel-lattice-model", version = "0.2.0" }
+tunnel-lattice-platform = { path = "crates/tunnel-lattice-platform", version = "0.2.0" }
+tunnel-lattice-backend-tunrs = { path = "crates/tunnel-lattice-backend-tunrs", version = "0.2.0" }
+tunnel-lattice-async = { path = "crates/tunnel-lattice-async", version = "0.2.0" }
+tunnel-lattice = { path = "crates/tunnel-lattice", version = "0.2.0" }
 
 bitflags = "2"
 futures = "0.3"
