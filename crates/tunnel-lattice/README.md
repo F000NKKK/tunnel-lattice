@@ -15,8 +15,8 @@ application-facing Tunnel Lattice crate.
   state;
 - `Handle::apply(DeviceConfigPatch)`, changing an open device's MTU or
   administrative state;
-- with the `async` feature: `Handle::packet_stream`, a `futures::Stream` of
-  received packets.
+- with the `async-io` or `tokio` feature (mutually exclusive):
+  `Handle::packet_stream`, a `futures::Stream` of received packets.
 
 This crate does not assign IP addresses to the interfaces it creates — see
 `net-lattice` in the sibling Lattice ecosystem for OS network configuration
