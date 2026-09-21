@@ -258,7 +258,9 @@ impl CapabilityProvider for TunRsDevice {
 /// restore on any exit path (including a panic through `expect`).
 #[cfg(test)]
 mod privileged_tests {
-    use tunnel_lattice_model::{DesiredAdminState, DeviceConfigPatch};
+    #[cfg(target_os = "linux")]
+    use tunnel_lattice_model::DesiredAdminState;
+    use tunnel_lattice_model::DeviceConfigPatch;
     use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
 
     use super::*;
