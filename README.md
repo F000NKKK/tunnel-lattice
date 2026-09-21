@@ -34,7 +34,10 @@ in a future `0.x` release (see `versioning.md`'s pre-1.0 policy).
   the optional `async-io` or `tokio` feature (mutually exclusive), through a
   `futures::Stream` — no async runtime is pulled in unless one of them is
   enabled;
-- Re-reads and patches an open device's MTU and administrative state.
+- Re-reads and patches an open device's MTU and administrative state;
+- On Linux, marks a device persistent across process exit and duplicates a
+  hardware-scheduled queue on the same device for another thread — see
+  `crates/tunnel-lattice/README.md`, "Persistent devices and multi-queue."
 
 Tunnel Lattice does not assign IP addresses to the interfaces it creates —
 see "Interop with net-lattice" below.
