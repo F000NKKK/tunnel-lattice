@@ -53,6 +53,17 @@ fn main() -> Result<()> {
   thread-based adapter. No async runtime dependency is imposed when neither
   feature is enabled.
 
+  **With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
+  multi-threaded Tokio runtime entered on the calling thread**
+  (`#[tokio::main]`'s default flavor, or `Builder::new_multi_thread()`) —
+  not only `packet_stream`. `tunnel-lattice-backend-tunrs`'s `PacketIo`
+  drives tun-rs's Tokio-backed handle through
+  `tokio::runtime::Handle::current().block_on`, which only polls that
+  runtime's I/O driver on the `multi_thread` flavor; on `current_thread` the
+  first `recv`/`send` call hangs forever. See that crate's README, "`tokio`
+  requires a multi-threaded runtime," for why. Prefer `async-io` if a
+  single-threaded runtime is a hard requirement.
+
 ## Platform and privilege notes
 
 Creating a TUN/TAP device generally requires `CAP_NET_ADMIN` on Linux,
