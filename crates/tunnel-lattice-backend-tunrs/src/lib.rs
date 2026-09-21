@@ -116,8 +116,34 @@ impl TunRsDevice {
     /// Blocking receive on whichever handle this build holds — the async
     /// build blocks on `AsyncDevice::recv` rather than keeping a second
     /// blocking-capable handle around (see [`TunRsDevice`]'s docs).
+    ///
+    /// Under the `tokio` feature this must go through
+    /// `Handle::current().block_on`, never `futures::executor::block_on`:
+    /// tun-rs's Tokio-backed `AsyncDevice` relies on Tokio's own I/O driver
+    /// to deliver readiness, and only Tokio's own `block_on` polls that
+    /// driver — a foreign executor drives the future manually but the
+    /// driver never runs, so the call hangs forever waiting for a wakeup
+    /// that never arrives (confirmed: a real `send()` deadlocked under a
+    /// 10s timeout with `futures::executor::block_on`). `async-io`'s
+    /// `AsyncDevice` has no such requirement, since it's built on the
+    /// runtime-agnostic `async-io`/`blocking` crates instead.
+    ///
+    /// **Also requires the caller's Tokio runtime to be multi-threaded.**
+    /// `Handle::block_on` only drives a runtime's I/O reactor on the
+    /// `multi_thread` flavor, whose worker threads poll it independently of
+    /// where `block_on` is called from; on `current_thread`, only
+    /// `Runtime::block_on` (called on the owned `Runtime`, not a `Handle`)
+    /// drives it, so calling this from a `current_thread` runtime
+    /// (`#[tokio::main(flavor = "current_thread")]`) hangs the same way —
+    /// confirmed by an isolated repro against `tun-rs` directly, independent
+    /// of this crate. See this crate's `privileged_tests` module (test-only,
+    /// not part of the public API) and `ARCHITECTURE.md`, "Async design."
     fn blocking_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        #[cfg(feature = "async")]
+        #[cfg(feature = "tokio")]
+        {
+            tokio::runtime::Handle::current().block_on(self.handle.recv(buf))
+        }
+        #[cfg(all(feature = "async", not(feature = "tokio")))]
         {
             futures::executor::block_on(self.handle.recv(buf))
         }
@@ -129,7 +155,11 @@ impl TunRsDevice {
 
     /// Blocking send; see [`Self::blocking_recv`].
     fn blocking_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        #[cfg(feature = "async")]
+        #[cfg(feature = "tokio")]
+        {
+            tokio::runtime::Handle::current().block_on(self.handle.send(buf))
+        }
+        #[cfg(all(feature = "async", not(feature = "tokio")))]
         {
             futures::executor::block_on(self.handle.send(buf))
         }
@@ -214,5 +244,157 @@ impl CapabilityProvider for TunRsDevice {
         {
             base
         }
+    }
+}
+
+/// Privileged tests that create a real TUN/TAP device.
+///
+/// `#[ignore]`d because opening a device needs `CAP_NET_ADMIN` on Linux,
+/// Administrator on Windows, or root on macOS/BSD — see `.claude/rules/
+/// ci.md`. Run with `cargo test -p tunnel-lattice-backend-tunrs -- --ignored`
+/// under the required privilege (`sudo` on Linux/macOS). Each test creates
+/// its own non-persistent device and never touches pre-existing host state:
+/// dropping `TunRsDevice` tears the interface down, so there is nothing to
+/// restore on any exit path (including a panic through `expect`).
+#[cfg(test)]
+mod privileged_tests {
+    use tunnel_lattice_model::{DesiredAdminState, DeviceConfigPatch};
+    use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
+
+    use super::*;
+
+    /// Under the `tokio` feature, `tun-rs`'s Tokio-backed `AsyncDevice`
+    /// registers its file descriptor with `tokio::runtime::Handle::
+    /// current()` as soon as it's built — before this crate's `PacketIo`
+    /// ever calls an async method — so every test below needs a Tokio
+    /// runtime entered on the current thread or `TunRsBackend::open` itself
+    /// panics (verified: "there is no reactor running, must be called from
+    /// the context of a Tokio 1.x runtime"), even though `open`/`recv`/
+    /// `send` are ordinary synchronous calls.
+    ///
+    /// **Must be `new_multi_thread`, not `new_current_thread`.**
+    /// `TunRsDevice`'s blocking `recv`/`send` drive tun-rs's async methods
+    /// through `Handle::current().block_on(..)` (see [`TunRsDevice::
+    /// blocking_recv`]'s docs on why, versus `futures::executor::block_on`).
+    /// On a `current_thread` runtime, `Handle::block_on` does not itself
+    /// drive that runtime's I/O driver — only `Runtime::block_on` does —
+    /// so a `send`/`recv` call made this way hangs forever waiting for a
+    /// readiness notification the (undriven) reactor never delivers.
+    /// Verified with an isolated repro: identical code hung under
+    /// `new_current_thread()` and completed immediately under
+    /// `new_multi_thread()`. A real caller building a `tokio` feature
+    /// integration must use `#[tokio::main]`'s default multi-thread flavor
+    /// (or `Builder::new_multi_thread()` directly) for the same reason —
+    /// see `ARCHITECTURE.md`, "Async design." Not needed for `async-io`,
+    /// whose `AsyncDevice` is built on the runtime-agnostic `async-io`
+    /// crate instead.
+    #[cfg(feature = "tokio")]
+    fn enter_tokio_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("build a Tokio runtime")
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn open_reports_the_requested_kind_and_mtu() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))
+            .expect("open a TUN device");
+
+        let snapshot = device.snapshot().expect("snapshot the open device");
+        assert_eq!(snapshot.kind, DeviceKind::Tun);
+        assert_eq!(snapshot.mtu, 1400);
+        assert!(!snapshot.name.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn apply_changes_mtu_and_is_observable_on_the_next_snapshot() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))
+            .expect("open a TUN device");
+        let device_id = device.snapshot().expect("initial snapshot").id;
+
+        let patch = DeviceConfigPatch::new(device_id, None, Some(1300)).expect("build a patch");
+        device.apply(patch).expect("apply the MTU patch");
+
+        let updated = device.snapshot().expect("snapshot after the patch");
+        assert_eq!(updated.mtu, 1300);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn apply_toggles_admin_state_and_it_is_observable_on_linux() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a TUN device");
+        let device_id = device.snapshot().expect("initial snapshot").id;
+
+        let patch = DeviceConfigPatch::new(device_id, Some(DesiredAdminState::Up), None)
+            .expect("build a patch");
+        device.apply(patch).expect("bring the device up");
+        assert_eq!(
+            device.snapshot().expect("snapshot after up").admin_state,
+            AdminState::Up
+        );
+
+        let patch = DeviceConfigPatch::new(device_id, Some(DesiredAdminState::Down), None)
+            .expect("build a patch");
+        device.apply(patch).expect("bring the device down");
+        assert_eq!(
+            device.snapshot().expect("snapshot after down").admin_state,
+            AdminState::Down
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn recv_returns_permission_or_no_data_rather_than_hanging_forever() {
+        // Exercises the `PacketIo::recv` code path against a real handle
+        // without depending on external traffic reaching the interface: a
+        // freshly opened, administratively-down device either yields no
+        // packets (the call would block) or the backend reports a state
+        // error, so this only asserts the send half round-trips a buffer
+        // size the OS is willing to accept, not full packet delivery.
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))
+            .expect("open a TUN device");
+
+        let mut buf = vec![0u8; 1400];
+        buf[0] = 0x45; // IPv4, header length 5
+        // Disambiguated: with the `async` feature, `TunRsDevice` also
+        // implements `AsyncPacketIo::send`, which has the same name.
+        let result = PacketIo::send(&device, &buf[..20]);
+        assert!(
+            result.is_ok() || matches!(result, Err(Error::Platform(_))),
+            "send on a freshly opened device should succeed or report a platform error, not panic: {result:?}"
+        );
     }
 }

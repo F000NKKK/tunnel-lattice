@@ -25,7 +25,15 @@ async = ["tunnel-lattice-platform/async", "dep:futures"]
 # features") if both are active in the same build, so `--all-features` is
 # not a valid way to build this crate; test each feature set separately.
 async-io = ["async", "tun-rs/async_io"]
-tokio = ["async", "tun-rs/async_tokio"]
+# `dep:tokio` is required, not just tun-rs's own tokio pull-in: `PacketIo`'s
+# blocking `recv`/`send` must drive tun-rs's Tokio-backed `AsyncDevice`
+# through the caller's own entered runtime (`Handle::current().block_on`),
+# not through `futures::executor::block_on` — that foreign executor never
+# polls Tokio's I/O driver, so the future's readiness notification never
+# arrives and the call hangs forever (verified: a real `send()` deadlocked
+# under a 10s timeout before this was fixed). `async-io`'s `AsyncDevice` has
+# no such requirement — it's built on the runtime-agnostic `async-io` crate.
+tokio = ["async", "tun-rs/async_tokio", "dep:tokio"]
 
 [dependencies]
 tunnel-lattice-core = { workspace = true }
@@ -33,3 +41,4 @@ tunnel-lattice-model = { workspace = true }
 tunnel-lattice-platform = { workspace = true }
 tun-rs = { workspace = true }
 futures = { workspace = true, optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
