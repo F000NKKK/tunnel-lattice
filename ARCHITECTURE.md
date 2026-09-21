@@ -92,26 +92,38 @@ at the boundary; callers never match on a raw `errno`/`DWORD` directly.
 
 ## Frozen public API surface
 
-Tunnel Lattice has not published a release yet (see `index.md`,
-`SUPPORT.md`). Nothing in this workspace is API-frozen; every type, trait,
-and feature flag described here may still change before `0.1.0` ships.
+`0.1.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
+workspace is API-frozen; every type, trait, and feature flag described here
+may still change in a future `0.x` release (see `versioning.md`'s pre-1.0
+policy).
 
 ## Async design
 
 `tunnel-lattice-platform`'s `async` feature adds `AsyncPacketIo`, an
 `impl Future`-returning trait a backend implements when it has genuine
 non-blocking I/O (an async-registered file descriptor, overlapped I/O, ...).
-`tunnel-lattice-backend-tunrs` implements it via a cloned `tun_rs::AsyncDevice`
-handle and reports `Capability::NATIVE_ASYNC`.
+`tunnel-lattice-backend-tunrs` implements it directly on its
+`tun_rs::AsyncDevice` handle (built via `DeviceBuilder::build_async`, not
+cloned from a separate sync handle — `tun_rs::SyncDevice::try_clone` only
+exists on Linux) and reports `Capability::NATIVE_ASYNC`; its blocking
+`PacketIo` impl then blocks on the same async methods
+(`futures::executor::block_on`) rather than keeping a second handle.
 
 `tunnel-lattice-async` provides a fallback for a backend with no native async
 path: `from_device` spawns one blocking worker thread per device bridging
-`PacketIo::recv` onto a `futures::Stream`. Neither crate depends on Tokio,
-async-std, or smol directly by default — `tunnel-lattice`'s `async` feature
-is opt-in, so a caller who never enables it pulls in no async runtime at all.
-Known limitation: the thread-based adapter cannot forcibly cancel a worker
-blocked inside `recv` with no further packets arriving — see
-`tunnel-lattice-async`'s rustdoc.
+`PacketIo::recv` onto a `futures::Stream`. This is also why a *new* backend
+never needs its own async story to get one for free: implementing `PacketIo`
+alone already makes it usable through `tunnel-lattice-async`, and
+`AsyncPacketIo` is purely an additive optimization for a backend with a
+genuine native path — the facade's `Handle<D>` and `ConnectedDevice` bound
+are identical either way (see `tunnel-lattice`'s rustdoc).
+
+Neither crate depends on Tokio, async-std, or smol directly by default —
+`tunnel-lattice`'s `async-io`/`tokio` features (mutually exclusive; enabling
+both is a compile error from `tun-rs` itself) are opt-in, so a caller who
+enables neither pulls in no async runtime at all. Known limitation: the
+thread-based adapter cannot forcibly cancel a worker blocked inside `recv`
+with no further packets arriving — see `tunnel-lattice-async`'s rustdoc.
 
 ## Platform and privilege notes
 
