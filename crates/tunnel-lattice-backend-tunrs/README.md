@@ -35,6 +35,23 @@ two async backends (`tun-rs/async_io`, no runtime dependency beyond
 `async-io`/`blocking`; `tun-rs/async_tokio`, which pulls in tokio).
 Enabling both is a compile error from `tun-rs` itself, not from this crate.
 
+### `tokio` requires a multi-threaded runtime
+
+With the `tokio` feature, every call into `TunRsDevice` — including plain
+`PacketIo::recv`/`send`, not only the async API — must happen while a
+**multi-threaded** Tokio runtime is entered on the calling thread
+(`#[tokio::main]`'s default flavor, or `Builder::new_multi_thread()`
+explicitly). `tokio::runtime::Handle::block_on` only drives that runtime's
+I/O reactor on the `multi_thread` flavor, whose worker threads poll it
+independently of where `block_on` is called from; on `current_thread`, only
+`Runtime::block_on` (called on the owned `Runtime` value, not a `Handle`)
+drives it, so a `current_thread` runtime
+(`#[tokio::main(flavor = "current_thread")]`) hangs the first `recv`/`send`
+call forever. This was confirmed with an isolated repro against `tun-rs`
+directly (not a bug specific to this crate) and is exercised by this crate's
+`privileged_tests`. Prefer the `async-io` feature instead if a
+single-threaded runtime is a hard requirement.
+
 ## Why this is one shared crate, not three
 
 `tun-rs` already abstracts Linux/Windows/macOS/BSD TUN/TAP differences
