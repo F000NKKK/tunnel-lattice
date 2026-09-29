@@ -32,7 +32,20 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// Stateless: opening a device does not go through a persistent connection
 /// object the way `net-lattice`'s Netlink/WFP/route-socket backends do —
 /// each [`TunRsDevice`] is independent of the others.
+///
+/// Marked `#[non_exhaustive]` so configuration can be added later without a
+/// breaking change: outside this crate, construct it with
+/// [`TunRsBackend::new`] or [`Default`], not the `TunRsBackend` literal.
+///
+/// ```
+/// use tunnel_lattice_backend_tunrs::TunRsBackend;
+///
+/// let backend = TunRsBackend::new();
+/// let same = TunRsBackend::default();
+/// # let _ = (backend, same);
+/// ```
 #[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
 pub struct TunRsBackend;
 
 impl TunRsBackend {
@@ -77,10 +90,16 @@ pub struct TunRsDevice {
 /// | `AlreadyExists`                                  | [`Error::AlreadyExists`]    |
 /// | `BrokenPipe`, `UnexpectedEof`, `NotConnected`    | [`Error::Disconnected`]     |
 /// | `Unsupported`                                    | [`Error::Unsupported`]      |
-/// | anything else                                    | [`Error::Platform`]         |
+/// | anything else, with a raw OS code                | [`Error::Platform`] with the target's tag (`Linux`/`Windows`/`Darwin`) and that code |
+/// | anything else, without a raw OS code             | `Error::Platform(PlatformErrorCode::Unknown)` |
 ///
 /// The typed variants intentionally drop the raw OS code: they are the
 /// primary contract, [`Error::Platform`] is only the diagnostic fallback.
+/// A code-less error (e.g. one `tun-rs` builds with `io::Error::other`) is
+/// reported as [`PlatformErrorCode::Unknown`] rather than a fabricated `0`
+/// code. On a target other than Linux, Windows, and macOS, where
+/// [`PlatformErrorCode`] has no matching tag, every unmapped error is
+/// [`PlatformErrorCode::Unknown`].
 fn io_error(err: std::io::Error) -> Error {
     use std::io::ErrorKind;
 
@@ -99,32 +118,39 @@ fn io_error(err: std::io::Error) -> Error {
         // the current device configuration (e.g. cloning a queue on a
         // device that wasn't opened with multi-queue) as
         // `io::ErrorKind::Unsupported` with no raw OS error code —
-        // `Error::Platform(..(0))` would be as unhelpful here as the
-        // wintun.dll-missing case was for a genuinely OS-level failure (see
-        // this crate's README). `ErrorKind::Unsupported` is a portable
+        // `Error::Platform(PlatformErrorCode::Unknown)` would say nothing
+        // about what went wrong. `ErrorKind::Unsupported` is a portable
         // Rust-level signal, not an OS one, so it maps directly onto our
         // own `Error::Unsupported` instead.
         ErrorKind::Unsupported => return Error::Unsupported,
         _ => {}
     }
+    Error::Platform(platform_code(err.raw_os_error()))
+}
+
+/// Tags a raw OS error code with the current target's platform, or returns
+/// [`PlatformErrorCode::Unknown`] when there is no code or no matching tag.
+fn platform_code(raw: Option<i32>) -> PlatformErrorCode {
+    let Some(code) = raw else {
+        return PlatformErrorCode::Unknown;
+    };
     #[cfg(target_os = "linux")]
     {
-        Error::Platform(PlatformErrorCode::Linux(err.raw_os_error().unwrap_or(0)))
+        PlatformErrorCode::Linux(code)
     }
     #[cfg(target_os = "windows")]
     {
-        Error::Platform(PlatformErrorCode::Windows(
-            err.raw_os_error().unwrap_or(0) as u32
-        ))
+        // `std` stores a Windows `DWORD` in an `i32`; reinterpret the bits.
+        PlatformErrorCode::Windows(code as u32)
     }
     #[cfg(target_os = "macos")]
     {
-        Error::Platform(PlatformErrorCode::Darwin(err.raw_os_error().unwrap_or(0)))
+        PlatformErrorCode::Darwin(code)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = err;
-        Error::Unsupported
+        let _ = code;
+        PlatformErrorCode::Unknown
     }
 }
 
@@ -276,13 +302,22 @@ impl DeviceMutator for TunRsDevice {
     type DeviceConfigPatch = DeviceConfigPatch;
 
     fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()> {
+        use tunnel_lattice_model::DesiredAdminState;
+
+        // Resolve the requested admin state before any native call, so a
+        // `DesiredAdminState` variant this backend does not know (the enum is
+        // `#[non_exhaustive]`) is rejected without changing the MTU first.
+        let enable = match patch.admin_state() {
+            None => None,
+            Some(DesiredAdminState::Up) => Some(true),
+            Some(DesiredAdminState::Down) => Some(false),
+            Some(_) => return Err(Error::Unsupported),
+        };
         if let Some(mtu) = patch.mtu() {
             let mtu = u16::try_from(mtu).map_err(|_| Error::InvalidState)?;
             self.handle.set_mtu(mtu).map_err(io_error)?;
         }
-        if let Some(admin_state) = patch.admin_state() {
-            use tunnel_lattice_model::DesiredAdminState;
-            let enable = matches!(admin_state, DesiredAdminState::Up);
+        if let Some(enable) = enable {
             self.handle.enabled(enable).map_err(io_error)?;
         }
         Ok(())
@@ -391,14 +426,58 @@ mod io_error_tests {
             io::ErrorKind::Interrupted,
         ] {
             let mapped = map_kind(kind);
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             assert!(
                 matches!(mapped, Error::Platform(_)),
                 "{kind:?} should stay Error::Platform, got {mapped:?}"
             );
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            assert!(matches!(mapped, Error::Unsupported));
         }
+    }
+
+    /// An error with no raw OS code (as `tun-rs` builds with
+    /// `io::Error::other`/`io::Error::new`) maps to
+    /// `PlatformErrorCode::Unknown`, never a fabricated `…(0)` code.
+    #[test]
+    fn code_less_errors_map_to_unknown_platform_code() {
+        for err in [
+            io::Error::other("synthetic code-less failure"),
+            io::Error::new(io::ErrorKind::InvalidInput, "name too long"),
+            io::Error::new(io::ErrorKind::Interrupted, "cancel"),
+            io::Error::from(io::ErrorKind::TimedOut),
+        ] {
+            assert!(err.raw_os_error().is_none());
+            let mapped = io_error(err);
+            assert!(
+                matches!(mapped, Error::Platform(PlatformErrorCode::Unknown)),
+                "a code-less error should map to Platform(Unknown), got {mapped:?}"
+            );
+        }
+    }
+
+    /// Typed kinds still win over the `Unknown` fallback when there is no
+    /// raw OS code.
+    #[test]
+    fn code_less_typed_kinds_keep_their_typed_variant() {
+        assert!(matches!(
+            io_error(io::Error::new(io::ErrorKind::NotFound, "No driver found")),
+            Error::NotFound
+        ));
+        assert!(matches!(
+            io_error(io::Error::from(io::ErrorKind::Unsupported)),
+            Error::Unsupported
+        ));
+    }
+
+    #[test]
+    fn platform_code_tags_a_present_code_and_reports_unknown_otherwise() {
+        assert_eq!(platform_code(None), PlatformErrorCode::Unknown);
+        #[cfg(target_os = "linux")]
+        assert_eq!(platform_code(Some(5)), PlatformErrorCode::Linux(5));
+        #[cfg(target_os = "windows")]
+        assert_eq!(platform_code(Some(5)), PlatformErrorCode::Windows(5));
+        #[cfg(target_os = "macos")]
+        assert_eq!(platform_code(Some(5)), PlatformErrorCode::Darwin(5));
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        assert_eq!(platform_code(Some(5)), PlatformErrorCode::Unknown);
     }
 
     /// Native codes go through `std`'s own errno → `ErrorKind` translation,

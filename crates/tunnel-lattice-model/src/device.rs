@@ -44,7 +44,27 @@ pub enum AdminState {
 ///
 /// Has no `Unknown` variant: a caller can request `Up` or `Down` only,
 /// never the observed-only `AdminState::Unknown`.
+///
+/// Marked `#[non_exhaustive]`: a `match` outside this crate needs a
+/// wildcard arm, and a backend should reject a variant it does not
+/// recognize rather than guess.
+///
+/// ```
+/// use tunnel_lattice_model::DesiredAdminState;
+///
+/// fn enable(state: DesiredAdminState) -> Option<bool> {
+///     match state {
+///         DesiredAdminState::Up => Some(true),
+///         DesiredAdminState::Down => Some(false),
+///         // Required: the enum is `#[non_exhaustive]`.
+///         _ => None,
+///     }
+/// }
+///
+/// assert_eq!(enable(DesiredAdminState::Down), Some(false));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DesiredAdminState {
     /// Request the device be administratively enabled.
     Up,

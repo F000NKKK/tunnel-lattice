@@ -95,6 +95,11 @@ Backend отображает свою нативную ошибку (сейча�
 `Unsupported`, а `BrokenPipe`/`UnexpectedEof`/`NotConnected` → `Disconnected`);
 только виды без типизированного аналога попадают в
 `Platform(PlatformErrorCode)`.
+`PlatformErrorCode` сам помечен `#[non_exhaustive]` (`Linux(i32)`,
+`Windows(u32)`, `Darwin(i32)`, `Unknown`): нативный сбой без кода ошибки
+ОС, а также сбой на платформе, для которой нет своего тега, сообщается как
+`Platform(PlatformErrorCode::Unknown)` — а не выдуманный код `0`, который
+на любой платформе означал бы «успех».
 
 ## Зафиксированный публичный API
 

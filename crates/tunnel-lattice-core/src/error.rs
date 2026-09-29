@@ -38,7 +38,28 @@ pub enum Error {
 /// Linux errno is a signed `i32`, Windows error codes are an unsigned
 /// `DWORD` (`u32`); collapsing both into one untyped integer would either
 /// truncate one of them or imply the two are comparable, which they are not.
+///
+/// Marked `#[non_exhaustive]`: new platform tags may be added in a minor
+/// release, so a `match` outside this crate needs a wildcard arm.
+///
+/// ```
+/// use tunnel_lattice_core::PlatformErrorCode;
+///
+/// fn describe(code: PlatformErrorCode) -> String {
+///     match code {
+///         PlatformErrorCode::Linux(errno) => format!("Linux errno {errno}"),
+///         PlatformErrorCode::Windows(code) => format!("Windows error {code}"),
+///         PlatformErrorCode::Darwin(errno) => format!("Darwin errno {errno}"),
+///         PlatformErrorCode::Unknown => "no OS error code".to_owned(),
+///         // Required: the enum is `#[non_exhaustive]`.
+///         _ => "unrecognized platform".to_owned(),
+///     }
+/// }
+///
+/// assert_eq!(describe(PlatformErrorCode::Unknown), "no OS error code");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PlatformErrorCode {
     /// A Linux `errno` value.
     Linux(i32),
@@ -46,6 +67,12 @@ pub enum PlatformErrorCode {
     Windows(u32),
     /// A Darwin (macOS) `errno` value.
     Darwin(i32),
+    /// A native failure that carried no OS error code, or occurred on a
+    /// target this enum has no tag for. Carries no payload.
+    ///
+    /// Used instead of fabricating a `0` code (which on Linux/macOS and
+    /// Windows alike means "success", not "unknown").
+    Unknown,
 }
 
 impl Error {
@@ -122,12 +149,27 @@ mod tests {
             Error::Platform(PlatformErrorCode::Linux(-1)).to_string(),
             "platform error: Linux(-1)"
         );
+        assert_eq!(
+            Error::Platform(PlatformErrorCode::Unknown).to_string(),
+            "platform error: Unknown"
+        );
     }
 
     #[test]
     fn platform_error_codes_preserve_their_platform_and_value() {
         assert_eq!(PlatformErrorCode::Linux(-1), PlatformErrorCode::Linux(-1));
         assert_ne!(PlatformErrorCode::Windows(1), PlatformErrorCode::Darwin(1));
+    }
+
+    #[test]
+    fn unknown_platform_code_is_distinct_from_every_zero_code() {
+        let unknown = PlatformErrorCode::Unknown;
+        let copied = unknown;
+        assert_eq!(unknown, copied);
+        assert_ne!(unknown, PlatformErrorCode::Linux(0));
+        assert_ne!(unknown, PlatformErrorCode::Windows(0));
+        assert_ne!(unknown, PlatformErrorCode::Darwin(0));
+        assert!(Error::Platform(unknown).is_platform());
     }
 
     #[test]

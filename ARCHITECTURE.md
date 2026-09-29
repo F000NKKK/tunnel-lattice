@@ -93,6 +93,11 @@ at the boundary; callers never match on a raw `errno`/`DWORD` directly.
 (`PermissionDenied`, `NotFound`, `AlreadyExists`, `Unsupported`, and
 `BrokenPipe`/`UnexpectedEof`/`NotConnected` → `Disconnected`); only kinds
 without a typed counterpart fall back to `Platform(PlatformErrorCode)`.
+`PlatformErrorCode` is itself `#[non_exhaustive]` (`Linux(i32)`,
+`Windows(u32)`, `Darwin(i32)`, `Unknown`): a native failure that carried no
+OS error code, or one on a target with no platform tag, is reported as
+`Platform(PlatformErrorCode::Unknown)` — never a fabricated `0` code, which
+would read as "success" on every platform.
 
 ## Frozen public API surface
 

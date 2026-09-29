@@ -21,6 +21,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tun-rs` reports a missing tap-windows driver as `io::ErrorKind::NotFound`,
   which now surfaces as `Error::NotFound` instead of
   `Error::Platform(PlatformErrorCode::Windows(0))`.
+- **Breaking: `PlatformErrorCode`, `DesiredAdminState`, and `TunRsBackend`
+  are now `#[non_exhaustive]`.** A `match` on `PlatformErrorCode` or
+  `DesiredAdminState` outside its defining crate needs a wildcard arm, and
+  `TunRsBackend` can no longer be built with the `TunRsBackend` literal
+  outside its crate — use `TunRsBackend::new()` or `TunRsBackend::default()`
+  (the `tunnel-lattice` facade's `connect` already does). This lets later
+  releases add platform tags, admin states, and backend configuration
+  without another breaking change.
+- **Breaking: added `PlatformErrorCode::Unknown`** (a unit variant, so the
+  enum stays `Copy + Eq`) for a native failure that carried no OS error
+  code or occurred on a target with no platform tag.
+  `tunnel-lattice-backend-tunrs` now reports a code-less error that has no
+  typed counterpart as `Error::Platform(PlatformErrorCode::Unknown)`
+  instead of a fabricated `Linux(0)`/`Windows(0)`/`Darwin(0)` (for
+  example a missing `wintun.dll` on Windows, previously
+  `Platform(Windows(0))`), and on targets other than Linux, Windows, and
+  macOS reports every unmapped error as `Platform(PlatformErrorCode::Unknown)`
+  instead of `Error::Unsupported`. The typed `io::ErrorKind` mappings above
+  are unchanged and still take precedence.
 
 ## [0.4.0]
 

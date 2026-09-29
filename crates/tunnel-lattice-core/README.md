@@ -9,7 +9,10 @@ workspace. No OS dependency, no TUN/TAP-specific types.
   method returns instead of a raw OS error (`std::io::Error`, a bare
   `errno`, a Windows `DWORD`);
 - `PlatformErrorCode`, a platform-tagged raw error code preserved as a
-  diagnostic escape hatch (`Error::Platform`);
+  diagnostic escape hatch (`Error::Platform`): `Linux(i32)`,
+  `Windows(u32)`, `Darwin(i32)`, or `Unknown` when the native failure
+  carried no OS code or the target has no tag. It is `#[non_exhaustive]`,
+  so a `match` on it needs a wildcard arm;
 - `Id<T>`, a phantom-typed identifier generic over the domain object it
   names, so `Id<Device>` and `Id<Queue>` are distinct types at compile time.
 

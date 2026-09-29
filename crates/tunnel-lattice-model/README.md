@@ -19,7 +19,8 @@ system.
   same way `net-lattice-model::InterfaceConfig::new` does;
 - `AdminState`/`DesiredAdminState`, split the same way
   `net-lattice-model::interface`'s pair is: observed `Unknown` is never
-  requested back.
+  requested back. Both enums are `#[non_exhaustive]`, so a `match` on
+  either needs a wildcard arm.
 
 This crate deliberately does not model packet I/O (that is a runtime
 concern of `tunnel-lattice-platform`'s provider traits) or IP address

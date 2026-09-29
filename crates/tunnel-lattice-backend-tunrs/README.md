@@ -46,7 +46,8 @@ variants instead of raw platform codes:
 | `AlreadyExists`                               | `AlreadyExists`    |
 | `BrokenPipe`, `UnexpectedEof`, `NotConnected` | `Disconnected`     |
 | `Unsupported`                                 | `Unsupported`      |
-| anything else                                 | `Platform(code)`   |
+| anything else, with a raw OS code             | `Platform(code)`   |
+| anything else, without a raw OS code          | `Platform(PlatformErrorCode::Unknown)` |
 
 `std` derives these kinds from native codes on every platform (Linux/macOS
 `EPERM`/`EACCES` and Windows `ERROR_ACCESS_DENIED` all become
@@ -54,6 +55,17 @@ variants instead of raw platform codes:
 reports `Error::PermissionDenied` rather than a raw errno. The typed
 variants do not carry the raw OS code; `Error::Platform` remains the
 diagnostic fallback for every kind without a typed counterpart.
+
+`code` is tagged `PlatformErrorCode::Linux`/`Windows`/`Darwin` by the
+current target. An error with no raw OS code at all (for example one
+`tun-rs` builds itself with `io::Error::other`) becomes
+`PlatformErrorCode::Unknown` rather than a fabricated `0` code, and on a
+target other than Linux, Windows, or macOS every unmapped error is
+`PlatformErrorCode::Unknown`. `PlatformErrorCode` is `#[non_exhaustive]`,
+so a `match` on it needs a wildcard arm.
+
+`TunRsBackend` is `#[non_exhaustive]` as well: construct it with
+`TunRsBackend::new()` or `TunRsBackend::default()`.
 
 ## Feature flags
 
@@ -85,10 +97,11 @@ single-threaded runtime is a hard requirement.
 this crate's `privileged_tests` and the facade's Quick Start both use) loads
 `wintun.dll` at runtime on Windows — `tun-rs` does not link or vendor it.
 Without it present, `TunRsBackend::open` fails with a generic
-`Error::Platform(PlatformErrorCode::Windows(0))`: `raw_os_error()` returns
-`None` because "DLL not found" isn't a Win32 error at all, so this crate's
-`io_error` mapping falls back to `0` — confirmed on a real CI run before the
-fix below, not a hypothetical failure mode.
+`Error::Platform(PlatformErrorCode::Unknown)`: `raw_os_error()` returns
+`None` because `tun-rs` wraps the DLL loader's own error rather than a
+Win32 error code, so there is no code to report — confirmed on a real CI
+run before the fix below (earlier releases reported this as
+`PlatformErrorCode::Windows(0)`), not a hypothetical failure mode.
 
 Download the matching architecture's `wintun.dll` from
 [wintun.net](https://www.wintun.net/) and place it next to your
