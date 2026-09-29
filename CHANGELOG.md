@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Changed `tunnel-lattice-backend-tunrs`'s error mapping (behavioral,
+  no signature change):** `io::Error`s are now mapped by `io::ErrorKind`
+  onto the typed `Error` variants that previously existed but were never
+  produced — `PermissionDenied` → `Error::PermissionDenied`, `NotFound` →
+  `Error::NotFound`, `AlreadyExists` → `Error::AlreadyExists`, and
+  `BrokenPipe`/`UnexpectedEof`/`NotConnected` → `Error::Disconnected`
+  (`Unsupported` → `Error::Unsupported` is unchanged). Every other kind
+  still becomes `Error::Platform(code)`. Callers that matched on
+  `Error::Platform` with a specific errno/Win32 code for these cases (for
+  example `EPERM` when opening a device without `CAP_NET_ADMIN`) now
+  receive the typed variant instead, without the raw code. On Windows,
+  `tun-rs` reports a missing tap-windows driver as `io::ErrorKind::NotFound`,
+  which now surfaces as `Error::NotFound` instead of
+  `Error::Platform(PlatformErrorCode::Windows(0))`.
+
 ## [0.4.0]
 
 - **Fixed `Handle::packet_stream`'s cancellation:** it previously always

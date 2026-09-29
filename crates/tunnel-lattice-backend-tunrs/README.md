@@ -33,6 +33,28 @@
   `try_clone` methods are `#[cfg(target_os = "linux")]` there too, not
   merely no-ops off Linux). See "Persistent devices and multi-queue" below.
 
+## Error mapping
+
+Every `tun-rs`/OS `io::Error` is mapped onto `tunnel_lattice_core::Error`
+by its portable `io::ErrorKind` first, so callers can match on typed
+variants instead of raw platform codes:
+
+| `io::ErrorKind`                               | `Error`            |
+|-----------------------------------------------|--------------------|
+| `PermissionDenied`                            | `PermissionDenied` |
+| `NotFound`                                    | `NotFound`         |
+| `AlreadyExists`                               | `AlreadyExists`    |
+| `BrokenPipe`, `UnexpectedEof`, `NotConnected` | `Disconnected`     |
+| `Unsupported`                                 | `Unsupported`      |
+| anything else                                 | `Platform(code)`   |
+
+`std` derives these kinds from native codes on every platform (Linux/macOS
+`EPERM`/`EACCES` and Windows `ERROR_ACCESS_DENIED` all become
+`PermissionDenied`), so opening a device without the required privilege
+reports `Error::PermissionDenied` rather than a raw errno. The typed
+variants do not carry the raw OS code; `Error::Platform` remains the
+diagnostic fallback for every kind without a typed counterpart.
+
 ## Feature flags
 
 `async-io` and `tokio` are mutually exclusive — they select `tun-rs`'s own

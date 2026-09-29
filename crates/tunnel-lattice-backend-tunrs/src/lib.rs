@@ -61,17 +61,51 @@ pub struct TunRsDevice {
     handle: tun_rs::SyncDevice,
 }
 
+/// Maps a `tun-rs`/OS `io::Error` onto the workspace [`Error`].
+///
+/// Portable `io::ErrorKind`s with a matching typed variant are mapped
+/// first, so callers can match on them without inspecting a raw platform
+/// code. `std` derives these kinds from the native code on every platform
+/// (e.g. Linux `EPERM`/`EACCES` and Windows `ERROR_ACCESS_DENIED` are both
+/// `PermissionDenied`), and `tun-rs` also constructs some of them directly
+/// without any OS code:
+///
+/// | `io::ErrorKind`                                  | [`Error`]                   |
+/// |--------------------------------------------------|-----------------------------|
+/// | `PermissionDenied`                               | [`Error::PermissionDenied`] |
+/// | `NotFound`                                       | [`Error::NotFound`]         |
+/// | `AlreadyExists`                                  | [`Error::AlreadyExists`]    |
+/// | `BrokenPipe`, `UnexpectedEof`, `NotConnected`    | [`Error::Disconnected`]     |
+/// | `Unsupported`                                    | [`Error::Unsupported`]      |
+/// | anything else                                    | [`Error::Platform`]         |
+///
+/// The typed variants intentionally drop the raw OS code: they are the
+/// primary contract, [`Error::Platform`] is only the diagnostic fallback.
 fn io_error(err: std::io::Error) -> Error {
-    // `tun-rs` reports operations that are semantically unsupported by the
-    // current device configuration (e.g. cloning a queue on a device that
-    // wasn't opened with multi-queue) as `io::ErrorKind::Unsupported` with
-    // no raw OS error code — `Error::Platform(..(0))` would be as
-    // unhelpful here as the wintun.dll-missing case was for a genuinely
-    // OS-level failure (see this crate's README). `ErrorKind::Unsupported`
-    // is a portable Rust-level signal, not an OS one, so it maps directly
-    // onto our own `Error::Unsupported` instead.
-    if err.kind() == std::io::ErrorKind::Unsupported {
-        return Error::Unsupported;
+    use std::io::ErrorKind;
+
+    match err.kind() {
+        ErrorKind::PermissionDenied => return Error::PermissionDenied,
+        ErrorKind::NotFound => return Error::NotFound,
+        ErrorKind::AlreadyExists => return Error::AlreadyExists,
+        // The device's read/write channel is gone for good: a closed pipe,
+        // an end-of-file on the device handle (e.g. Wintun's
+        // `ERROR_HANDLE_EOF` on a torn-down session, or macOS's feth-based
+        // TAP read loop closing), or a socket that is no longer connected.
+        ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof | ErrorKind::NotConnected => {
+            return Error::Disconnected;
+        }
+        // `tun-rs` reports operations that are semantically unsupported by
+        // the current device configuration (e.g. cloning a queue on a
+        // device that wasn't opened with multi-queue) as
+        // `io::ErrorKind::Unsupported` with no raw OS error code —
+        // `Error::Platform(..(0))` would be as unhelpful here as the
+        // wintun.dll-missing case was for a genuinely OS-level failure (see
+        // this crate's README). `ErrorKind::Unsupported` is a portable
+        // Rust-level signal, not an OS one, so it maps directly onto our
+        // own `Error::Unsupported` instead.
+        ErrorKind::Unsupported => return Error::Unsupported,
+        _ => {}
     }
     #[cfg(target_os = "linux")]
     {
@@ -286,6 +320,193 @@ impl CapabilityProvider for TunRsDevice {
         {
             base
         }
+    }
+}
+
+/// Ordinary (non-privileged, deterministic) tests of [`io_error`]'s
+/// `io::ErrorKind` → [`Error`] mapping.
+#[cfg(test)]
+mod io_error_tests {
+    use std::io;
+
+    use super::*;
+
+    fn map_kind(kind: io::ErrorKind) -> Error {
+        io_error(io::Error::new(kind, "synthetic"))
+    }
+
+    #[test]
+    fn permission_denied_maps_to_the_typed_variant() {
+        assert!(matches!(
+            map_kind(io::ErrorKind::PermissionDenied),
+            Error::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn not_found_maps_to_the_typed_variant() {
+        assert!(matches!(map_kind(io::ErrorKind::NotFound), Error::NotFound));
+    }
+
+    #[test]
+    fn already_exists_maps_to_the_typed_variant() {
+        assert!(matches!(
+            map_kind(io::ErrorKind::AlreadyExists),
+            Error::AlreadyExists
+        ));
+    }
+
+    #[test]
+    fn channel_shutdown_kinds_map_to_disconnected() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert!(
+                matches!(map_kind(kind), Error::Disconnected),
+                "{kind:?} should map to Error::Disconnected"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_still_maps_to_the_typed_variant() {
+        assert!(matches!(
+            map_kind(io::ErrorKind::Unsupported),
+            Error::Unsupported
+        ));
+    }
+
+    /// Kinds with no typed counterpart keep the platform escape hatch —
+    /// including ones that sound related but are not a permanent channel
+    /// shutdown (`TimedOut`, `WouldBlock`, `Interrupted`).
+    #[test]
+    fn unmapped_kinds_stay_platform_errors() {
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+        ] {
+            let mapped = map_kind(kind);
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+            assert!(
+                matches!(mapped, Error::Platform(_)),
+                "{kind:?} should stay Error::Platform, got {mapped:?}"
+            );
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            assert!(matches!(mapped, Error::Unsupported));
+        }
+    }
+
+    /// Native codes go through `std`'s own errno → `ErrorKind` translation,
+    /// so the typed mapping also holds for real OS errors, not only for
+    /// errors `tun-rs` constructs from a bare kind.
+    #[test]
+    #[cfg(unix)]
+    fn raw_errno_values_map_through_their_error_kind() {
+        // POSIX values shared by Linux and macOS.
+        const EPERM: i32 = 1;
+        const ENOENT: i32 = 2;
+        const EACCES: i32 = 13;
+        const EEXIST: i32 = 17;
+        const EPIPE: i32 = 32;
+        let raw = |code| io_error(io::Error::from_raw_os_error(code));
+
+        assert!(matches!(raw(EPERM), Error::PermissionDenied));
+        assert!(matches!(raw(EACCES), Error::PermissionDenied));
+        assert!(matches!(raw(ENOENT), Error::NotFound));
+        assert!(matches!(raw(EEXIST), Error::AlreadyExists));
+        assert!(matches!(raw(EPIPE), Error::Disconnected));
+    }
+
+    /// An unmapped native code still carries its raw value.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unmapped_linux_errno_is_preserved() {
+        const EIO: i32 = 5;
+        assert!(matches!(
+            io_error(io::Error::from_raw_os_error(EIO)),
+            Error::Platform(PlatformErrorCode::Linux(EIO))
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn raw_windows_codes_map_through_their_error_kind() {
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_BROKEN_PIPE: i32 = 109;
+        const ERROR_ALREADY_EXISTS: i32 = 183;
+        let raw = |code| io_error(io::Error::from_raw_os_error(code));
+
+        assert!(matches!(raw(ERROR_ACCESS_DENIED), Error::PermissionDenied));
+        assert!(matches!(raw(ERROR_FILE_NOT_FOUND), Error::NotFound));
+        assert!(matches!(raw(ERROR_ALREADY_EXISTS), Error::AlreadyExists));
+        assert!(matches!(raw(ERROR_BROKEN_PIPE), Error::Disconnected));
+    }
+
+    /// Returns `true` when this process can plausibly create a TUN device:
+    /// effective UID 0, or `CAP_NET_ADMIN` (bit 12) in the effective
+    /// capability set. Read from `/proc/self/status` so the check needs no
+    /// extra dependency; an unreadable file is treated as "privileged" so
+    /// the caller skips instead of asserting on an unknown environment.
+    #[cfg(target_os = "linux")]
+    fn linux_process_may_create_tun_devices() -> bool {
+        const CAP_NET_ADMIN: u32 = 12;
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return true;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        let euid_is_root = field("Uid:")
+            .and_then(|uids| uids.split_whitespace().nth(1))
+            .is_none_or(|euid| euid == "0");
+        let has_net_admin = field("CapEff:")
+            .and_then(|caps| u64::from_str_radix(caps, 16).ok())
+            .is_none_or(|caps| caps & (1 << CAP_NET_ADMIN) != 0);
+        euid_is_root || has_net_admin
+    }
+
+    /// Unprivileged `open` on Linux must surface as the typed
+    /// [`Error::PermissionDenied`] (`TUNSETIFF` fails with `EPERM`, or
+    /// opening `/dev/net/tun` fails with `EACCES`), not a raw
+    /// `Error::Platform` errno. Skipped at runtime when the process is root
+    /// or holds `CAP_NET_ADMIN` (where `open` would succeed and create a
+    /// real device), or when `/dev/net/tun` is absent (containers without
+    /// the TUN module, where the correct result is `NotFound` instead).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unprivileged_open_reports_permission_denied_on_linux() {
+        if linux_process_may_create_tun_devices() {
+            eprintln!("skipped: process is root or holds CAP_NET_ADMIN");
+            return;
+        }
+        if !std::path::Path::new("/dev/net/tun").exists() {
+            eprintln!("skipped: /dev/net/tun is not present");
+            return;
+        }
+
+        #[cfg(feature = "tokio")]
+        let _runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("build a Tokio runtime");
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let result = TunRsBackend::new().open(DeviceConfig::new(DeviceKind::Tun));
+        assert!(
+            matches!(result, Err(Error::PermissionDenied)),
+            "unprivileged open should report Error::PermissionDenied, got {:?}",
+            result.err()
+        );
     }
 }
 

@@ -89,6 +89,10 @@ Mirrors `net-lattice-core::Error`: one `#[non_exhaustive]` enum
 every provider trait method instead of a raw OS error type. A backend maps
 its native error (`std::io::Error` for `tun-rs`, currently) into this shape
 at the boundary; callers never match on a raw `errno`/`DWORD` directly.
+`tunnel-lattice-backend-tunrs` maps by portable `io::ErrorKind` first
+(`PermissionDenied`, `NotFound`, `AlreadyExists`, `Unsupported`, and
+`BrokenPipe`/`UnexpectedEof`/`NotConnected` → `Disconnected`); only kinds
+without a typed counterpart fall back to `Platform(PlatformErrorCode)`.
 
 ## Frozen public API surface
 

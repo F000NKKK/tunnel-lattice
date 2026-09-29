@@ -90,6 +90,11 @@ Backend для конкретной ОС пока не существует — 
 Backend отображает свою нативную ошибку (сейчас — `std::io::Error` для
 `tun-rs`) в эту форму на границе; вызывающий код никогда не сопоставляет
 паттерн напрямую с `errno`/`DWORD`.
+`tunnel-lattice-backend-tunrs` сначала отображает переносимый
+`io::ErrorKind` (`PermissionDenied`, `NotFound`, `AlreadyExists`,
+`Unsupported`, а `BrokenPipe`/`UnexpectedEof`/`NotConnected` → `Disconnected`);
+только виды без типизированного аналога попадают в
+`Platform(PlatformErrorCode)`.
 
 ## Зафиксированный публичный API
 
