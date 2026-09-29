@@ -27,6 +27,17 @@ pub enum Error {
     /// the device is gone for good, typically because the kernel torn it
     /// down or the owning handle was dropped.
     Disconnected,
+    /// The OS driver or user-mode runtime needed to create this kind of
+    /// device is not installed or could not be loaded (for example
+    /// `wintun.dll`, the tap-windows6 `tap0901` driver, or the Linux `tun`
+    /// module).
+    ///
+    /// Returned only by `DeviceProvider::open`. Distinct from
+    /// [`Error::Unsupported`] (the operation has no meaning on this backend
+    /// at all) and from [`Error::NotFound`] (a referenced device is
+    /// missing): installing or loading the driver makes the same `open`
+    /// call succeed.
+    DriverUnavailable,
     /// Escape hatch preserving the raw backend-specific error for
     /// diagnostics. Not the primary way consumers are expected to match on
     /// failures.
@@ -106,6 +117,11 @@ impl Error {
         matches!(self, Error::Disconnected)
     }
 
+    /// Returns `true` if this is [`Error::DriverUnavailable`].
+    pub const fn is_driver_unavailable(&self) -> bool {
+        matches!(self, Error::DriverUnavailable)
+    }
+
     /// Returns `true` if this is [`Error::Platform`].
     pub const fn is_platform(&self) -> bool {
         matches!(self, Error::Platform(_))
@@ -121,6 +137,7 @@ impl fmt::Display for Error {
             Error::Unsupported => write!(f, "unsupported operation"),
             Error::InvalidState => write!(f, "invalid state"),
             Error::Disconnected => write!(f, "device channel disconnected"),
+            Error::DriverUnavailable => write!(f, "required driver or runtime is unavailable"),
             Error::Platform(code) => write!(f, "platform error: {code:?}"),
         }
     }
@@ -141,6 +158,10 @@ mod tests {
             (Error::Unsupported, "unsupported operation"),
             (Error::InvalidState, "invalid state"),
             (Error::Disconnected, "device channel disconnected"),
+            (
+                Error::DriverUnavailable,
+                "required driver or runtime is unavailable",
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.to_string(), expected);
@@ -191,6 +212,11 @@ mod tests {
 
         assert!(Error::Disconnected.is_disconnected());
         assert!(!Error::Platform(PlatformErrorCode::Linux(-1)).is_disconnected());
+
+        assert!(Error::DriverUnavailable.is_driver_unavailable());
+        assert!(!Error::Unsupported.is_driver_unavailable());
+        assert!(!Error::NotFound.is_driver_unavailable());
+        assert!(!Error::Platform(PlatformErrorCode::Unknown).is_driver_unavailable());
 
         assert!(Error::Platform(PlatformErrorCode::Linux(-1)).is_platform());
         assert!(!Error::PermissionDenied.is_platform());

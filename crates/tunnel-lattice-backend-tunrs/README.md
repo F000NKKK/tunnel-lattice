@@ -37,7 +37,8 @@
 
 Every `tun-rs`/OS `io::Error` is mapped onto `tunnel_lattice_core::Error`
 by its portable `io::ErrorKind` first, so callers can match on typed
-variants instead of raw platform codes:
+variants instead of raw platform codes (during `open`, the rules under
+"Opening a device" below are applied before this table):
 
 | `io::ErrorKind`                               | `Error`            |
 |-----------------------------------------------|--------------------|
@@ -66,6 +67,96 @@ so a `match` on it needs a wildcard arm.
 
 `TunRsBackend` is `#[non_exhaustive]` as well: construct it with
 `TunRsBackend::new()` or `TunRsBackend::default()`.
+
+## Opening a device
+
+### Name and MTU prechecks
+
+`DeviceProvider::open` rejects a requested name or MTU it cannot honor
+exactly with `Error::InvalidState`, before any native call (no device is
+created or touched):
+
+| OS           | Accepted name                                                                 |
+|--------------|-------------------------------------------------------------------------------|
+| all          | non-empty, no NUL character                                                   |
+| Linux        | at most 15 bytes (`IFNAMSIZ` minus the NUL), no `%`                           |
+| macOS TAP    | `feth<N>`, `N` a decimal number that fits in a `u32` with no sign or leading zero, at most 15 bytes |
+| macOS TUN    | `utun<N>`, `N` a decimal number below `u32::MAX` with no sign or leading zero, at most 15 bytes |
+| Windows      | at most 255 UTF-16 code units (TUN and TAP)                                   |
+
+Two of these rules exist because the name would otherwise not be honored
+exactly: on Linux the kernel treats a `%d` in the name as a naming template
+(`tl%d` would open as `tl0`), so any name containing `%` is rejected; on
+macOS a bare `feth` is `tun-rs`'s own auto-naming request (the kernel would
+pick the unit), so a TAP name must carry an explicit unit number. Leave
+`name` unset to let the OS choose.
+
+An MTU above `u16::MAX` is rejected the same way.
+
+### `open`-specific error mapping
+
+A native failure during `open` is first checked against these rules; only
+unmatched errors go through the general table above:
+
+| OS / kind     | Native failure                                                    | `Error`             |
+|---------------|-------------------------------------------------------------------|---------------------|
+| Windows TUN   | `wintun.dll` could not be loaded, or lacks a required function    | `DriverUnavailable` |
+| Windows TAP   | no `tap0901` (tap-windows6) driver installed                      | `DriverUnavailable` |
+| Windows TAP   | an adapter with the requested name already exists                 | `AlreadyExists`     |
+| Linux         | `ENODEV`/`ENOENT`: the `tun` module or `/dev/net/tun` is missing  | `DriverUnavailable` |
+| Linux         | `EINVAL`/`EBUSY` while an interface with the requested name exists | `AlreadyExists`    |
+| macOS         | `EBUSY` while an interface with the requested name exists          | `AlreadyExists`    |
+
+`Error::DriverUnavailable` is returned only by `open`; installing or
+loading the missing driver makes the same call succeed.
+
+The Windows rules depend on `tun-rs` internals, written against `tun-rs`
+2.8.11 (this crate's minimum `tun-rs` version):
+
+- a missing `wintun.dll` is recognized by downcasting the
+  `libloading::Error` that `tun-rs` wraps (it carries no OS error code, and
+  its message is localized). This crate therefore depends on `libloading`
+  on Windows, and that dependency must stay on the same major version as
+  `tun-rs`'s own (0.9); the workspace CI fails if two versions appear;
+- the TAP driver and existing-adapter cases are recognized by the exact
+  messages `tun-rs` produces (`"No driver found"`, and
+  `"The network adapter [<name>] already exists."`).
+
+A newer `tun-rs` 2.x is allowed but is not checked by this crate's unit
+tests, which only guard this crate's own copies of those strings. A
+`tun-rs` release that changes the wintun load failure or the "no driver"
+message is caught by two ignored Windows tests (`open(Tun)` without
+`wintun.dll` and `open(Tap)` without the tap-windows6 driver must both
+report `DriverUnavailable`), which the repository's privileged CI job runs
+before installing any driver. The "adapter already exists" message has no
+such end-to-end check.
+
+### Existing interface names
+
+`open` never adopts an existing interface and then destroys it on drop:
+
+| OS / kind          | Existing interface with the requested name                         | Result |
+|--------------------|--------------------------------------------------------------------|--------|
+| Linux TUN/TAP      | other kind, multi-queue mismatch, or a non-multi-queue device that already has a queue attached | `AlreadyExists` |
+| Linux TUN/TAP      | a persistent same-kind device with no queue attached               | re-attached; not deleted on drop |
+| Linux, `multi_queue = true` | a same-kind multi-queue device, including a live one opened by another process | a queue is attached; not deleted on drop |
+| macOS TAP (`feth`) | any                                                                | `AlreadyExists`; the existing `feth` survives |
+| macOS TUN (`utun`) | the unit is in use                                                 | `AlreadyExists` |
+| Windows TAP        | any adapter with that name                                         | `AlreadyExists`; the adapter is untouched |
+| Windows TUN        | a Wintun adapter                                                   | adopted; not deleted on drop |
+| Windows TUN        | a non-Wintun adapter                                               | `Platform(Windows(code))` |
+
+On macOS and Windows this relies on disabling `tun-rs`'s `reuse_dev`
+default for TAP devices; with it enabled, `tun-rs` would adopt the existing
+TAP interface and, on macOS, destroy it when the handle drops. The two
+attach cases (Linux, Windows TUN) are documented rather than refused: a
+check before opening would race with other processes, and neither case
+deletes the interface. On Linux, joining a multi-queue device owned by
+another user requires `CAP_NET_ADMIN` in the device's network namespace.
+Re-attaching to an existing persistent Linux device with an MTU the kernel
+rejects (`EINVAL` from setting the MTU) is reported as `AlreadyExists`,
+because the name exists — the same limitation as the other Linux `EINVAL`
+case above.
 
 ## Feature flags
 
@@ -96,12 +187,12 @@ single-threaded runtime is a hard requirement.
 `tun_rs::DeviceBuilder::build_sync`/`build_async` for a TUN device (the kind
 this crate's `privileged_tests` and the facade's Quick Start both use) loads
 `wintun.dll` at runtime on Windows — `tun-rs` does not link or vendor it.
-Without it present, `TunRsBackend::open` fails with a generic
-`Error::Platform(PlatformErrorCode::Unknown)`: `raw_os_error()` returns
-`None` because `tun-rs` wraps the DLL loader's own error rather than a
-Win32 error code, so there is no code to report — confirmed on a real CI
-run before the fix below (earlier releases reported this as
-`PlatformErrorCode::Windows(0)`), not a hypothetical failure mode.
+Without it present (or with a `wintun.dll` missing a required function),
+`TunRsBackend::open` fails with `Error::DriverUnavailable`. `tun-rs` wraps
+the DLL loader's own error rather than a Win32 error code, so there is no
+OS code to report; this crate recognizes the wrapped loader error instead
+(see "`open`-specific error mapping" above). Releases up to 0.4 reported
+this case as `Error::Platform(PlatformErrorCode::Windows(0))`.
 
 Download the matching architecture's `wintun.dll` from
 [wintun.net](https://www.wintun.net/) and place it next to your
@@ -109,8 +200,9 @@ application's executable, or anywhere on `PATH`. This project's own CI
 downloads it at job time (see `.github/workflows/ci.yml`'s `privileged`
 job) rather than committing the binary to the repository. TAP mode instead
 needs the separate [tap-windows](https://build.openvpn.net/downloads/releases/)
-driver installed — see `tun-rs`'s own README for details neither this crate
-nor `tunnel-lattice` re-derives.
+driver installed (without it, `open` for a TAP device also fails with
+`Error::DriverUnavailable`) — see `tun-rs`'s own README for details neither
+this crate nor `tunnel-lattice` re-derives.
 
 ## Persistent devices and multi-queue
 

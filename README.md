@@ -70,10 +70,13 @@ let interface = lattice
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`name` is advisory on `DeviceConfig` (see its docs) — a backend may assign a
-different name than requested, especially on Windows — so always read the
-name back from `snapshot()`/the returned `Device`, never from the
-`DeviceConfig` you passed in.
+With no `name` on `DeviceConfig`, the backend or OS picks one. A requested
+name the platform cannot honor as given is rejected by `open` with
+`Error::InvalidState`, and a name already in use with `Error::AlreadyExists`;
+see `DeviceConfig::name` for the accepted formats and the cases where `open`
+attaches to an existing device instead. Always read the actual name back
+from `snapshot()`/the returned `Device`, never from the `DeviceConfig` you
+passed in.
 
 ## Quick start
 

@@ -17,10 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still becomes `Error::Platform(code)`. Callers that matched on
   `Error::Platform` with a specific errno/Win32 code for these cases (for
   example `EPERM` when opening a device without `CAP_NET_ADMIN`) now
-  receive the typed variant instead, without the raw code. On Windows,
-  `tun-rs` reports a missing tap-windows driver as `io::ErrorKind::NotFound`,
-  which now surfaces as `Error::NotFound` instead of
-  `Error::Platform(PlatformErrorCode::Windows(0))`.
+  receive the typed variant instead, without the raw code. (A missing
+  tap-windows driver, which `tun-rs` reports as `io::ErrorKind::NotFound`,
+  is the exception: `open` reports it as `Error::DriverUnavailable`, below.)
 - **Breaking: `PlatformErrorCode`, `DesiredAdminState`, and `TunRsBackend`
   are now `#[non_exhaustive]`.** A `match` on `PlatformErrorCode` or
   `DesiredAdminState` outside its defining crate needs a wildcard arm, and
@@ -34,12 +33,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code or occurred on a target with no platform tag.
   `tunnel-lattice-backend-tunrs` now reports a code-less error that has no
   typed counterpart as `Error::Platform(PlatformErrorCode::Unknown)`
-  instead of a fabricated `Linux(0)`/`Windows(0)`/`Darwin(0)` (for
-  example a missing `wintun.dll` on Windows, previously
-  `Platform(Windows(0))`), and on targets other than Linux, Windows, and
-  macOS reports every unmapped error as `Platform(PlatformErrorCode::Unknown)`
-  instead of `Error::Unsupported`. The typed `io::ErrorKind` mappings above
-  are unchanged and still take precedence.
+  instead of a fabricated `Linux(0)`/`Windows(0)`/`Darwin(0)`, and on
+  targets other than Linux, Windows, and macOS reports every unmapped error
+  as `Platform(PlatformErrorCode::Unknown)` instead of `Error::Unsupported`.
+  The typed `io::ErrorKind` mappings above are unchanged and still take
+  precedence.
+- **Breaking: added `Error::DriverUnavailable`** (with
+  `Error::is_driver_unavailable`, Display "required driver or runtime is
+  unavailable"), returned only by `DeviceProvider::open` when the OS driver
+  or user-mode runtime needed for the device is missing.
+  `tunnel-lattice-backend-tunrs` returns it for a `wintun.dll` that cannot
+  be loaded or lacks a required function (previously
+  `Platform(Windows(0))`), a missing tap-windows `tap0901` driver
+  (previously `Platform(Windows(0))` in 0.4, `NotFound` above), and a Linux
+  `ENODEV`/`ENOENT` when the `tun` module or `/dev/net/tun` is missing
+  (previously `Platform(Linux(19))`/`NotFound`). The backend now depends on
+  `libloading` 0.9 on Windows (already in the dependency graph via
+  `tun-rs`) to recognize the wintun load failure.
+- **Breaking: `open` rejects unusable names with `Error::InvalidState`
+  before any native call.** Empty names and names containing NUL
+  everywhere; on Linux names over 15 bytes or containing `%`; on macOS TAP
+  names that are not a canonical `feth<N>` (an explicit unit number that
+  fits in a `u32`) or are over 15 bytes, and TUN names that are not a
+  canonical `utun<N>`; on Windows names over 255 UTF-16 units. These
+  previously failed inside `tun-rs` as `Platform(...)` errors — or silently
+  opened a device under a different name: a non-canonical `utun` name such
+  as `utun07`, a bare `feth` (which lets the kernel pick the unit), and a
+  Linux name with `%d` (which the kernel expands as a template, so `tl%d`
+  opened as `tl0`). `DeviceConfig::name`'s docs list the accepted formats.
+- **Raised the workspace's `tun-rs` requirement from `2` to `2.8.11`**, the
+  release the backend's `open` error classifier and name prechecks were
+  verified against. It is a minimum, not an exact pin; the privileged
+  Windows CI job now runs two missing-driver tests (`open(Tun)` without
+  `wintun.dll`, `open(Tap)` without the tap-windows6 driver) before any
+  driver is installed, to detect a newer `tun-rs` that changes those
+  errors.
+- **Breaking: `open` on an existing name reports `Error::AlreadyExists`
+  where it previously adopted the device or returned a platform error.**
+  On macOS and Windows, `tunnel-lattice-backend-tunrs` now disables
+  `tun-rs`'s `reuse_dev` default for TAP devices, so an existing TAP name
+  fails with `AlreadyExists` and the existing interface is left alone
+  (previously it was adopted and, on macOS, destroyed when the handle was
+  dropped). The code-less Windows "adapter already exists" error, Linux
+  `EINVAL`/`EBUSY` (kind or multi-queue mismatch, or a non-multi-queue
+  device that already has a queue), and macOS `EBUSY` (a `utun` unit in use)
+  map to `AlreadyExists` when an interface with the requested name exists.
+  Re-attaching to a Linux persistent or multi-queue device and adopting an
+  existing Wintun adapter on Windows still work, and are now documented on
+  `DeviceConfig::name`/`multi_queue`; neither deletes the device on drop.
 
 ## [0.4.0]
 

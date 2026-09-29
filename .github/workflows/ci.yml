@@ -57,6 +57,20 @@ jobs:
         run: cargo fmt --check
         if: matrix.features.name == 'default'
 
+      # tunnel-lattice-backend-tunrs recognizes a failed wintun.dll load by
+      # downcasting the `libloading::Error` tun-rs wraps; that only works
+      # while both crates use the same libloading version. `cargo tree -i`
+      # fails outright when the spec is ambiguous (two versions) or matches
+      # nothing, and the line count check below catches anything else.
+      # `--target` makes this host-independent, so it runs once.
+      - name: libloading single-version guard (Windows target)
+        if: matrix.os == 'ubuntu-latest' && matrix.features.name == 'default'
+        shell: bash
+        run: |
+          versions="$(cargo tree --target x86_64-pc-windows-msvc -i libloading -e normal --depth 0 --prefix none)" || exit 1
+          echo "$versions"
+          test "$(printf '%s\n' "$versions" | wc -l)" -eq 1 || exit 1
+
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets ${{ matrix.features.flags }} -- -D warnings
 
@@ -93,13 +107,25 @@ jobs:
         with:
           key: privileged-${{ matrix.features.name }}
 
+      # Must run before "Download wintun.dll" (and before any TAP driver
+      # install step): these two ignored tests assert that `open(Tun)`
+      # without wintun.dll and `open(Tap)` without the tap-windows6 driver
+      # both report `Error::DriverUnavailable`. They are the end-to-end check
+      # that the backend's wintun/"No driver found" recognition still
+      # matches what the resolved tun-rs actually returns. `GITHUB_PATH`
+      # only affects later steps, so nothing has to be moved or restored.
+      - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored windows_missing_driver_ (Windows, before driver install)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored windows_missing_driver_ --nocapture
+
       # tun-rs's TUN mode on Windows loads wintun.dll at runtime (not linked
       # at build time) and does not vendor it — see tun-rs's own README,
       # "Windows" / "wintun.dll not found." Without this, every
-      # `TunRsBackend::open` call on Windows fails with a generic
-      # `Platform(Windows(0))` (confirmed on a real run: no raw OS error
-      # code, because tun-rs's own "DLL not found" error isn't a Win32 error
-      # at all). Pinned to 0.14.1, the same long-standing stable build
+      # `TunRsBackend::open` call for a TUN device on Windows fails — now
+      # with `Error::DriverUnavailable`; releases up to 0.4 reported a
+      # generic `Platform(Windows(0))` (confirmed on a real run: no raw OS
+      # error code, because tun-rs's own "DLL not found" error isn't a Win32
+      # error at all). Pinned to 0.14.1, the same long-standing stable build
       # WireGuard itself ships. Downloaded at CI time rather than committed
       # to the repo to avoid bundling a third-party binary and its license
       # question into version control.
@@ -120,7 +146,8 @@ jobs:
 
       # windows-latest runners already execute as Administrator; opening a
       # TUN/TAP device there does not need an explicit elevation step the
-      # way `sudo` provides one on Linux/macOS.
+      # way `sudo` provides one on Linux/macOS. The missing-driver tests ran
+      # in their own step above and no longer hold once wintun is on PATH.
       - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored (Windows)
         if: matrix.os == 'windows-latest'
-        run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --nocapture
+        run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --skip windows_missing_driver_ --nocapture

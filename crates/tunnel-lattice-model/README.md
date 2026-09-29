@@ -9,8 +9,11 @@ system.
 - `DeviceKind`, distinguishing TUN (raw IP) from TAP (Ethernet-framed)
   devices;
 - `DeviceConfig`, desired intent for creating a new device (kind, an
-  advisory name, an optional MTU, a multi-queue request) via
-  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_multi_queue`;
+  optional name, an optional MTU, a multi-queue request) via
+  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_multi_queue`. The
+  `name` field's docs list the per-OS name formats a backend accepts
+  (anything else is rejected with `Error::InvalidState` before any native
+  call) and what happens when an interface with that name already exists;
 - `Device`, an observed, already-open device (id, actual name, kind, MTU,
   administrative state);
 - `DeviceConfigPatch`, desired intent for changing an open device's MTU or

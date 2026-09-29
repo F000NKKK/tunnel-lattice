@@ -15,6 +15,8 @@
 
 #![warn(missing_docs)]
 
+mod open_contract;
+
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
     AdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
@@ -36,6 +38,42 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// Marked `#[non_exhaustive]` so configuration can be added later without a
 /// breaking change: outside this crate, construct it with
 /// [`TunRsBackend::new`] or [`Default`], not the `TunRsBackend` literal.
+///
+/// # Opening a device
+///
+/// [`DeviceProvider::open`] checks the requested name and MTU before any
+/// native call and returns [`Error::InvalidState`] if either cannot be
+/// honored exactly (the per-OS name formats are listed on
+/// `tunnel_lattice_model::DeviceConfig::name`):
+///
+/// | OS | Name rule |
+/// |---|---|
+/// | all | non-empty, no NUL character |
+/// | Linux | at most 15 bytes, no `%` (the kernel would expand `%d` as a naming template) |
+/// | macOS `Tap` | `feth<N>`, `N` a decimal number that fits in a `u32` with no sign or leading zero, at most 15 bytes (bare `feth` would let the kernel pick the unit) |
+/// | macOS `Tun` | `utun<N>`, `N` a decimal number below `u32::MAX` with no sign or leading zero, at most 15 bytes |
+/// | Windows | at most 255 UTF-16 code units |
+///
+/// A native failure is then mapped by these `open`-only rules before the
+/// general mapping described on the crate's error table:
+///
+/// | OS / kind | Native failure | [`Error`] |
+/// |---|---|---|
+/// | Windows `Tun` | `wintun.dll` could not be loaded, or lacks a required function | [`Error::DriverUnavailable`] |
+/// | Windows `Tap` | no `tap0901` (tap-windows6) driver installed | [`Error::DriverUnavailable`] |
+/// | Windows `Tap` | an adapter with the requested name already exists | [`Error::AlreadyExists`] |
+/// | Linux | `ENODEV`/`ENOENT`: the `tun` module or `/dev/net/tun` is missing | [`Error::DriverUnavailable`] |
+/// | Linux | `EINVAL`/`EBUSY` while an interface with the requested name exists (a TUN/TAP or multi-queue mismatch, or a non-multi-queue device that already has a queue attached) | [`Error::AlreadyExists`] |
+/// | macOS | `EBUSY` while an interface with the requested name exists (a `utun` unit in use) | [`Error::AlreadyExists`] |
+///
+/// On macOS and Windows a `Tap` open never adopts an existing interface of
+/// the requested name: it fails with [`Error::AlreadyExists`] and leaves the
+/// existing interface untouched. Two cases attach to an existing device
+/// instead, and neither destroys it when the handle drops: on Linux, a
+/// persistent same-kind device with no queue attached, or any same-kind
+/// multi-queue device when `multi_queue` is requested (including one opened
+/// by another process); and on Windows, an existing Wintun adapter whose
+/// name matches a `Tun` request.
 ///
 /// ```
 /// use tunnel_lattice_backend_tunrs::TunRsBackend;
@@ -158,13 +196,33 @@ impl DeviceProvider for TunRsBackend {
     type DeviceConfig = DeviceConfig;
     type Device = TunRsDevice;
 
+    /// Opens a device; see [`TunRsBackend`], "Opening a device", for the
+    /// name prechecks and the `open`-specific error mapping.
     fn open(&self, config: Self::DeviceConfig) -> Result<Self::Device> {
         let layer = match config.kind {
             DeviceKind::Tun => tun_rs::Layer::L3,
             DeviceKind::Tap => tun_rs::Layer::L2,
             _ => return Err(Error::Unsupported),
         };
+        // Prechecks: everything below this block may make a native call.
+        if let Some(name) = config.name.as_deref() {
+            open_contract::precheck_name(open_contract::HOST_OS, config.kind, name)?;
+        }
+        let mtu = config
+            .mtu
+            .map(|mtu| u16::try_from(mtu).map_err(|_| Error::InvalidState))
+            .transpose()?;
+
         let mut builder = tun_rs::DeviceBuilder::new().layer(layer);
+        // `tun-rs` defaults `reuse_dev` to `true`, which on macOS/Windows TAP
+        // adopts an existing interface of the requested name — and on macOS
+        // then destroys that foreign `feth` when the handle drops. Turn it
+        // off so an existing TAP name fails with `AlreadyExists` instead
+        // (the option exists only on these targets and only affects TAP).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if config.kind == DeviceKind::Tap {
+            builder = builder.reuse_dev(false);
+        }
         // `DeviceBuilder::multi_queue` only exists on Linux in `tun-rs`
         // itself (not merely a no-op elsewhere) — `IFF_MULTI_QUEUE` has no
         // equivalent concept on macOS/Windows, so there is nothing to call
@@ -174,18 +232,26 @@ impl DeviceProvider for TunRsBackend {
         {
             builder = builder.multi_queue(config.multi_queue);
         }
-        if let Some(name) = config.name {
+        if let Some(name) = config.name.as_deref() {
             builder = builder.name(name);
         }
-        if let Some(mtu) = config.mtu {
-            let mtu = u16::try_from(mtu).map_err(|_| Error::InvalidState)?;
+        if let Some(mtu) = mtu {
             builder = builder.mtu(mtu);
         }
 
         #[cfg(feature = "async")]
-        let handle = builder.build_async().map_err(io_error)?;
+        let built = builder.build_async();
         #[cfg(not(feature = "async"))]
-        let handle = builder.build_sync().map_err(io_error)?;
+        let built = builder.build_sync();
+        let handle = built.map_err(|err| {
+            open_contract::classify_open_error(
+                open_contract::HOST_OS,
+                config.kind,
+                config.name.as_deref(),
+                err,
+                open_contract::host_name_exists,
+            )
+        })?;
 
         Ok(TunRsDevice {
             kind: config.kind,
@@ -559,7 +625,8 @@ mod io_error_tests {
     /// `Error::Platform` errno. Skipped at runtime when the process is root
     /// or holds `CAP_NET_ADMIN` (where `open` would succeed and create a
     /// real device), or when `/dev/net/tun` is absent (containers without
-    /// the TUN module, where the correct result is `NotFound` instead).
+    /// the TUN module, where `open` reports `Error::DriverUnavailable`
+    /// instead).
     #[test]
     #[cfg(target_os = "linux")]
     fn unprivileged_open_reports_permission_denied_on_linux() {
@@ -586,6 +653,55 @@ mod io_error_tests {
             "unprivileged open should report Error::PermissionDenied, got {:?}",
             result.err()
         );
+    }
+
+    /// A name or MTU `open` cannot honor is rejected with `InvalidState`
+    /// before any native call. Deterministic and unprivileged: no device is
+    /// ever built. Under the `tokio` feature this also proves no native
+    /// call was made — building a device without an entered Tokio runtime
+    /// would panic.
+    #[test]
+    fn open_rejects_unusable_names_and_mtus_before_any_native_call() {
+        let backend = TunRsBackend::new();
+        let too_long_for_host = if cfg!(target_os = "windows") {
+            "a".repeat(256)
+        } else {
+            "a".repeat(16)
+        };
+        for kind in [DeviceKind::Tun, DeviceKind::Tap] {
+            for name in ["", "tl\0x", too_long_for_host.as_str()] {
+                let result = backend.open(DeviceConfig::new(kind).with_name(name));
+                assert!(
+                    matches!(result, Err(Error::InvalidState)),
+                    "{kind:?} name {name:?}: expected InvalidState, got {:?}",
+                    result.err()
+                );
+            }
+            let result = backend.open(DeviceConfig::new(kind).with_mtu(u32::from(u16::MAX) + 1));
+            assert!(
+                matches!(result, Err(Error::InvalidState)),
+                "{kind:?} oversized MTU: expected InvalidState, got {:?}",
+                result.err()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            for name in ["tap0", "feth", "fethX"] {
+                let tap = backend.open(DeviceConfig::new(DeviceKind::Tap).with_name(name));
+                assert!(matches!(tap, Err(Error::InvalidState)), "{name}");
+            }
+            let tun = backend.open(DeviceConfig::new(DeviceKind::Tun).with_name("tun0"));
+            assert!(matches!(tun, Err(Error::InvalidState)));
+        }
+        #[cfg(target_os = "linux")]
+        for kind in [DeviceKind::Tun, DeviceKind::Tap] {
+            let result = backend.open(DeviceConfig::new(kind).with_name("tl%d"));
+            assert!(
+                matches!(result, Err(Error::InvalidState)),
+                "{kind:?} template name: expected InvalidState, got {:?}",
+                result.err()
+            );
+        }
     }
 }
 
@@ -827,5 +943,119 @@ mod privileged_tests {
         device
             .snapshot()
             .expect("original queue still usable after the clone was dropped");
+    }
+
+    /// A name unique to this test process and `tag`, within `IFNAMSIZ`.
+    #[cfg(target_os = "linux")]
+    fn unique_linux_name(tag: &str) -> String {
+        let name = format!("tl{tag}{}", std::process::id() % 100_000);
+        assert!(name.len() <= 15, "{name} exceeds IFNAMSIZ");
+        name
+    }
+
+    /// Opening a name whose non-multi-queue device already has a queue
+    /// attached fails with `EBUSY`, which `open` reports as
+    /// `AlreadyExists`. Both handles are this test's own non-persistent
+    /// devices, so dropping `first` removes the interface.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn opening_an_attached_non_multi_queue_name_reports_already_exists() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let name = unique_linux_name("busy");
+        let first = backend
+            .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
+            .expect("open the first TUN device");
+
+        let second = backend.open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()));
+        assert!(
+            matches!(second, Err(Error::AlreadyExists)),
+            "second open of an attached name should report AlreadyExists, got {:?}",
+            second.err()
+        );
+        // The original device is untouched by the failed open.
+        assert_eq!(first.snapshot().expect("snapshot the original").name, name);
+    }
+
+    /// Opening an existing TUN name as TAP fails with `EINVAL`, which `open`
+    /// reports as `AlreadyExists` because the name exists.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn opening_an_existing_name_as_the_other_kind_reports_already_exists() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let backend = TunRsBackend::new();
+        let name = unique_linux_name("kind");
+        let tun = backend
+            .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
+            .expect("open the TUN device");
+
+        let tap = backend.open(DeviceConfig::new(DeviceKind::Tap).with_name(name.as_str()));
+        assert!(
+            matches!(tap, Err(Error::AlreadyExists)),
+            "opening a TUN name as TAP should report AlreadyExists, got {:?}",
+            tap.err()
+        );
+        assert_eq!(tun.snapshot().expect("snapshot the original").name, name);
+    }
+
+    /// Opening a `Tun` device while `wintun.dll` is not on the DLL search
+    /// path reports [`Error::DriverUnavailable`]. Only meaningful on a host
+    /// without wintun: the privileged CI job runs it (filtered by the
+    /// `windows_missing_driver_` prefix) before its "Download wintun.dll"
+    /// step and skips it afterwards. This is the end-to-end check that the
+    /// `libloading::Error` downcast still matches what `tun-rs` returns.
+    /// Nothing is created on the expected path; if wintun is unexpectedly
+    /// present, the opened device is non-persistent and is torn down when
+    /// the result drops.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and a host without wintun.dll on the DLL search path"]
+    fn windows_missing_driver_tun_open_reports_driver_unavailable() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let result = TunRsBackend::new().open(DeviceConfig::new(DeviceKind::Tun));
+        assert!(
+            matches!(result, Err(Error::DriverUnavailable)),
+            "open(Tun) without wintun.dll should report DriverUnavailable, got {:?}",
+            result.err()
+        );
+    }
+
+    /// Opening a `Tap` device while no `tap0901` (tap-windows6) driver is
+    /// installed reports [`Error::DriverUnavailable`]. Only meaningful on a
+    /// host without that driver: the privileged CI job runs it (filtered by
+    /// the `windows_missing_driver_` prefix) before any driver is installed
+    /// and skips it afterwards. This is the end-to-end check that `tun-rs`
+    /// still returns exactly the "No driver found" error the classifier
+    /// matches. If the driver is unexpectedly installed, the adapter
+    /// created is non-persistent and is removed when the result drops.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and a host without the tap-windows6 driver installed"]
+    fn windows_missing_driver_tap_open_reports_driver_unavailable() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let result = TunRsBackend::new().open(DeviceConfig::new(DeviceKind::Tap));
+        assert!(
+            matches!(result, Err(Error::DriverUnavailable)),
+            "open(Tap) without the tap-windows6 driver should report DriverUnavailable, got {:?}",
+            result.err()
+        );
     }
 }

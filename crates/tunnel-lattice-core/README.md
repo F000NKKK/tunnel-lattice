@@ -7,7 +7,10 @@ workspace. No OS dependency, no TUN/TAP-specific types.
 
 - `Error`, the single `#[non_exhaustive]` error type every provider trait
   method returns instead of a raw OS error (`std::io::Error`, a bare
-  `errno`, a Windows `DWORD`);
+  `errno`, a Windows `DWORD`). Besides the usual typed variants it has
+  `DriverUnavailable`, returned only when opening a device fails because
+  the OS driver or user-mode runtime (for example `wintun.dll` or the Linux
+  `tun` module) is missing;
 - `PlatformErrorCode`, a platform-tagged raw error code preserved as a
   diagnostic escape hatch (`Error::Platform`): `Linux(i32)`,
   `Windows(u32)`, `Darwin(i32)`, or `Unknown` when the native failure

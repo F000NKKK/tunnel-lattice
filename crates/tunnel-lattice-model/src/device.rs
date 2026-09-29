@@ -75,17 +75,43 @@ pub enum DesiredAdminState {
 /// Desired intent for creating a new TUN/TAP device.
 ///
 /// Distinct from the observed [`Device`]: a caller has no device identity
-/// yet, only the shape of the device it wants opened. `name` is advisory —
-/// Linux honors an exact requested name (or a kernel-assigned one if
-/// `None`); Windows and some BSD/macOS configurations may only support a
-/// kernel-assigned name and ignore the request. Backends report the actual
-/// assigned name on the returned [`Device`].
+/// yet, only the shape of the device it wants opened. With `name` left
+/// `None` the backend or OS picks a free name; a requested `name` is either
+/// honored exactly or rejected (see the field's docs). Backends report the
+/// actual assigned name on the returned [`Device`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct DeviceConfig {
     /// Whether to open a TUN or TAP device.
     pub kind: DeviceKind,
-    /// A requested device name, honored where the platform supports it.
+    /// A requested device name; `None` lets the backend or OS choose one.
+    ///
+    /// A name the platform cannot honor exactly is rejected by `open` with
+    /// [`Error::InvalidState`] before any native call. With the `tun-rs`
+    /// backend the accepted formats are:
+    ///
+    /// | OS | Accepted name |
+    /// |---|---|
+    /// | all | non-empty, no NUL character |
+    /// | Linux | at most 15 bytes (`IFNAMSIZ` minus the NUL), no `%` (the kernel would expand `%d` as a naming template) |
+    /// | macOS TAP | `feth<N>`, `N` a decimal number that fits in a `u32` with no sign or leading zero, at most 15 bytes (bare `feth` would let the kernel pick the unit) |
+    /// | macOS TUN | `utun<N>`, `N` a decimal number below `u32::MAX` with no sign or leading zero, at most 15 bytes |
+    /// | Windows | at most 255 UTF-16 code units |
+    ///
+    /// **An existing interface with the same name.** Opening never adopts
+    /// an existing interface and then destroys it on drop:
+    ///
+    /// - macOS and Windows TAP, macOS TUN: `open` fails with
+    ///   [`Error::AlreadyExists`] and the existing interface is untouched.
+    /// - Linux: a device of the other kind, a multi-queue mismatch (see
+    ///   [`Self::multi_queue`]), or a non-multi-queue device that already has
+    ///   a queue attached fails with [`Error::AlreadyExists`]. A persistent
+    ///   device of the same kind with no queue attached is **re-attached**:
+    ///   the handle joins it, and dropping the handle does not delete it.
+    /// - Windows TUN: an existing Wintun adapter with this name is
+    ///   **adopted**: the handle uses it, and dropping the handle does not
+    ///   delete it. A same-named adapter that is not a Wintun adapter makes
+    ///   `open` fail with a platform error.
     pub name: Option<String>,
     /// A requested MTU, applied at creation where the platform allows it.
     pub mtu: Option<u32>,
@@ -94,6 +120,16 @@ pub struct DeviceConfig {
     /// duplicate an independent queue for another thread. Ignored where the
     /// backend/platform has no such concept — this is a request, not a
     /// guarantee; check `Capability::MULTI_QUEUE` before relying on it.
+    ///
+    /// On Linux, requesting multi-queue together with the [`Self::name`] of
+    /// an existing multi-queue device of the same kind **attaches** a new
+    /// queue to that device — even a live device opened by another process,
+    /// provided the caller holds `CAP_NET_ADMIN` in its network namespace or
+    /// owns the device. The kernel has no "create only" flag for this, and
+    /// the attach never deletes the device: dropping the handle detaches
+    /// only its own queue. Use a name nobody else uses (or `None`) if
+    /// sharing is not intended. A multi-queue mismatch with an existing
+    /// device fails with [`Error::AlreadyExists`].
     pub multi_queue: bool,
 }
 
@@ -109,7 +145,8 @@ impl DeviceConfig {
         }
     }
 
-    /// Requests `name` for the new device (advisory; see the type's docs).
+    /// Requests `name` for the new device (see [`Self::name`] for the
+    /// accepted formats and the existing-name behavior).
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());

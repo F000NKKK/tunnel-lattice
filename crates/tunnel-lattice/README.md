@@ -114,7 +114,8 @@ authorized.
 On Windows, `TunRsBackend::open` for a TUN device also requires
 `wintun.dll` to be present next to your application's executable or on
 `PATH` — `tun-rs` loads it at runtime rather than linking it at build time,
-and does not vendor it. Without it, `open` fails with a generic
-`Error::Platform` carrying no OS error code, not an obviously-named error.
+and does not vendor it. Without it, `open` fails with
+`Error::DriverUnavailable` (as it does for a TAP device when the
+tap-windows driver is not installed).
 Download it from [wintun.net](https://www.wintun.net/) and ship it with your
 application; see `tunnel-lattice-backend-tunrs`'s README for details.

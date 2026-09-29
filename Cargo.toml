@@ -31,7 +31,10 @@ tokio = { version = "1", default-features = false }
 # Initial TUN/TAP backend (see ARCHITECTURE.md, "Backend replacement plan"):
 # tun-rs is itself cross-platform (Linux/Windows/macOS/*BSD/iOS/Android), so
 # tunnel-lattice-backend-tunrs is one shared crate rather than net-lattice's
-# per-OS split. Version pinned loosely; verify against docs.rs/crates.io
-# before bumping — its exact synchronous/async API surface was not
-# independently re-verified while drafting this workspace.
-tun-rs = { version = "2", default-features = false }
+# per-OS split. The floor is 2.8.11 because tunnel-lattice-backend-tunrs's
+# `open` error classifier and name prechecks were verified against that
+# release's source (error messages, `feth`/`utun` naming, libloading 0.9).
+# Not exact-pinned: this is a library, so a downstream lockfile may resolve a
+# newer 2.x; the privileged CI job's Windows missing-driver tests detect a
+# newer tun-rs that changes the errors the classifier relies on.
+tun-rs = { version = "2.8.11", default-features = false }

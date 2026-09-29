@@ -85,7 +85,8 @@ completed work.
 
 Mirrors `net-lattice-core::Error`: one `#[non_exhaustive]` enum
 (`PermissionDenied`, `NotFound`, `AlreadyExists`, `Unsupported`,
-`InvalidState`, `Disconnected`, `Platform(PlatformErrorCode)`) returned by
+`InvalidState`, `Disconnected`, `DriverUnavailable`,
+`Platform(PlatformErrorCode)`) returned by
 every provider trait method instead of a raw OS error type. A backend maps
 its native error (`std::io::Error` for `tun-rs`, currently) into this shape
 at the boundary; callers never match on a raw `errno`/`DWORD` directly.
@@ -98,6 +99,24 @@ without a typed counterpart fall back to `Platform(PlatformErrorCode)`.
 OS error code, or one on a target with no platform tag, is reported as
 `Platform(PlatformErrorCode::Unknown)` — never a fabricated `0` code, which
 would read as "success" on every platform.
+
+`DeviceProvider::open` adds two layers in front of that mapping. First,
+prechecks reject a requested name (per-OS format, documented on
+`DeviceConfig::name`) or MTU the platform cannot honor with `InvalidState`,
+before any native call. Second, an open-only classifier turns native
+failures that only have a specific meaning during creation into typed
+variants: a missing driver or user-mode runtime (`wintun.dll`, the
+tap-windows6 driver, the Linux `tun` module) becomes `DriverUnavailable`,
+which no other operation returns; an existing interface with the requested
+name becomes `AlreadyExists` (on Linux and macOS only when an interface with
+that name actually exists, because the same errno also covers unrelated
+failures). Everything else falls through to the general mapping. `open`
+never adopts an existing interface and then destroys it on drop: the
+`tun-rs` backend turns off `tun-rs`'s TAP "reuse existing device" default on
+macOS/Windows, and the two remaining attach cases — Linux persistent or
+multi-queue devices, and existing Wintun adapters on Windows — are
+documented rather than refused, since neither deletes the interface and a
+check before opening would race with other processes.
 
 ## Frozen public API surface
 
