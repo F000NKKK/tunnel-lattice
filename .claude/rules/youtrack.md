@@ -129,6 +129,26 @@ If the reviewer can run the full applicable matrix itself in one pass, skip
 for the case where verification is split across sessions or environments,
 not as mandatory checkpoints for every Task.
 
+### Rolling `Stage` up to Stories and Epics
+
+A User Story's and an Epic's `Stage` must reflect the work under it — a
+Story sitting at `Backlog` while its Tasks are being worked on is a board
+error, not a neutral default. The primary agent owns this roll-up and
+re-checks it every time it changes a child's `Stage` (in the same turn):
+
+- **Story** → `Develop` as soon as any child Task/Bug leaves `Backlog`;
+  `Review`/`Test`/`Staging` once every child that is not yet `Done` has
+  reached at least that state; `Done` only when every child is `Done`.
+  A Story whose children are all still at `Backlog` stays at `Backlog`.
+- **Epic** → the same rule applied over its Stories (and any Tasks/Bugs
+  parented directly to it): `Develop` once any child is in progress,
+  `Done` only when every child is `Done`.
+- Filing a new child at `Backlog` under a `Develop` Story does not move the
+  Story back; descoping a Story's last active Task does (see "When an issue
+  goes to `Stage: Backlog`").
+- Role subagents that change a Task's `Stage` do not roll it up themselves;
+  the primary agent does so when reconciling their handoff.
+
 ## Field ownership
 
 - `Type` — set once at creation; never changed afterward.
