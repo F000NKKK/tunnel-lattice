@@ -53,12 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `open` rejects unusable names with `Error::InvalidState`
   before any native call.** Empty names and names containing NUL
   everywhere; on Linux names over 15 bytes or containing `%`; on macOS TAP
-  names that are not a canonical `feth<N>` (an explicit unit number that
-  fits in a `u32`) or are over 15 bytes, and TUN names that are not a
+  names that are not a canonical `feth<N>` (an explicit unit number from 0
+  to 32767, the kernel's highest `feth` unit), and TUN names that are not a
   canonical `utun<N>`; on Windows names over 255 UTF-16 units. These
   previously failed inside `tun-rs` as `Platform(...)` errors — or silently
   opened a device under a different name: a non-canonical `utun` name such
-  as `utun07`, a bare `feth` (which lets the kernel pick the unit), and a
+  as `utun07`, a bare `feth` or `feth4294967295` (the kernel's wildcard
+  unit; both let the kernel pick the unit), and a
   Linux name with `%d` (which the kernel expands as a template, so `tl%d`
   opened as `tl0`). `DeviceConfig::name`'s docs list the accepted formats.
 - **Raised the workspace's `tun-rs` requirement from `2` to `2.8.11`**, the

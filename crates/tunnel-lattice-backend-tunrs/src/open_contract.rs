@@ -59,6 +59,13 @@ const WINDOWS_MAX_NAME_UTF16_UNITS: usize = 255;
 /// Required prefix of a macOS TAP (`feth`) name (`macos/tap/mod.rs`).
 const MACOS_TAP_PREFIX: &str = "feth";
 
+/// Highest `feth` unit the XNU cloner creates: `FETH_MAXUNIT`, which is
+/// `IF_MAXUNIT` (`0x7fff`) in `bsd/net/if_fake.c` / `if_private.h`. Larger
+/// units fail natively with `ENXIO`, and `u32::MAX` is XNU's wildcard unit
+/// (`if_clone_create` then picks the lowest free unit and renames the
+/// device).
+const MACOS_FETH_MAX_UNIT: u32 = 0x7fff;
+
 /// Required prefix of a macOS TUN (`utun`) name (`macos/tuntap.rs`).
 const MACOS_TUN_PREFIX: &str = "utun";
 
@@ -93,7 +100,7 @@ const EINVAL: i32 = 22;
 /// |---|---|
 /// | all | non-empty, no NUL character |
 /// | Linux | at most 15 bytes, no `%` (the kernel expands `%d` as a naming template) |
-/// | macOS `Tap` | `feth` followed by a canonical decimal number that fits in a `u32` (no sign, no leading zero), at most 15 bytes |
+/// | macOS `Tap` | `feth` followed by a canonical decimal number from 0 to 32767 (no sign, no leading zero) |
 /// | macOS `Tun` | `utun` followed by a canonical decimal number below `u32::MAX` (no sign, no leading zero), at most 15 bytes |
 /// | Windows `Tun`/`Tap` | at most 255 UTF-16 code units |
 pub(crate) fn precheck_name(os: HostOs, kind: DeviceKind, name: &str) -> Result<(), Error> {
@@ -135,11 +142,14 @@ fn is_canonical_utun_name(name: &str) -> bool {
 /// checks the `feth` prefix and hands the name to `SIOCIFCREATE`, but bare
 /// `feth` is its own auto-naming template (the kernel picks the unit, so the
 /// device would open as some `fethN`), and a non-numeric or non-canonical
-/// unit is not a name the `feth` cloner creates as given.
+/// unit is not a name the `feth` cloner creates as given. The unit is also
+/// bounded by [`MACOS_FETH_MAX_UNIT`]: `feth4294967295` would be XNU's
+/// wildcard (again a kernel-picked unit) and `feth32768` and above fail
+/// natively.
 fn is_canonical_feth_name(name: &str) -> bool {
     name.strip_prefix(MACOS_TAP_PREFIX)
         .and_then(canonical_unit)
-        .is_some()
+        .is_some_and(|n| n <= MACOS_FETH_MAX_UNIT)
 }
 
 /// Parses a non-empty run of ASCII digits with no sign and no leading zero
@@ -332,7 +342,7 @@ mod tests {
     #[test]
     fn macos_tap_names_must_be_canonical_feth_units() {
         let tap = DeviceKind::Tap;
-        for ok in ["feth0", "feth7", "feth42", "feth4294967295"] {
+        for ok in ["feth0", "feth7", "feth42", "feth32767"] {
             assert!(accepted(HostOs::Macos, tap, ok), "{ok} should be accepted");
         }
         for bad in [
@@ -345,6 +355,12 @@ mod tests {
             "feth07",
             "feth00",
             "feth 1",
+            // Past XNU's `IF_MAXUNIT` (0x7fff): fails natively with ENXIO.
+            "feth32768",
+            "feth65535",
+            // XNU's wildcard unit (`u32::MAX`): the kernel would pick the
+            // unit and rename the device.
+            "feth4294967295",
             // Past `u32` (and within 15 bytes, so only the range rule
             // rejects it).
             "feth4294967296",

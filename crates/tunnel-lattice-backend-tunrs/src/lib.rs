@@ -8,10 +8,13 @@
 //! moving `tunnel-lattice-platform` or the `tunnel-lattice` facade's public
 //! API.
 //!
-//! Upstream API surface last verified against `tun-rs` 2.8.11 on docs.rs
-//! (`tun_rs::DeviceBuilder`, `SyncDevice`, `AsyncDevice`, `Layer`); re-verify
-//! before bumping the workspace's pinned `tun-rs` version if its public API
-//! has changed.
+//! The upstream API surface (`tun_rs::DeviceBuilder`, `SyncDevice`,
+//! `AsyncDevice`, `Layer`) and the `open` error classification were verified
+//! against `tun-rs` 2.8.11, which is this crate's minimum `tun-rs` version.
+//! Newer `tun-rs` 2.x releases resolve without a separate review; the
+//! privileged Windows CI tests that open a device before any driver is
+//! installed are the check that such a release has not changed the errors
+//! `open` relies on.
 
 #![warn(missing_docs)]
 
@@ -50,7 +53,7 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// |---|---|
 /// | all | non-empty, no NUL character |
 /// | Linux | at most 15 bytes, no `%` (the kernel would expand `%d` as a naming template) |
-/// | macOS `Tap` | `feth<N>`, `N` a decimal number that fits in a `u32` with no sign or leading zero, at most 15 bytes (bare `feth` would let the kernel pick the unit) |
+/// | macOS `Tap` | `feth<N>`, `N` a decimal number from 0 to 32767 (the kernel's highest `feth` unit) with no sign or leading zero (bare `feth` or `feth4294967295` would let the kernel pick the unit) |
 /// | macOS `Tun` | `utun<N>`, `N` a decimal number below `u32::MAX` with no sign or leading zero, at most 15 bytes |
 /// | Windows | at most 255 UTF-16 code units |
 ///
@@ -74,6 +77,11 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// multi-queue device when `multi_queue` is requested (including one opened
 /// by another process); and on Windows, an existing Wintun adapter whose
 /// name matches a `Tun` request.
+///
+/// On Linux, attaching to an existing (persistent) device with an MTU the
+/// kernel rejects fails with `EINVAL` while the name exists, so it is
+/// reported as [`Error::AlreadyExists`] rather than an MTU error: the same
+/// limitation as the `EINVAL` row above.
 ///
 /// ```
 /// use tunnel_lattice_backend_tunrs::TunRsBackend;

@@ -94,7 +94,7 @@ pub struct DeviceConfig {
     /// |---|---|
     /// | all | non-empty, no NUL character |
     /// | Linux | at most 15 bytes (`IFNAMSIZ` minus the NUL), no `%` (the kernel would expand `%d` as a naming template) |
-    /// | macOS TAP | `feth<N>`, `N` a decimal number that fits in a `u32` with no sign or leading zero, at most 15 bytes (bare `feth` would let the kernel pick the unit) |
+    /// | macOS TAP | `feth<N>`, `N` a decimal number from 0 to 32767 (the kernel's highest `feth` unit) with no sign or leading zero (bare `feth` or `feth4294967295` would let the kernel pick the unit) |
     /// | macOS TUN | `utun<N>`, `N` a decimal number below `u32::MAX` with no sign or leading zero, at most 15 bytes |
     /// | Windows | at most 255 UTF-16 code units |
     ///

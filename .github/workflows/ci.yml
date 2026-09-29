@@ -114,9 +114,20 @@ jobs:
       # that the backend's wintun/"No driver found" recognition still
       # matches what the resolved tun-rs actually returns. `GITHUB_PATH`
       # only affects later steps, so nothing has to be moved or restored.
+      # A name filter that matches nothing still exits 0, so the step also
+      # requires the unit-test binary to report exactly those two tests
+      # passed (a rename would otherwise turn this check into a no-op).
       - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored windows_missing_driver_ (Windows, before driver install)
         if: matrix.os == 'windows-latest'
-        run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored windows_missing_driver_ --nocapture
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/missing-driver-tests.log"
+          cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored windows_missing_driver_ --nocapture 2>&1 | tee "$log"
+          if ! grep -Eq '^test result: ok\. 2 passed;' "$log"; then
+            echo "::error::expected 'test result: ok. 2 passed' from the windows_missing_driver_ tests; the filter matched a different number of tests (renamed or removed?)"
+            exit 1
+          fi
 
       # tun-rs's TUN mode on Windows loads wintun.dll at runtime (not linked
       # at build time) and does not vendor it — see tun-rs's own README,

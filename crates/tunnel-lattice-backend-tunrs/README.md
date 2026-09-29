@@ -80,7 +80,7 @@ created or touched):
 |--------------|-------------------------------------------------------------------------------|
 | all          | non-empty, no NUL character                                                   |
 | Linux        | at most 15 bytes (`IFNAMSIZ` minus the NUL), no `%`                           |
-| macOS TAP    | `feth<N>`, `N` a decimal number that fits in a `u32` with no sign or leading zero, at most 15 bytes |
+| macOS TAP    | `feth<N>`, `N` a decimal number from 0 to 32767 with no sign or leading zero |
 | macOS TUN    | `utun<N>`, `N` a decimal number below `u32::MAX` with no sign or leading zero, at most 15 bytes |
 | Windows      | at most 255 UTF-16 code units (TUN and TAP)                                   |
 
@@ -88,8 +88,11 @@ Two of these rules exist because the name would otherwise not be honored
 exactly: on Linux the kernel treats a `%d` in the name as a naming template
 (`tl%d` would open as `tl0`), so any name containing `%` is rejected; on
 macOS a bare `feth` is `tun-rs`'s own auto-naming request (the kernel would
-pick the unit), so a TAP name must carry an explicit unit number. Leave
-`name` unset to let the OS choose.
+pick the unit), so a TAP name must carry an explicit unit number. That unit
+is capped at 32767, the macOS kernel's highest `feth` unit: larger units
+fail natively, and `feth4294967295` is the kernel's own "pick any unit"
+wildcard, so it would also open under a different name. Leave `name` unset
+to let the OS choose.
 
 An MTU above `u16::MAX` is rejected the same way.
 
