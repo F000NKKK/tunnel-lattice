@@ -136,8 +136,8 @@ a specific message). Every other end-of-file stays `Disconnected`.
 
 `recv` and `send` also recognize a device that was deleted or disabled
 underneath the handle. `Disconnected` means the device channel is gone for
-good: raw `ENXIO` (macOS, the TAP's BPF descriptor after its `feth`
-interface was destroyed; also mapped on Linux for symmetry), Linux
+good: raw `ENXIO` (macOS, the TAP's BPF descriptor after the peer `feth`
+it is bound to was destroyed; also mapped on Linux for symmetry), Linux
 `EBADFD` (the tun file was detached because the device was deleted),
 Linux `EFAULT` on `recv` only (a blocking read already waiting when the
 device was deleted), and Wintun's send-side "adapter terminating" signal
@@ -271,6 +271,21 @@ error readiness only, which a readable-only wait (what `tun-rs` uses) never
 sees, so a pending `recv` would otherwise hang instead of ending with
 `Disconnected`. `send` stays on the `tun-rs` handle.
 
+On macOS with `async-io` or `tokio`, a TAP (`feth`) `recv` keeps `tun-rs`
+doing the read but replaces its readiness wait. macOS readiness
+notification for BPF only reports buffered data, never the interface
+going away, so `tun-rs`'s unbounded wait on the BPF descriptor would never
+end after the peer `feth` is destroyed. The backend instead waits on a
+duplicate of that descriptor on the `blocking` thread pool (the pool
+`tun-rs` itself uses there, so it needs no reactor and no runtime timer),
+in waits of at most 250 ms, and at each timeout asks the kernel which
+interface the descriptor is bound to; once that fails, the next read
+returns `ENXIO`, which maps to `Disconnected`. A per-wait pipe lets a
+dropped `recv` end its thread's wait at once, and no packet is read inside
+the wait, so dropping a `recv` never loses one. The cost is one extra
+descriptor per TAP handle and a pipe per pending wait; `send` and `utun`
+devices are unchanged.
+
 `tunnel-lattice-async` provides two ways to build the `futures::Stream`
 `Handle::packet_stream` returns: `from_async_device`, wrapping a backend's
 `AsyncPacketIo` directly with no worker thread at all (built on
@@ -298,8 +313,7 @@ every backend `tunnel-lattice` ships as of this crate implements
 `from_device` is not on the path any shipped build actually takes).
 `Handle::packet_stream`'s bound was tightened accordingly to require
 `AsyncPacketIo` (previously only `PacketIo`) — a pre-1.0 additive-in-effect
-change (see `versioning.md`) recorded as `TL-A-1`'s ADR index entry for this
-decision.
+change (see `versioning.md`) recorded in its own ADR.
 
 Neither crate depends on Tokio, async-std, or smol directly by default —
 `tunnel-lattice`'s `async-io`/`tokio` features (mutually exclusive; enabling

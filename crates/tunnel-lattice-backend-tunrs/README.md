@@ -112,7 +112,7 @@ disabled underneath the handle, before the general table above:
 
 | OS                   | Native error                                                                  | `Error`         |
 |----------------------|-------------------------------------------------------------------------------|-----------------|
-| macOS                | `ENXIO`: the TAP's BPF descriptor after its `feth` interface was destroyed    | `Disconnected`  |
+| macOS                | `ENXIO`: the TAP's BPF descriptor after the peer `feth` it is bound to was destroyed | `Disconnected`  |
 | Linux                | `EBADFD`: the device was deleted and its queue detached                       | `Disconnected`  |
 | Linux (`recv`)       | `EFAULT`: a blocking read already waiting when the device was deleted         | `Disconnected`  |
 | Linux                | `ENXIO` (mapped for symmetry with macOS; the Linux tun driver does not return it on read or write) | `Disconnected` |
@@ -135,6 +135,20 @@ descriptor registered with Tokio for readable and error readiness: a
 deleted device reports error readiness only, which the readable-only wait
 `tun-rs` uses would never see. The duplicate costs one extra file
 descriptor per handle (per queue) and closes with the handle.
+
+On macOS, destroying the peer `feth` of a TAP device ends `recv` with
+`Disconnected` in every feature set too. Without an async feature, the
+blocking BPF read is woken with `ENXIO`. With `async-io` or `tokio`, the
+wait needs help: macOS readiness notification for BPF does not report the
+interface going away, so `tun-rs`'s own wait would never end. A TAP
+`recv` therefore waits for the BPF descriptor itself, on a blocking-pool
+thread, in waits of at most 250 ms, and at each timeout checks that the
+descriptor is still bound to its interface; once it is not, the next read
+returns `ENXIO`, so a pending `recv` ends within about 250 ms. `tun-rs`
+still reads every packet. This costs one extra file descriptor per TAP
+handle, closed with the handle, and a pipe per pending wait, released as
+soon as the wait ends or its `recv` is dropped. Sending and macOS TUN
+(`utun`) devices are unchanged.
 
 `tunnel-lattice-async`'s `PacketStream` (and the facade's
 `Handle::packet_stream`) ends after any error except `BufferTooSmall`,
@@ -243,6 +257,9 @@ case above.
 two async backends (`tun-rs/async_io`, no runtime dependency beyond
 `async-io`/`blocking`; `tun-rs/async_tokio`, which pulls in tokio).
 Enabling both is a compile error from `tun-rs` itself, not from this crate.
+On macOS, either one also makes this crate depend on `blocking` directly,
+for the TAP receive wait described in "When the device goes away"; `tun-rs`
+already depends on it with both, so no new package enters the build.
 
 ### `tokio` requires a multi-threaded runtime
 

@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of panicking.
 - **`tunnel-lattice-backend-tunrs` maps device deletion and disabling on
   `recv`/`send` (behavioral, no signature change):** raw `ENXIO` on macOS
-  (the TAP's BPF descriptor after its `feth` interface was destroyed) and
+  (the TAP's BPF descriptor after the peer `feth` it is bound to was
+  destroyed) and
   Linux, and raw `EBADFD` on Linux (the device was deleted), are now
   `Error::Disconnected` instead of `Error::Platform(...)`. On Windows, a
   Wintun `send` after the adapter started terminating (`tun-rs` reports
@@ -48,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds one extra file descriptor; `send` is unchanged. The crate's
   `tokio` requirement is raised from `1` to `1.49`, the floor `tun-rs`
   2.8.11 already imposes, so resolved versions do not change.
+- **Fixed `tunnel-lattice-backend-tunrs` hanging on a destroyed macOS TAP
+  device under `async-io`/`tokio`:** a pending `recv` (and so a
+  `PacketStream`) over a TAP device whose peer `feth` was destroyed was
+  never woken, because macOS readiness notification for BPF does not
+  report the interface going away and `tun-rs` waits on the BPF descriptor
+  without a timeout. On macOS with either async feature, a TAP `recv` now
+  waits for the descriptor itself on the `blocking` thread pool, in waits
+  of at most 250 ms, checking at each timeout that the descriptor is still
+  bound to its interface, and ends with `Error::Disconnected` within about
+  250 ms of the destroy, as in the sync build. `tun-rs` still reads every
+  packet. Each TAP handle holds one extra file descriptor, and each pending
+  wait a pipe; `send` and macOS TUN (`utun`) devices are unchanged. The
+  crate now depends on `blocking` directly on macOS in async builds;
+  `tun-rs` already depends on it there, so no new package enters the build.
 - **Added packet-path benchmarks and an allocation-count test to
   `tunnel-lattice-async` (development only, no API change):** `cargo bench
   -p tunnel-lattice-async` measures the synchronous caller-buffer receive
