@@ -41,3 +41,9 @@ plan."
 
 This crate is not used directly by application code — see the
 `tunnel-lattice` facade. Implement these traits when writing a new backend.
+
+A backend's `PacketIo::recv` and `AsyncPacketIo::recv` must return
+`Ok(n)` only after writing all of `buf[..n]`, with `n <= buf.len()`.
+Callers such as `tunnel-lattice-async`'s buffer pool reuse receive
+buffers without clearing them, so reporting bytes that were not written
+would expose data from an earlier packet.

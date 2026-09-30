@@ -39,6 +39,10 @@ Tunnel Lattice follows standard Rust ecosystem conventions:
 - Changes to the packet receive path should report before/after numbers
   from `cargo bench -p tunnel-lattice-async` and keep
   `crates/tunnel-lattice-async/tests/alloc_count.rs` passing.
+- Changes to `crates/tunnel-lattice-async/src/pool.rs`, which holds all of
+  that crate's `unsafe` code, should pass
+  `cargo +nightly miri test -p tunnel-lattice-async --lib pool`. CI runs
+  this as a non-blocking job.
 - Commit messages should be clear and descriptive.
 
 ## Reporting Issues

@@ -17,6 +17,11 @@ use tunnel_lattice_core::Result;
 /// Available with the `async` feature.
 pub trait AsyncPacketIo {
     /// Reads one packet into `buf`, returning the number of bytes written.
+    ///
+    /// On `Ok(n)` the implementation must have written `buf[..n]`, and
+    /// `n <= buf.len()`. Callers may reuse `buf` across calls without
+    /// clearing it, so bytes past what was actually written must never be
+    /// reported as part of the packet.
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send;
 
     /// Writes one packet from `buf`.

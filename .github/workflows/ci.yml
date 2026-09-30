@@ -92,6 +92,31 @@ jobs:
         if: matrix.features.name == 'default'
         run: cargo bench -p tunnel-lattice-async --no-run
 
+  # Runs the packet-pool unit tests (the only `unsafe` in
+  # tunnel-lattice-async: the slab allocation and slot views) under Miri to
+  # catch undefined behaviour the ordinary tests cannot see. Non-blocking:
+  # Miri needs a nightly toolchain, which can break independently of this
+  # repository, so a failure here is reported but does not fail the run.
+  # The `pool` filter selects `pool::tests::*`; tunnel-lattice-async has no
+  # features of its own, so one Linux job covers it.
+  miri:
+    name: miri (tunnel-lattice-async pool, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (nightly + miri)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: cargo miri setup
+        run: cargo +nightly miri setup
+
+      - name: cargo +nightly miri test -p tunnel-lattice-async --lib pool
+        run: cargo +nightly miri test -p tunnel-lattice-async --lib pool
+
   privileged:
     name: privileged (${{ matrix.os }}, ${{ matrix.features.name }})
     runs-on: ${{ matrix.os }}

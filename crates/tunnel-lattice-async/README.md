@@ -55,6 +55,45 @@ while let Some(packet) = packets.next().await {
 }
 ```
 
+## Packet buffer pool
+
+`PacketPool` is a fixed-capacity pool of equally sized receive slots,
+carved from one zeroed slab that is allocated once. `PacketBuf` is an
+exclusive view of one packet inside a slot: the pool handle plus a 32-bit
+offset and length, 16 bytes on 64-bit targets. It dereferences to `[u8]`,
+supports `advance` (drop a prefix) and `truncate`, and returns its slot to
+the pool when dropped.
+
+- `PacketPool::new(slots, buf_len)` accepts any non-zero sizes whose slab
+  fits in `u32::MAX` bytes (and in `isize::MAX` on 32-bit targets).
+  `PacketPool::with_buf_len(buf_len)` picks up to `DEFAULT_SLOTS` (128)
+  slots within `DEFAULT_MAX_BYTES` (4 MiB).
+  Invalid sizes return `Error::InvalidState` before anything is allocated.
+  A failed slab allocation aborts the process, as it does for a `Vec`.
+- Each slot is `buf_len + 1` bytes rounded up to 64, so slots never share
+  a cache line. For example, a 1500-byte `buf_len` gives 1536-byte slots.
+- Slots are reused without being re-zeroed. `PacketBuf` only exposes the
+  bytes the device's `recv` reported, so this relies on backends honoring
+  `recv`'s contract: every reported byte was written.
+- The pool is plain `std` code with no feature flags or OS-specific paths.
+  Its `unsafe` code is confined to one module, whose tests CI also runs
+  under Miri.
+
+The stream adapters do not use the pool yet: `PacketStream` still yields
+`Vec<u8>` items, and the pool has no public acquire method.
+
+```rust
+use tunnel_lattice_async::{PacketPool, Result};
+
+fn make_pool() -> Result<PacketPool> {
+    let pool = PacketPool::with_buf_len(1500)?;
+    assert_eq!(pool.slots(), 128);
+    assert_eq!(pool.available(), 128);
+    assert!(PacketPool::new(0, 1500).is_err());
+    Ok(pool)
+}
+```
+
 ## Per-packet cost and benchmarks
 
 Today both paths yield an owned `Vec<u8>` per packet: the native path
@@ -63,4 +102,6 @@ copies each packet into a new `Vec` and an unbounded-channel node (two
 allocations per packet). The repository's `tests/alloc_count.rs` pins these
 counts, and `cargo bench -p tunnel-lattice-async` measures both paths
 against a synchronous caller-buffer loop, using in-memory mock devices (no
-privileges or real device needed).
+privileges or real device needed). `cargo bench -p tunnel-lattice-async
+--bench pool` measures `PacketPool` construction for full-MTU, jumbo and
+maximum-size buffers.

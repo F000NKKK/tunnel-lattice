@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::executor::block_on;
-use tunnel_lattice_async::{Error, PacketStream, Result, from_async_device, from_device};
+use tunnel_lattice_async::{
+    Error, PacketPool, PacketStream, Result, from_async_device, from_device,
+};
 use tunnel_lattice_platform::{AsyncPacketIo, PacketIo};
 
 struct Counting;
@@ -251,6 +253,19 @@ fn executor_control() {
     let before = zeroed();
     drop(black_box(vec![0u8; BUF_LEN]));
     assert_eq!(zeroed() - before, 1, "vec![0; n] must be one alloc_zeroed");
+
+    // The pool's slab is its only zeroed allocation (the free list and the
+    // `Arc` are plain allocations; eager mutex/condvar init adds plain ones
+    // on pthread platforms only).
+    let before = zeroed();
+    drop(black_box(
+        PacketPool::new(128, BUF_LEN).expect("128 slots of 1500 bytes are valid"),
+    ));
+    assert_eq!(
+        zeroed() - before,
+        1,
+        "PacketPool::new must make exactly one alloc_zeroed (the slab)"
+    );
     println!("executor_control: ok");
 }
 

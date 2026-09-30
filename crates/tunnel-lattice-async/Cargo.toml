@@ -27,6 +27,11 @@ criterion = { workspace = true }
 name = "packet_stream"
 harness = false
 
+# `PacketPool` construction cost (mock-free, no device).
+[[bench]]
+name = "pool"
+harness = false
+
 # Counts heap allocations per received packet with a counting global
 # allocator, which needs its own binary (no libtest harness allocating
 # concurrently on the main thread).

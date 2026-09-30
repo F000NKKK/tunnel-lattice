@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bridge) so later buffer changes can be compared against it. `criterion`
   is a dev-dependency only. CI builds the benches on every OS without
   running them.
+- **Added `PacketPool` and `PacketBuf` to `tunnel-lattice-async`
+  (additive):** `PacketPool::new(slots, buf_len)` and
+  `PacketPool::with_buf_len(buf_len)` build a fixed-capacity pool of
+  receive slots carved from one zeroed slab that is allocated once
+  (`with_buf_len` picks up to 128 slots within a 4 MiB budget). An invalid
+  size (zero slots, a zero `buf_len`, or a slab over `u32::MAX` bytes, or
+  over `isize::MAX` on 32-bit targets) is rejected with
+  `Error::InvalidState` before anything is allocated. A failed
+  slab allocation aborts the process, as it does for a `Vec`. `PacketBuf` is
+  a 16-byte (on 64-bit targets) view of one packet inside a slot. It
+  dereferences to `[u8]`, supports `advance`/`truncate`, and returns its
+  slot to the pool on drop. Slots are reused without being re-zeroed.
+  `PacketStream` still yields `Vec<u8>` items in this change, and the pool
+  has no public acquire method. `cargo bench -p tunnel-lattice-async
+  --bench pool` measures pool construction, and CI gains a non-blocking
+  Miri job for the pool's unsafe code.
+- **Documented the `recv` contract on `PacketIo` and `AsyncPacketIo`
+  (rustdoc only, no signature change):** on `Ok(n)` an implementation must
+  have written `buf[..n]`, and `n <= buf.len()`.
 - **Changed `tunnel-lattice-backend-tunrs`'s error mapping (behavioral,
   no signature change):** `io::Error`s are now mapped by `io::ErrorKind`
   onto the typed `Error` variants that previously existed but were never

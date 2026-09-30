@@ -14,6 +14,11 @@ use tunnel_lattice_core::Result;
 pub trait PacketIo {
     /// Reads one packet into `buf`, returning the number of bytes written.
     ///
+    /// On `Ok(n)` the implementation must have written `buf[..n]`, and
+    /// `n <= buf.len()`. Callers may reuse `buf` across calls without
+    /// clearing it, so bytes past what was actually written must never be
+    /// reported as part of the packet.
+    ///
     /// Returns [`tunnel_lattice_core::Error::InvalidState`] if `buf` is too
     /// small for the next queued packet on a backend that cannot truncate
     /// it, rather than silently returning a truncated packet.

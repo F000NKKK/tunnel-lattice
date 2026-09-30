@@ -19,8 +19,16 @@
 //!   shutdown limitation this variant has that `from_async_device` does not.
 //!
 //! No Tokio, async-std, or smol dependency is imposed by this crate itself.
+//!
+//! The crate also provides [`PacketPool`], a fixed-capacity pool of receive
+//! slots carved from one slab allocated once, and [`PacketBuf`], a 16-byte
+//! (on 64-bit targets) offset view of one packet inside a pool slot.
 
 #![warn(missing_docs)]
+
+mod pool;
+
+pub use pool::{PacketBuf, PacketPool};
 
 use std::pin::Pin;
 use std::sync::Arc;
