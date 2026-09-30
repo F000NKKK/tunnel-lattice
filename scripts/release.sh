@@ -26,7 +26,7 @@
 # отключает эту проверку полностью.
 #
 # Примеры:
-#   ./scripts/release.sh tunnel-lattice-core --minor    # каскад: core → model → platform → backend-tunrs → async → facade
+#   ./scripts/release.sh tunnel-lattice-core --minor    # каскад: core → model → platform → async → backend-tunrs → facade
 #   ./scripts/release.sh tunnel-lattice --patch         # patch: ссылки совместимы, каскада нет
 #   ./scripts/release.sh tunnel-lattice-model           # без бампа: публикует текущую версию, если ещё не на crates.io
 #   ./scripts/release.sh --publish-all           # весь воркспейс как есть, публикует неопубликованное
@@ -330,25 +330,38 @@ resolve_crate_action() {
 resolve_order() {
     local root="$1"
     local prefix_re="^${CRATE_PREFIX}[a-z0-9_-]+"
-    local names=() dep_lines=()
+    local names=() dep_lines=() dev_lines=()
 
     for toml in "$WS"/crates/*/Cargo.toml; do
         local name
         name="$(grep -m1 '^name *= *"' "$toml" | sed 's/.*"\([^"]*\)".*/\1/')"
         [[ -n "$name" ]] || continue
         names+=("$name")
-        # Только секция [dependencies] и [target.*.dependencies], до
-        # следующего заголовка секции.
-        local deps
-        deps="$(awk '/^\[.*dependencies\]/{f=1;next} /^\[/{f=0} f' "$toml" \
+        # Обычные зависимости: [dependencies], [build-dependencies] и
+        # [target.*.dependencies], до следующего заголовка секции. Только
+        # они задают каскад бампа: dev-зависимость не попадает в собранный
+        # крейт, и её бамп не требует перевыпуска зависящего крейта.
+        local deps dev_deps
+        deps="$(awk '/^\[/{f = ($0 ~ /dependencies\]/ && $0 !~ /dev-dependencies\]/); next} f' "$toml" \
+            | grep -oE "$prefix_re" | sort -u | tr '\n' ' ')"
+        # [dev-dependencies] и [target.*.dev-dependencies] влияют только на
+        # порядок публикации: `cargo publish` резолвит и dev-зависимости с
+        # версией, поэтому они должны быть на crates.io раньше.
+        dev_deps="$(awk '/^\[/{f = ($0 ~ /dev-dependencies\]/); next} f' "$toml" \
             | grep -oE "$prefix_re" | sort -u | tr '\n' ' ')"
         dep_lines+=("$name:$deps")
+        dev_lines+=("$name:$dev_deps")
     done
 
-    declare -A DEPS
+    declare -A DEPS ORDER_DEPS
     for line in "${dep_lines[@]}"; do
         local name="${line%%:*}" deps="${line#*:}"
         DEPS["$name"]="$deps"
+        ORDER_DEPS["$name"]="$deps"
+    done
+    for line in "${dev_lines[@]}"; do
+        local name="${line%%:*}" deps="${line#*:}"
+        ORDER_DEPS["$name"]+=" $deps"
     done
 
     local -a sel=()
@@ -379,7 +392,7 @@ resolve_order() {
         sel=("${names[@]}")
     fi
 
-    # Топологическая сортировка внутри sel
+    # Топологическая сортировка внутри sel (с учётом dev-зависимостей)
     local -A in_sel=() placed=()
     for c in "${sel[@]}"; do in_sel["$c"]=1; done
     local order=()
@@ -388,7 +401,7 @@ resolve_order() {
         for c in $(printf '%s\n' "${sel[@]}" | sort); do
             [[ -n "${placed[$c]+x}" ]] && continue
             local ready=true
-            for d in ${DEPS[$c]:-}; do
+            for d in ${ORDER_DEPS[$c]:-}; do
                 [[ -n "${in_sel[$d]+x}" && -z "${placed[$d]+x}" ]] && { ready=false; break; }
             done
             if $ready; then
