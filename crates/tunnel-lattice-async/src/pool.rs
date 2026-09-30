@@ -994,11 +994,14 @@ mod tests {
         }
     }
 
-    /// Panics when its last clone is dropped.
-    struct PanicOnDrop;
+    /// Panics when its last clone is dropped. Counts wakes, so it is not a
+    /// no-op waker (`Waker::noop()` cannot panic on drop).
+    struct PanicOnDrop(AtomicUsize);
 
     impl Wake for PanicOnDrop {
-        fn wake(self: Arc<Self>) {}
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     impl Drop for PanicOnDrop {
@@ -1487,7 +1490,7 @@ mod tests {
         // A pending acquire whose stored waker panics on drop is dropped
         // without the panic escaping.
         let mut fut = pool.acquire();
-        let waker = Waker::from(Arc::new(PanicOnDrop));
+        let waker = Waker::from(Arc::new(PanicOnDrop(AtomicUsize::new(0))));
         assert!(poll(&mut fut, &waker).is_pending());
         drop(waker);
         drop(fut);
