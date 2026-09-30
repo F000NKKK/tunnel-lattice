@@ -132,9 +132,36 @@ the snapshot's MTU, except a double-tagged (QinQ) TAP frame. `recv`
 and `send` also retry two transient conditions internally instead of
 reporting them: `EINTR` on Linux and macOS, and a macOS TAP read that
 produced no complete frame (which `tun-rs` reports as an end-of-file with
-a specific message). Every other end-of-file stays `Disconnected`. Both
-`PacketStream` variants yield `BufferTooSmall` and keep receiving; they end
-only after `Disconnected`.
+a specific message). Every other end-of-file stays `Disconnected`.
+
+`recv` and `send` also recognize a device that was deleted or disabled
+underneath the handle. `Disconnected` means the device channel is gone for
+good: raw `ENXIO` (macOS, the TAP's BPF descriptor after its `feth`
+interface was destroyed; also mapped on Linux for symmetry), Linux
+`EBADFD` (the tun file was detached because the device was deleted),
+Linux `EFAULT` on `recv` only (a blocking read already waiting when the
+device was deleted), and Wintun's send-side "adapter terminating" signal
+on Windows. A Wintun adapter that was disabled (for example by applying
+`DesiredAdminState::Down`) reports `InvalidState` instead, because applying
+`Up` recovers the same handle. These rules match raw OS codes only on the
+OS they belong to, and a raw-coded error is never matched through `kind()`
+(which `std` decodes with the running host's code table); only the
+code-less Wintun errors are matched by kind and message. Every rule is
+therefore unit-tested on every host.
+
+Both `PacketStream` variants yield `BufferTooSmall` and keep receiving.
+Every other error is yielded once and then ends the stream — `Disconnected`
+and recoverable errors alike. A device whose `recv` fails immediately and
+repeatedly (a deleted Linux device, a destroyed macOS `feth`, a disabled
+Wintun adapter) would otherwise turn the stream into a busy loop of error
+items and, on the thread bridge, fill its unbounded channel; a back-off or
+an error-count cap would need a timer (the crate is runtime-agnostic) or
+an arbitrary limit. The caller creates a new stream with
+`Handle::packet_stream` after recovering. Transient conditions never reach
+the stream because the backend retries them, which is why the `EINTR`
+retry is required: without it a signal would end a healthy stream. On
+Windows no condition is retried, so `BufferTooSmall` is the only error that
+does not end a stream there.
 
 ## Frozen public API surface
 
@@ -236,6 +263,13 @@ feature requires a **multi-threaded** Tokio runtime on the calling thread —
 on the owned value, not a `Handle`) does, so a `current_thread` runtime
 reproduces the same hang. See `tunnel-lattice-backend-tunrs`'s README,
 "`tokio` requires a multi-threaded runtime."
+
+On Linux with `tokio`, `recv` does not wait through `tun-rs` at all: it
+reads through a private duplicate of the device descriptor registered with
+Tokio for readable *and* error readiness. A deleted Linux device reports
+error readiness only, which a readable-only wait (what `tun-rs` uses) never
+sees, so a pending `recv` would otherwise hang instead of ending with
+`Disconnected`. `send` stays on the `tun-rs` handle.
 
 `tunnel-lattice-async` provides two ways to build the `futures::Stream`
 `Handle::packet_stream` returns: `from_async_device`, wrapping a backend's

@@ -242,8 +242,15 @@ where
     /// which fits one packet at the device's current MTU, Ethernet framing
     /// included for TAP. A packet larger than `buf_len` is never truncated:
     /// it is discarded, the stream yields `Err(Error::BufferTooSmall)`, and
-    /// it keeps receiving. The stream ends after yielding
-    /// `Err(Error::Disconnected)`.
+    /// it keeps receiving.
+    ///
+    /// Every other error is yielded once and then the stream ends: both
+    /// `Err(Error::Disconnected)` (the device is gone for good) and errors
+    /// the device can recover from, such as `Err(Error::InvalidState)`
+    /// after the interface was administratively disabled. To keep
+    /// receiving after recovering (for example after applying
+    /// `DesiredAdminState::Up`), call `packet_stream` again for a new
+    /// stream.
     ///
     /// ```no_run
     /// # #[cfg(any(feature = "async-io", feature = "tokio"))]

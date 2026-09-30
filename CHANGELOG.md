@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking (behavioral): `PacketStream` now ends after any error except
+  `Error::BufferTooSmall`.** Both `tunnel-lattice-async` variants
+  (`from_async_device` and the `from_device` thread bridge), and so
+  `Handle::packet_stream`, yield the error once and then end. Previously
+  only `Err(Disconnected)` ended a stream and every other error was yielded
+  while the stream kept polling, so a device whose `recv` failed
+  immediately and repeatedly (a deleted Linux device, a destroyed macOS TAP
+  interface, a disabled Wintun adapter) produced an endless stream of error
+  items, and the thread bridge's worker kept filling its unbounded channel
+  with them. The worker now stops calling `recv` and exits right after
+  forwarding the error. Callers that relied on a stream surviving an error
+  must create a new stream (`Handle::packet_stream` again) after recovering,
+  for example after applying `DesiredAdminState::Up` to a disabled
+  interface. Polling an ended native stream again now returns `None`
+  instead of panicking.
+- **`tunnel-lattice-backend-tunrs` maps device deletion and disabling on
+  `recv`/`send` (behavioral, no signature change):** raw `ENXIO` on macOS
+  (the TAP's BPF descriptor after its `feth` interface was destroyed) and
+  Linux, and raw `EBADFD` on Linux (the device was deleted), are now
+  `Error::Disconnected` instead of `Error::Platform(...)`. On Windows, a
+  Wintun `send` after the adapter started terminating (`tun-rs` reports
+  `WriteZero`) is now `Error::Disconnected`, matching `recv`, instead of
+  `Error::Platform(Unknown)`; and the code-less `"The interface has been
+  disabled"` error after the Wintun adapter was disabled is now
+  `Error::InvalidState` (recoverable by applying `DesiredAdminState::Up`)
+  instead of `Error::Platform(Unknown)`. On Linux `recv` only, raw `EFAULT`
+  (the kernel's error for a blocking read already waiting when the device
+  is deleted) is also `Error::Disconnected` instead of
+  `Error::Platform(Linux(14))`, so deleting a Linux device ends `recv` with
+  `Disconnected` in every feature set; `EFAULT` on `send` and on macOS keeps
+  the generic mapping.
+- **Fixed `tunnel-lattice-backend-tunrs` hanging on a deleted Linux device
+  under the `tokio` feature:** a pending `recv` (and so a `PacketStream`)
+  over a TUN/TAP device deleted with `ip link del` was never woken, because
+  the deleted device reports error readiness only and `tun-rs` waits for
+  readable readiness alone. On Linux with `tokio`, `recv` now waits through
+  a private duplicate of the device descriptor registered for both, and
+  ends with `Error::Disconnected`. Each handle (and each additional queue)
+  holds one extra file descriptor; `send` is unchanged. The crate's
+  `tokio` requirement is raised from `1` to `1.49`, the floor `tun-rs`
+  2.8.11 already imposes, so resolved versions do not change.
 - **Added packet-path benchmarks and an allocation-count test to
   `tunnel-lattice-async` (development only, no API change):** `cargo bench
   -p tunnel-lattice-async` measures the synchronous caller-buffer receive
@@ -47,7 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the buffer plus one spare byte on Linux and macOS, and maps `tun-rs`'s
   code-less `InvalidData` (macOS TAP) and `InvalidInput` (Windows) receive
   errors. `tunnel-lattice-async`'s streams yield `Err(BufferTooSmall)` for
-  such a packet and keep receiving; only `Err(Disconnected)` ends a stream.
+  such a packet and keep receiving (it is the only error that does not end
+  a stream; see the stream end-of-life entry above).
   A device that reports more bytes than the buffer holds is also reported
   as `BufferTooSmall` by the streams instead of being sliced.
 - **Added `Device::recv_buffer_len` to `tunnel-lattice-model`

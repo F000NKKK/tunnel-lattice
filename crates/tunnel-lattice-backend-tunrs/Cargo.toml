@@ -41,7 +41,10 @@ tunnel-lattice-model = { workspace = true }
 tunnel-lattice-platform = { workspace = true }
 tun-rs = { workspace = true }
 futures = { workspace = true, optional = true }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
+# 1.49 is tun-rs 2.8.11's own tokio floor. The Linux error-aware receive
+# path also needs `Interest::ERROR` (1.32) and `task::coop::consume_budget`
+# (1.44), both below it.
+tokio = { version = "1.49", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
 
 # `if_nametoindex`, used by `open` to tell an existing-name conflict apart
 # from other `EINVAL`/`EBUSY` failures. Already locked via tun-rs; adds no
@@ -57,3 +60,11 @@ libc = "0.2"
 # `cargo tree --target x86_64-pc-windows-msvc -i libloading`.
 [target.'cfg(target_os = "windows")'.dependencies]
 libloading = "0.9"
+
+# Test-only: the privileged teardown tests drive a real device through
+# `tunnel-lattice-async`'s `PacketStream` (the native adapter in async
+# builds, the thread bridge in the sync build) and delete or disable the
+# device underneath it.
+[dev-dependencies]
+tunnel-lattice-async = { workspace = true }
+futures = { workspace = true }

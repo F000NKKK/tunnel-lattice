@@ -75,9 +75,12 @@ current MTU, except for a double-tagged (QinQ) TAP frame.
   thread-based adapter, whose shutdown is best-effort only. Its `buf_len`
   argument is the per-packet buffer size; pass
   `handle.snapshot()?.recv_buffer_len()`. An oversize packet yields
-  `Err(Error::BufferTooSmall)` and the stream keeps receiving; only
-  `Err(Error::Disconnected)` ends it. No async runtime dependency is imposed
-  when neither feature is enabled.
+  `Err(Error::BufferTooSmall)` and the stream keeps receiving; every other
+  error (`Err(Error::Disconnected)` for a deleted device, or a recoverable
+  one such as `Err(Error::InvalidState)` for a disabled interface) is
+  yielded once and ends the stream, so call `packet_stream` again for a new
+  stream after recovering. No async runtime dependency is imposed when
+  neither feature is enabled.
 
   **With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
   multi-threaded Tokio runtime entered on the calling thread**

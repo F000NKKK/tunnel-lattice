@@ -20,6 +20,8 @@
 
 mod open_contract;
 mod recv_contract;
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+mod tokio_linux;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
@@ -114,6 +116,14 @@ impl TunRsBackend {
 /// so device metadata (name/mtu/if_index/enabled) reads identically either
 /// way.
 ///
+/// On Linux with the `tokio` feature, receiving is the one exception: it
+/// reads through a private duplicate of the device descriptor, registered
+/// with the Tokio reactor for both readable and error readiness, because
+/// `tun-rs` waits for readable readiness only and a deleted device reports
+/// an error readiness alone (see "When the device goes away"). The
+/// duplicate is owned by this handle, costs one extra descriptor, and
+/// closes with it. Sending stays on the `tun-rs` handle.
+///
 /// # Receiving packets
 ///
 /// `recv` (sync [`PacketIo`] and, with an async feature, `AsyncPacketIo`)
@@ -136,8 +146,30 @@ impl TunRsBackend {
 /// `tun-rs` 2.8.11). Each retry re-enters the blocking read or readiness
 /// wait, so it never spins. Every other end-of-file, such as the device
 /// being closed or a Wintun session ending, is [`Error::Disconnected`].
+///
+/// # When the device goes away
+///
+/// `recv` and `send` also map the native errors that mean the device is
+/// gone or disabled, before the general mapping on the crate's error table:
+///
+/// | OS | Native error | [`Error`] |
+/// |---|---|---|
+/// | macOS (and Linux, for symmetry) | `ENXIO`: on macOS, the TAP's BPF descriptor after its `feth` interface was destroyed | [`Error::Disconnected`] |
+/// | Linux | `EBADFD`: the device was deleted and its queue detached | [`Error::Disconnected`] |
+/// | Linux (`recv`) | `EFAULT`: a blocking read already waiting when the device was deleted | [`Error::Disconnected`] |
+/// | Windows TUN (`send`) | Wintun reports the adapter terminating (`tun-rs` returns `WriteZero`) | [`Error::Disconnected`] |
+/// | Windows TUN | `"The interface has been disabled"`: the adapter was disabled, for example by applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
+///
+/// So on Linux, deleting the device (for example with `ip link del`) ends
+/// a pending or later `recv` with [`Error::Disconnected`] in every feature
+/// set. A `PacketStream` from `tunnel-lattice-async` ends after any of
+/// these errors (every error except [`Error::BufferTooSmall`] ends it).
 pub struct TunRsDevice {
     kind: DeviceKind,
+    /// The error-aware receive registration (see above). Declared before
+    /// `handle` so it drops, and deregisters, first.
+    #[cfg(all(target_os = "linux", feature = "tokio"))]
+    reader: tokio_linux::ErrorAwareReader,
     #[cfg(feature = "async")]
     handle: tun_rs::AsyncDevice,
     #[cfg(not(feature = "async"))]
@@ -171,10 +203,12 @@ pub struct TunRsDevice {
 /// [`PlatformErrorCode`] has no matching tag, every unmapped error is
 /// [`PlatformErrorCode::Unknown`].
 ///
-/// `recv`/`send` apply their own rules first (retrying transient errors
-/// and reporting a too-small buffer as [`Error::BufferTooSmall`]; see
-/// [`TunRsDevice`], "Receiving packets"), so a retried `EINTR` or macOS
-/// `"recv buffer is empty"` end-of-file never reaches this table.
+/// `recv`/`send` apply their own rules first (retrying transient errors,
+/// reporting a too-small buffer as [`Error::BufferTooSmall`], and mapping
+/// the device-gone and device-disabled errors; see [`TunRsDevice`],
+/// "Receiving packets" and "When the device goes away"), so a retried
+/// `EINTR` or macOS `"recv buffer is empty"` end-of-file never reaches this
+/// table.
 fn io_error(err: std::io::Error) -> Error {
     use std::io::ErrorKind;
 
@@ -292,6 +326,10 @@ impl DeviceProvider for TunRsBackend {
 
         Ok(TunRsDevice {
             kind: config.kind,
+            // On failure `handle` drops: a new device is torn down, an
+            // attached persistent one is detached.
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            reader: tokio_linux::ErrorAwareReader::new(&*handle).map_err(io_error)?,
             handle,
         })
     }
@@ -359,10 +397,16 @@ impl TunRsDevice {
         }
     }
 
-    /// Async receive with the `recv` error contract applied.
+    /// Async receive with the `recv` error contract applied. On Linux with
+    /// `tokio` it reads through the error-aware duplicate descriptor (see
+    /// [`TunRsDevice`]), otherwise through the `tun-rs` handle.
     #[cfg(feature = "async")]
     async fn async_recv(&self, buf: &mut [u8]) -> Result<usize> {
-        recv_contract::recv_async(open_contract::HOST_OS, &self.handle, buf).await
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        let source = &self.reader;
+        #[cfg(not(all(target_os = "linux", feature = "tokio")))]
+        let source = &self.handle;
+        recv_contract::recv_async(open_contract::HOST_OS, source, buf).await
     }
 
     /// Async send, retrying transient errors.
@@ -390,8 +434,9 @@ fn sentinel_recv(handle: &tun_rs::SyncDevice, buf: &mut [u8]) -> std::io::Result
 }
 
 /// The async counterpart of `sentinel_recv`, re-awaited by
-/// `recv_contract::recv_async` after a transient error.
-#[cfg(feature = "async")]
+/// `recv_contract::recv_async` after a transient error. Not used on Linux
+/// with `tokio`, which receives through `tokio_linux::ErrorAwareReader`.
+#[cfg(all(feature = "async", not(all(target_os = "linux", feature = "tokio"))))]
 impl recv_contract::AsyncRecvSource for tun_rs::AsyncDevice {
     async fn recv_native(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
@@ -494,6 +539,8 @@ impl MultiQueueProvider for TunRsDevice {
         let handle = self.handle.try_clone().map_err(io_error)?;
         Ok(TunRsDevice {
             kind: self.kind,
+            #[cfg(all(target_os = "linux", feature = "tokio"))]
+            reader: tokio_linux::ErrorAwareReader::new(&*handle).map_err(io_error)?,
             handle,
         })
     }
@@ -1327,6 +1374,387 @@ mod privileged_tests {
             matches!(result, Err(Error::DriverUnavailable)),
             "open(Tap) without the tap-windows6 driver should report DriverUnavailable, got {:?}",
             result.err()
+        );
+    }
+
+    /// Runs a host command best-effort on drop: removes the test's own
+    /// device if a teardown test panics before (or after) tearing it down
+    /// itself. A failure (the device is already gone) is ignored, and it
+    /// runs on unwind, not on a hard abort.
+    ///
+    /// A Linux TUN/TAP device is non-persistent, so closing its handle, at
+    /// the latest when the test process exits, removes it as well. A macOS
+    /// `feth` pair is different: it is a cloned interface that outlives the
+    /// process, so after a failed test (whose drain thread still holds the
+    /// device) these guards, one per `feth`, are its only cleanup. A hard
+    /// abort would leak it; CI runners are ephemeral.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct RemoveOnDrop {
+        program: &'static str,
+        args: Vec<String>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(self.program)
+                .args(&self.args)
+                .output();
+        }
+    }
+
+    /// What a stream yielded between being started and ending.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[derive(Debug)]
+    struct Drained {
+        /// Packets received before the first error (unsolicited traffic
+        /// such as IPv6 neighbor discovery may arrive).
+        packets: usize,
+        /// Every error item, in order.
+        errors: Vec<Error>,
+        /// Packets received after the first error; must be zero.
+        packets_after_error: usize,
+    }
+
+    /// Starts the `PacketStream` the facade's `Handle::packet_stream` would
+    /// build for this device (the native adapter in async builds, the
+    /// thread bridge in the sync build), drains it on a separate thread,
+    /// runs `teardown` while the stream is polling, and returns what the
+    /// stream yielded once it ends, or panics if it has not ended within
+    /// 30 s. `teardown` returns `false` if it could not tear the device
+    /// down; the stream is then left polling on its thread (the device is
+    /// removed when the test process exits) and `None` is returned.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn drain_stream_across_teardown(
+        device: TunRsDevice,
+        teardown: impl FnOnce(&TunRsDevice) -> bool,
+    ) -> Option<Drained> {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use futures::StreamExt;
+
+        let buf_len = device
+            .snapshot()
+            .expect("snapshot the device")
+            .recv_buffer_len();
+        let device = Arc::new(device);
+        #[cfg(feature = "async")]
+        let mut stream = tunnel_lattice_async::from_async_device(Arc::clone(&device), buf_len);
+        #[cfg(not(feature = "async"))]
+        let mut stream = tunnel_lattice_async::from_device(Arc::clone(&device), buf_len);
+
+        #[cfg(feature = "tokio")]
+        let runtime = tokio::runtime::Handle::current();
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let drain = async move {
+                let mut drained = Drained {
+                    packets: 0,
+                    errors: Vec::new(),
+                    packets_after_error: 0,
+                };
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(_) if drained.errors.is_empty() => drained.packets += 1,
+                        Ok(_) => drained.packets_after_error += 1,
+                        Err(err) => drained.errors.push(err),
+                    }
+                }
+                drained
+            };
+            #[cfg(feature = "tokio")]
+            let drained = runtime.block_on(drain);
+            #[cfg(not(feature = "tokio"))]
+            let drained = futures::executor::block_on(drain);
+            let _ = done.send(drained);
+        });
+
+        // Let the stream reach its blocking read or readiness wait first.
+        std::thread::sleep(Duration::from_millis(500));
+        if !teardown(&device) {
+            return None;
+        }
+        match outcome.recv_timeout(Duration::from_secs(30)) {
+            Ok(drained) => Some(drained),
+            Err(_) => panic!("the stream did not end within 30 s of the device teardown"),
+        }
+    }
+
+    /// The contract every teardown test asserts: the stream ended after
+    /// yielding exactly one error, and nothing after it.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn assert_ended_after_one_error(label: &str, drained: &Drained) {
+        eprintln!("{label}: {drained:?}");
+        assert_eq!(
+            drained.errors.len(),
+            1,
+            "{label}: the stream must end right after its first error: {drained:?}"
+        );
+        assert!(
+            !matches!(drained.errors[0], Error::BufferTooSmall),
+            "{label}: BufferTooSmall is not terminal"
+        );
+        assert_eq!(drained.packets_after_error, 0, "{label}: {drained:?}");
+    }
+
+    /// Deleting the device with `ip link del` while a stream is polling
+    /// ends the stream with exactly `Disconnected`, in every feature set.
+    /// Per `drivers/net/tun.c`, the native error differs by build:
+    ///
+    /// - sync (the thread bridge's blocking read): `EFAULT` for the read
+    ///   already blocked, or `EBADFD` if the read starts after the tun file
+    ///   was detached;
+    /// - `async-io`: `EBADFD`, read once `polling` reports the error
+    ///   readiness;
+    /// - `tokio`: `EBADFD`, read through the error-aware duplicate
+    ///   descriptor (Tokio's readable-only wait, which `tun-rs` uses, is
+    ///   never woken by the error readiness a detached tun file reports).
+    ///
+    /// All of them map to `Disconnected`; the stream yields it and ends.
+    #[cfg(target_os = "linux")]
+    fn assert_linux_delete_ends_the_stream(kind: DeviceKind, tag: &str) {
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let name = unique_linux_name(tag);
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(kind).with_name(name.as_str()))
+            .expect("open a device");
+        let _cleanup = RemoveOnDrop {
+            program: "ip",
+            args: vec!["link".into(), "del".into(), name.clone()],
+        };
+        let drained = drain_stream_across_teardown(device, |_| {
+            run_host_command("ip", &["link", "del", &name]);
+            true
+        })
+        .expect("the teardown ran");
+        assert_ended_after_one_error(&format!("{kind:?} ip link del"), &drained);
+        assert!(
+            matches!(drained.errors[0], Error::Disconnected),
+            "{drained:?}"
+        );
+    }
+
+    /// A `PacketIo::recv` blocked when the device is deleted with `ip link
+    /// del` returns `Disconnected`: the sync build's `EFAULT` rule, and the
+    /// `tokio` build's `Handle::block_on` path over the error-aware reader.
+    /// Unsolicited packets that arrive first are skipped. The receiving
+    /// thread is bounded by a 30 s wait; the guard deletes the device on
+    /// every exit path.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open and delete a TUN device"]
+    fn recv_returns_disconnected_when_the_device_is_deleted_on_linux() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let name = unique_linux_name("rdel");
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
+                .expect("open a TUN device"),
+        );
+        let _cleanup = RemoveOnDrop {
+            program: "ip",
+            args: vec!["link".into(), "del".into(), name.clone()],
+        };
+        let buf_len = device
+            .snapshot()
+            .expect("snapshot the device")
+            .recv_buffer_len();
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        {
+            let device = Arc::clone(&device);
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                #[cfg(feature = "tokio")]
+                let _entered = runtime.enter();
+                let mut buf = vec![0u8; buf_len];
+                let err = loop {
+                    if let Err(err) = PacketIo::recv(&*device, &mut buf) {
+                        break err;
+                    }
+                };
+                let _ = done.send(err);
+            });
+        }
+
+        // Let the receiver reach its blocking read or readiness wait first.
+        std::thread::sleep(Duration::from_millis(500));
+        run_host_command("ip", &["link", "del", &name]);
+        match outcome.recv_timeout(Duration::from_secs(30)) {
+            Ok(err) => assert!(matches!(err, Error::Disconnected), "{err:?}"),
+            Err(_) => panic!("recv did not return within 30 s of the device deletion"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open and delete a TUN device"]
+    fn tun_stream_ends_when_the_device_is_deleted_on_linux() {
+        assert_linux_delete_ends_the_stream(DeviceKind::Tun, "sdel");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open and delete a TAP device"]
+    fn tap_stream_ends_when_the_device_is_deleted_on_linux() {
+        assert_linux_delete_ends_the_stream(DeviceKind::Tap, "pdel");
+    }
+
+    /// The peer of the macOS TAP's `feth` interface `dev`, read from the
+    /// `peer: fethN` line of `ifconfig <dev>`. `tun-rs` creates a `feth`
+    /// pair and binds its BPF read descriptor to the peer, but does not
+    /// expose the peer's name. Panics if there is no such line.
+    #[cfg(target_os = "macos")]
+    fn feth_peer_of(dev: &str) -> String {
+        let output = std::process::Command::new("ifconfig")
+            .arg(dev)
+            .output()
+            .unwrap_or_else(|err| panic!("run ifconfig {dev}: {err}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("peer: "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("no `peer:` line in `ifconfig {dev}`:\n{stdout}"))
+    }
+
+    /// Destroying the peer of the macOS TAP's `feth` pair with `ifconfig
+    /// <peer> destroy` while a stream is polling ends the stream. The peer
+    /// is the interface the BPF read descriptor is bound to; destroying
+    /// the other (`dev`) side would only unpeer it and the read would keep
+    /// waiting. The one terminal item is either `Disconnected` (the
+    /// blocking BPF read fails with `ENXIO`) or
+    /// `Platform(PlatformErrorCode::Unknown)` (the async builds' `select`
+    /// loop reports the descriptor's poll error as a code-less
+    /// `"fd error"`); the test prints which one occurred.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open and destroy a feth TAP device"]
+    fn tap_stream_ends_when_the_feth_is_destroyed_on_macos() {
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap))
+            .expect("open a feth TAP device");
+        let dev = device.snapshot().expect("snapshot the device").name;
+        // Armed first so it drops last: locals drop in reverse order, so
+        // the peer is destroyed before `dev`.
+        let _dev_guard = RemoveOnDrop {
+            program: "ifconfig",
+            args: vec![dev.clone(), "destroy".into()],
+        };
+        let peer = feth_peer_of(&dev);
+        let _peer_guard = RemoveOnDrop {
+            program: "ifconfig",
+            args: vec![peer.clone(), "destroy".into()],
+        };
+        let drained = drain_stream_across_teardown(device, |_| {
+            run_host_command("ifconfig", &[&peer, "destroy"]);
+            true
+        })
+        .expect("the teardown ran");
+        assert_ended_after_one_error("feth peer destroy", &drained);
+        let terminal = &drained.errors[0];
+        eprintln!("feth peer destroy: terminal item {terminal:?}");
+        assert!(
+            matches!(
+                terminal,
+                Error::Disconnected | Error::Platform(PlatformErrorCode::Unknown)
+            ),
+            "{drained:?}"
+        );
+    }
+
+    /// `ifconfig <utun> destroy` while a stream is polling. A `utun`
+    /// interface is created through a kernel-control socket, not an
+    /// interface cloner, so the kernel is expected to refuse the destroy;
+    /// the test then records that nothing was torn down (only the `feth`
+    /// test above exercises macOS teardown) and leaves the device to be
+    /// removed when the test process exits. If the destroy does succeed,
+    /// the stream must end like on every other platform.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open a utun device"]
+    fn tun_stream_ends_or_utun_destroy_is_refused_on_macos() {
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a utun device");
+        let name = device.snapshot().expect("snapshot the device").name;
+        let drained = drain_stream_across_teardown(device, |_| {
+            let output = std::process::Command::new("ifconfig")
+                .args([name.as_str(), "destroy"])
+                .output()
+                .expect("run ifconfig");
+            if !output.status.success() {
+                eprintln!(
+                    "utun destroy refused, nothing torn down: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            output.status.success()
+        });
+        if let Some(drained) = drained {
+            assert_ended_after_one_error("utun destroy", &drained);
+        }
+    }
+
+    /// Disabling the Wintun adapter (`apply(Down)`, which ends the Wintun
+    /// session) while a stream is polling ends the stream with
+    /// `InvalidState`: the disabled state is recoverable with `apply(Up)`,
+    /// but it still ends the stream (only `BufferTooSmall` does not). The
+    /// adapter is removed when the device drops at the end of the test. If
+    /// the test panics, the still-running drain thread keeps the device, so
+    /// removal then relies on Wintun deleting the adapter when the test
+    /// process exits.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and wintun.dll to open a TUN device"]
+    fn tun_stream_ends_when_the_wintun_adapter_is_disabled_on_windows() {
+        use tunnel_lattice_model::DesiredAdminState;
+
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a Wintun device");
+        let drained = drain_stream_across_teardown(device, |device| {
+            let id = device.snapshot().expect("snapshot the device").id;
+            let patch = DeviceConfigPatch::new(id, Some(DesiredAdminState::Down), None)
+                .expect("build a patch");
+            device.apply(patch).expect("disable the adapter");
+            true
+        })
+        .expect("the teardown ran");
+        assert_ended_after_one_error("Wintun disable", &drained);
+        assert!(
+            matches!(drained.errors[0], Error::InvalidState),
+            "{drained:?}"
         );
     }
 }

@@ -1,19 +1,32 @@
 //! The `recv`/`send` error contract: the transient conditions retried
-//! inside the backend and the too-small-buffer normalization, applied in
-//! front of the generic [`io_error`] mapping.
+//! inside the backend, the too-small-buffer normalization, and the
+//! device-lifecycle errors, applied in front of the generic [`io_error`]
+//! mapping.
 //!
 //! Like [`crate::open_contract`], the rules take an explicit [`HostOs`]
 //! instead of `#[cfg]` blocks, so every per-OS rule is exercised by the
-//! ordinary unit tests on every host.
+//! ordinary unit tests on every host. Rules on OS error codes compare the
+//! raw code only, never `kind()` of a raw-coded error: `std` decodes a raw
+//! code with the *running* host's table (code 6 is `ENXIO` on unix but
+//! `ERROR_INVALID_HANDLE` on Windows), so a kind check would make a rule
+//! behave differently depending on where the tests run.
 //!
 //! | OS | Native signal | Result |
 //! |---|---|---|
-//! | Linux, macOS | raw `EINTR` (`Interrupted`) | retried (re-enters the blocking read or readiness wait) |
+//! | Linux, macOS | raw `EINTR` (4) | retried (re-enters the blocking read or readiness wait) |
 //! | macOS | code-less `UnexpectedEof`, message exactly `"recv buffer is empty"` (feth TAP: a BPF read with no complete frame) | retried |
 //! | Linux, macOS (recv) | `Ok(n)` with `n > buf.len()` from the sentinel read | [`Error::BufferTooSmall`] |
 //! | macOS (recv) | code-less `InvalidData` (feth TAP: frame larger than the buffer) | [`Error::BufferTooSmall`] |
 //! | Windows (recv) | code-less `InvalidInput` (wintun / tap-windows: packet larger than the buffer) | [`Error::BufferTooSmall`] |
-//! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF`) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
+//! | Linux, macOS | raw `ENXIO` (6): on macOS the feth TAP's BPF descriptor after the interface is destroyed; on Linux listed for symmetry only (`tun.c` returns it only on its XDP transmit path) | [`Error::Disconnected`] |
+//! | Linux | raw `EBADFD` (77): the tun file was detached because the device was deleted | [`Error::Disconnected`] |
+//! | Linux (recv) | raw `EFAULT` (14): a read already blocked when the device was deleted | [`Error::Disconnected`] |
+//! | Windows (send) | code-less `WriteZero` (Wintun `ERROR_HANDLE_EOF`: the adapter is terminating) | [`Error::Disconnected`] |
+//! | Windows | code-less `Other`, message exactly `"The interface has been disabled"` (Wintun session ended by `apply(Down)`; `apply(Up)` recovers it) | [`Error::InvalidState`] |
+//! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
+//!
+//! `WriteZero` is remapped on `send` only, so the same kind from any other
+//! operation keeps its generic meaning.
 //!
 //! Linux TUN/TAP and macOS utun truncate an oversize packet silently, so on
 //! unix the backend reads into `[buf, 1-byte sentinel]` with `readv`: a
@@ -21,7 +34,7 @@
 //! reported length exceeds `buf.len()`. The packet is then already consumed
 //! (discarded); only its first `buf.len()` bytes were written.
 //!
-//! The retried message and the error kinds come from `tun-rs` 2.8.11, the
+//! The matched messages and the error kinds come from `tun-rs` 2.8.11, the
 //! workspace's minimum `tun-rs` requirement; re-verify them whenever the
 //! resolved `tun-rs` changes. The unit tests pin this crate's own
 //! constants, not the upstream strings.
@@ -39,10 +52,31 @@ use crate::open_contract::HostOs;
 /// when a BPF read produced no complete frame. Transient: retried.
 pub(crate) const MACOS_TAP_EMPTY_READ_MESSAGE: &str = "recv buffer is empty";
 
+/// `tun-rs` 2.8.11 `platform/windows/tun/mod.rs` (`State::check`, the
+/// `WinTunAdapter` receive/send methods once the session is gone, and both
+/// Wintun readiness waits when the adapter's shutdown event fires): the
+/// message of the code-less `io::Error::other` returned after the Wintun
+/// adapter was disabled (`enabled(false)`, which `apply(Down)` calls).
+/// Recoverable with `apply(Up)`: mapped to [`Error::InvalidState`].
+pub(crate) const WINDOWS_TUN_DISABLED_MESSAGE: &str = "The interface has been disabled";
+
 /// `EINTR`, identical on Linux and macOS (asserted against `libc` by the
 /// unit tests on those targets). Written out so the rules compile, and are
 /// tested, on every host.
 const EINTR: i32 = 4;
+
+/// `ENXIO`, identical on Linux and macOS (asserted against `libc` by the
+/// unit tests on those targets).
+const ENXIO: i32 = 6;
+
+/// Linux `EBADFD` (asserted against `libc` by the unit tests on Linux).
+/// macOS has no `EBADFD`; its code 77 is `ENOLCK`, so this rule is
+/// Linux-only.
+const EBADFD: i32 = 77;
+
+/// Linux `EFAULT` (asserted against `libc` by the unit tests on Linux).
+/// Mapped on Linux `recv` only; see [`recv_error`].
+const EFAULT: i32 = 14;
 
 /// What a `recv`/`send` loop does with one native attempt's result.
 #[derive(Debug)]
@@ -83,12 +117,13 @@ pub(crate) fn send_step(os: HostOs, result: io::Result<usize>) -> Step {
     match result {
         Ok(n) => Step::Done(Ok(n)),
         Err(err) if is_transient(os, &err) => Step::Retry,
-        Err(err) => Step::Done(Err(io_error(err))),
+        Err(err) => Step::Done(Err(send_error(os, err))),
     }
 }
 
 /// Maps a non-transient `recv` error: the too-small-buffer signals first,
-/// then [`io_error`].
+/// then the Linux receive-only `EFAULT` rule, then the device-lifecycle
+/// rules, then [`io_error`].
 fn recv_error(os: HostOs, err: io::Error) -> Error {
     let too_small = err.raw_os_error().is_none()
         && match os {
@@ -97,9 +132,52 @@ fn recv_error(os: HostOs, err: io::Error) -> Error {
             HostOs::Linux | HostOs::Other => false,
         };
     if too_small {
-        Error::BufferTooSmall
-    } else {
-        io_error(err)
+        return Error::BufferTooSmall;
+    }
+    // Linux `tun.c` fails a read that is already blocked when the device is
+    // deleted with `EFAULT` (the socket's `RCV_SHUTDOWN`, which only the
+    // device teardown sets on an attached file); every later read returns
+    // `EBADFD`. The read path's only other `EFAULT` sources are user-copy
+    // faults, which a safe `&mut [u8]` cannot cause: the packet-information
+    // header and the virtio-net header, neither of which this backend
+    // enables. Re-examine this rule if packet information or offload is
+    // ever enabled. Matched on the raw code only, never on `kind()`: `std`
+    // decodes the code with the running host's table. Not applied to
+    // `send` (an `EFAULT` there is only a copy fault; teardown is
+    // `EBADFD`) nor to macOS (a BPF `EFAULT` is a `copyout` fault).
+    if os == HostOs::Linux && err.raw_os_error() == Some(EFAULT) {
+        return Error::Disconnected;
+    }
+    lifecycle_error(os, &err).unwrap_or_else(|| io_error(err))
+}
+
+/// Maps a non-transient `send` error: Wintun's send-side end-of-life
+/// signal, then the device-lifecycle rules shared with `recv`, then
+/// [`io_error`].
+fn send_error(os: HostOs, err: io::Error) -> Error {
+    // `tun-rs` reports Wintun `ERROR_HANDLE_EOF` as `WriteZero` on send
+    // (and as `UnexpectedEof`, already `Disconnected`, on receive).
+    let wintun_send_eof = os == HostOs::Windows
+        && err.raw_os_error().is_none()
+        && err.kind() == io::ErrorKind::WriteZero;
+    if wintun_send_eof {
+        return Error::Disconnected;
+    }
+    lifecycle_error(os, &err).unwrap_or_else(|| io_error(err))
+}
+
+/// The device-lifecycle rules shared by `recv` and `send` (see the module
+/// table), or `None` for an error [`io_error`] maps.
+fn lifecycle_error(os: HostOs, err: &io::Error) -> Option<Error> {
+    let unix = matches!(os, HostOs::Linux | HostOs::Macos);
+    match err.raw_os_error() {
+        Some(ENXIO) if unix => Some(Error::Disconnected),
+        Some(EBADFD) if os == HostOs::Linux => Some(Error::Disconnected),
+        Some(_) => None,
+        None => (os == HostOs::Windows
+            && err.kind() == io::ErrorKind::Other
+            && err.to_string() == WINDOWS_TUN_DISABLED_MESSAGE)
+            .then_some(Error::InvalidState),
     }
 }
 
@@ -244,8 +322,215 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn eintr_matches_libc() {
+    fn eintr_and_enxio_match_libc() {
         assert_eq!(EINTR, libc::EINTR);
+        assert_eq!(ENXIO, libc::ENXIO);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ebadfd_matches_libc_on_linux() {
+        assert_eq!(EBADFD, libc::EBADFD);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn efault_matches_libc_on_linux() {
+        assert_eq!(EFAULT, libc::EFAULT);
+    }
+
+    /// A read blocked across the Linux device deletion fails with raw
+    /// `EFAULT`: `Disconnected` on Linux `recv` only. Everywhere else the
+    /// same raw code falls through to the generic mapping, which never
+    /// yields `Disconnected` for it on any host (code 14 decodes as
+    /// `Uncategorized` on unix and as `OutOfMemory` on Windows).
+    #[test]
+    fn raw_efault_is_disconnected_on_linux_recv_only() {
+        let efault = || io::Error::from_raw_os_error(EFAULT);
+        assert!(matches!(
+            recv_err(HostOs::Linux, efault()),
+            Err(Error::Disconnected)
+        ));
+        let send = send_result(HostOs::Linux, efault());
+        assert!(!matches!(send, Err(Error::Disconnected)), "{send:?}");
+        for os in [HostOs::Macos, HostOs::Windows, HostOs::Other] {
+            let recv = recv_err(os, efault());
+            assert!(!matches!(recv, Err(Error::Disconnected)), "{os:?} {recv:?}");
+        }
+        let send = send_result(HostOs::Macos, efault());
+        assert!(!matches!(send, Err(Error::Disconnected)), "{send:?}");
+    }
+
+    /// Pins the Wintun "disabled" message to `tun-rs` 2.8.11.
+    #[test]
+    fn pinned_tun_rs_2_8_11_lifecycle_messages() {
+        assert_eq!(
+            WINDOWS_TUN_DISABLED_MESSAGE,
+            "The interface has been disabled"
+        );
+        assert_eq!(
+            wintun_disabled().to_string(),
+            "The interface has been disabled"
+        );
+    }
+
+    fn wintun_disabled() -> io::Error {
+        io::Error::other(WINDOWS_TUN_DISABLED_MESSAGE)
+    }
+
+    fn send_result(os: HostOs, err: io::Error) -> Result<usize> {
+        match send_step(os, Err(err)) {
+            Step::Retry => panic!("{os:?}: a lifecycle error must not be retried"),
+            Step::Done(result) => result,
+        }
+    }
+
+    fn recv_err(os: HostOs, err: io::Error) -> Result<usize> {
+        recv_result(os, 64, Err(err)).expect("a lifecycle error must not be retried")
+    }
+
+    /// The device-lifecycle table, on every host: raw `ENXIO` on Linux and
+    /// macOS and raw `EBADFD` on Linux are `Disconnected` on both `recv`
+    /// and `send`; the same raw codes elsewhere (code 6 is Windows
+    /// `ERROR_INVALID_HANDLE`, code 77 is macOS `ENOLCK`) fall through to
+    /// the generic mapping.
+    #[test]
+    fn raw_enxio_and_ebadfd_are_disconnected_only_where_they_mean_it() {
+        let enxio = || io::Error::from_raw_os_error(ENXIO);
+        let ebadfd = || io::Error::from_raw_os_error(EBADFD);
+        for os in [HostOs::Linux, HostOs::Macos] {
+            assert!(matches!(recv_err(os, enxio()), Err(Error::Disconnected)));
+            assert!(matches!(send_result(os, enxio()), Err(Error::Disconnected)));
+        }
+        assert!(matches!(
+            recv_err(HostOs::Linux, ebadfd()),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            send_result(HostOs::Linux, ebadfd()),
+            Err(Error::Disconnected)
+        ));
+        for (os, err) in [
+            (HostOs::Windows, enxio()),
+            (HostOs::Other, enxio()),
+            (HostOs::Macos, ebadfd()),
+            (HostOs::Windows, ebadfd()),
+            (HostOs::Other, ebadfd()),
+        ] {
+            let mapped = lifecycle_error(os, &err);
+            assert!(mapped.is_none(), "{os:?} {err}: {mapped:?}");
+        }
+    }
+
+    /// Wintun's send-side `ERROR_HANDLE_EOF` (`WriteZero`) is
+    /// `Disconnected` on Windows `send` only: not on `recv`, not on other
+    /// hosts, and not when it carries an OS code.
+    #[test]
+    fn code_less_write_zero_is_disconnected_on_windows_send_only() {
+        let write_zero = || io::Error::from(io::ErrorKind::WriteZero);
+        assert!(matches!(
+            send_result(HostOs::Windows, write_zero()),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            recv_err(HostOs::Windows, write_zero()),
+            Err(Error::Platform(PlatformErrorCode::Unknown))
+        ));
+        for os in [HostOs::Linux, HostOs::Macos, HostOs::Other] {
+            assert!(
+                matches!(
+                    send_result(os, write_zero()),
+                    Err(Error::Platform(PlatformErrorCode::Unknown))
+                ),
+                "{os:?}"
+            );
+        }
+        // Wintun's receive-side `ERROR_HANDLE_EOF` is a bare
+        // `UnexpectedEof`, which is `Disconnected` on both directions.
+        let eof = || io::Error::from(io::ErrorKind::UnexpectedEof);
+        assert!(matches!(
+            recv_err(HostOs::Windows, eof()),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            send_result(HostOs::Windows, eof()),
+            Err(Error::Disconnected)
+        ));
+    }
+
+    /// The Wintun "disabled" error is `InvalidState` (recoverable, not
+    /// `Disconnected`) on both directions, on Windows only, and only for
+    /// the exact code-less message.
+    #[test]
+    fn wintun_disabled_is_invalid_state_on_windows_only() {
+        assert!(matches!(
+            recv_err(HostOs::Windows, wintun_disabled()),
+            Err(Error::InvalidState)
+        ));
+        assert!(matches!(
+            send_result(HostOs::Windows, wintun_disabled()),
+            Err(Error::InvalidState)
+        ));
+        for os in [HostOs::Linux, HostOs::Macos, HostOs::Other] {
+            assert!(
+                matches!(
+                    recv_err(os, wintun_disabled()),
+                    Err(Error::Platform(PlatformErrorCode::Unknown))
+                ),
+                "{os:?}"
+            );
+        }
+        for near_miss in [
+            io::Error::other("The interface has been disabled."),
+            io::Error::other("the interface has been disabled"),
+            io::Error::new(io::ErrorKind::TimedOut, WINDOWS_TUN_DISABLED_MESSAGE),
+        ] {
+            assert!(
+                matches!(
+                    recv_err(HostOs::Windows, near_miss),
+                    Err(Error::Platform(PlatformErrorCode::Unknown))
+                ),
+                "only the exact code-less `Other` message is remapped"
+            );
+        }
+    }
+
+    /// The lifecycle errors are final: the blocking and async loops report
+    /// them after one native call instead of retrying.
+    #[test]
+    fn lifecycle_errors_end_the_loops_after_one_call() {
+        let script = Script::new(
+            vec![Err(io::Error::from_raw_os_error(EBADFD)), Ok(3)],
+            b"abc",
+        );
+        let mut buf = [0u8; 8];
+        let result = recv_blocking(HostOs::Linux, &mut buf, |buf| script.read(buf));
+        assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
+        assert_eq!(script.calls(), 1);
+
+        let source = AsyncScript(std::sync::Mutex::new(Script::new(
+            vec![Err(wintun_disabled()), Ok(3)],
+            b"abc",
+        )));
+        let result = ready(recv_async(HostOs::Windows, &source, &mut buf));
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert_eq!(source.0.lock().unwrap().calls(), 1);
+
+        let script = Script::new(
+            vec![Err(io::Error::from(io::ErrorKind::WriteZero)), Ok(5)],
+            b"",
+        );
+        let result = send_blocking(HostOs::Windows, || script.read(&mut []));
+        assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
+        assert_eq!(script.calls(), 1);
+
+        let script = Script::new(vec![Err(io::Error::from_raw_os_error(ENXIO)), Ok(5)], b"");
+        let result = ready(send_async(HostOs::Macos, || {
+            let result = script.read(&mut []);
+            async move { result }
+        }));
+        assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
+        assert_eq!(script.calls(), 1);
     }
 
     #[test]

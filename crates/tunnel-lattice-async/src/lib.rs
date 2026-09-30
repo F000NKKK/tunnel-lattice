@@ -48,10 +48,31 @@ use tunnel_lattice_platform::{AsyncPacketIo, PacketIo};
 /// (thread-bridge, best-effort shutdown only) — see each function's docs
 /// for which to prefer.
 ///
-/// Both variants behave the same way on errors: a packet larger than the
-/// receive buffer yields `Err(Error::BufferTooSmall)` (the packet is
-/// discarded, never truncated) and the stream keeps receiving;
-/// `Err(Error::Disconnected)` is yielded once and then the stream ends.
+/// # End of life
+///
+/// Both variants behave the same way on errors:
+///
+/// - A packet larger than the receive buffer yields
+///   `Err(Error::BufferTooSmall)` (the packet is discarded, never
+///   truncated) and the stream keeps receiving. This is the only
+///   non-terminal error.
+/// - Every other error is yielded once, and then the stream ends
+///   (`poll_next` returns `Poll::Ready(None)`, and keeps returning it if
+///   polled again). This includes
+///   `Err(Error::Disconnected)` (the device is gone for good) and errors a
+///   caller can recover from, such as `Err(Error::InvalidState)` for an
+///   administratively disabled interface. After recovering, create a new
+///   stream (for a facade handle, `Handle::packet_stream` again).
+///
+/// Ending on the first such error keeps a device whose `recv` fails
+/// immediately and repeatedly (for example after the interface was deleted
+/// or disabled) from turning the stream into a busy loop of error items,
+/// and keeps the [`from_device`] worker from filling its channel with them:
+/// that worker exits right after forwarding the error.
+///
+/// Transient native conditions (a signal interrupting the call, for
+/// example) are retried inside a conforming backend's `recv` and never
+/// reach the stream.
 pub struct PacketStream {
     inner: Inner,
 }
@@ -80,8 +101,8 @@ enum Inner {
 /// larger than `buf_len` is never truncated: it is discarded and the stream
 /// yields `Err(Error::BufferTooSmall)`, then keeps receiving. A
 /// non-conforming device that reports more bytes than `buf_len` is treated
-/// the same way. The stream ends after yielding `Err(Error::Disconnected)`;
-/// every other error is yielded and the stream continues.
+/// the same way. Every other error is yielded once and then the stream
+/// ends; see [`PacketStream`], "End of life".
 ///
 /// Dropping the returned stream drops whatever `AsyncPacketIo::recv` future
 /// is currently in flight, the same way dropping any other future cancels
@@ -110,12 +131,15 @@ where
                 buf.truncate(len);
                 Some((Ok(buf), State::Live(device)))
             }
-            Err(Error::Disconnected) => Some((Err(Error::Disconnected), State::Done)),
-            Err(err) => Some((Err(err), State::Live(device))),
+            Err(Error::BufferTooSmall) => Some((Err(Error::BufferTooSmall), State::Live(device))),
+            // Terminal: yield the error, then end (dropping the device).
+            Err(err) => Some((Err(err), State::Done)),
         }
     });
     PacketStream {
-        inner: Inner::Native(Box::pin(stream)),
+        // Fused so polling after the end keeps returning `None` (as the
+        // thread bridge's closed channel does) instead of panicking.
+        inner: Inner::Native(Box::pin(futures::StreamExt::fuse(stream))),
     }
 }
 
@@ -126,7 +150,10 @@ where
 /// and the same too-small-buffer and end-of-stream behavior as
 /// [`from_async_device`]'s: use `handle.snapshot()?.recv_buffer_len()`; an
 /// oversize packet yields `Err(Error::BufferTooSmall)` and the stream keeps
-/// receiving; only `Err(Error::Disconnected)` ends it.
+/// receiving; every other error is yielded once and then the stream ends
+/// (see [`PacketStream`], "End of life"). The worker thread stops calling
+/// `recv` and exits as soon as it has forwarded that error, so a device
+/// that keeps failing never fills the channel.
 ///
 /// **Shutdown limitation**: dropping the returned stream signals the worker
 /// thread to stop but does **not** join it: [`PacketIo::recv`] has no
@@ -175,14 +202,16 @@ fn forward_device<D>(
                     break;
                 }
             }
-            Err(Error::Disconnected) => {
-                let _ = sender.unbounded_send(Err(Error::Disconnected));
-                break;
-            }
-            Err(err) => {
-                if sender.unbounded_send(Err(err)).is_err() {
+            Err(Error::BufferTooSmall) => {
+                if sender.unbounded_send(Err(Error::BufferTooSmall)).is_err() {
                     break;
                 }
+            }
+            // Terminal: forward the error, then exit so the stream ends
+            // (the receiver sees the channel close once `sender` drops).
+            Err(err) => {
+                let _ = sender.unbounded_send(Err(err));
+                break;
             }
         }
     }
@@ -319,6 +348,11 @@ mod tests {
         Overlong,
         /// End of life.
         Disconnected,
+        /// A recoverable device state (e.g. an administratively disabled
+        /// interface).
+        InvalidState,
+        /// An unclassified native failure.
+        Platform,
     }
 
     /// A mock device implementing both `PacketIo` and `AsyncPacketIo`,
@@ -340,7 +374,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("the stream received past Disconnected");
+                .expect("the stream received past the end of the script");
             match step {
                 Step::Packet(bytes) => {
                     buf[..bytes.len()].copy_from_slice(bytes);
@@ -349,7 +383,15 @@ mod tests {
                 Step::TooSmall => Err(Error::BufferTooSmall),
                 Step::Overlong => Ok(buf.len() + 1),
                 Step::Disconnected => Err(Error::Disconnected),
+                Step::InvalidState => Err(Error::InvalidState),
+                Step::Platform => Err(Error::Platform(
+                    tunnel_lattice_core::PlatformErrorCode::Unknown,
+                )),
             }
+        }
+
+        fn remaining(&self) -> usize {
+            self.steps.lock().unwrap().len()
         }
     }
 
@@ -430,6 +472,129 @@ mod tests {
             assert!(matches!(items[0], Err(Error::BufferTooSmall)));
             assert!(matches!(items[1], Err(Error::Disconnected)));
         }
+    }
+
+    /// Every error except `BufferTooSmall` ends both stream variants right
+    /// after it is yielded: the packet scripted after it is never
+    /// received.
+    #[test]
+    fn every_other_error_is_yielded_once_then_ends_both_streams() {
+        for terminal in [Step::Disconnected, Step::InvalidState, Step::Platform] {
+            let script = [
+                Step::TooSmall,
+                Step::Packet(b"abc"),
+                terminal,
+                Step::Packet(b"never"),
+            ];
+            let native = Scripted::new(&script);
+            let bridged = Scripted::new(&script);
+            for (device, stream) in [
+                (&native, from_async_device(Arc::clone(&native), 8)),
+                (&bridged, from_device(Arc::clone(&bridged), 8)),
+            ] {
+                let items = collect(stream);
+                assert_eq!(items.len(), 3, "BufferTooSmall, the packet, the error");
+                assert!(matches!(items[0], Err(Error::BufferTooSmall)));
+                assert_eq!(items[1].as_deref().unwrap(), b"abc");
+                match (terminal, &items[2]) {
+                    (Step::Disconnected, Err(Error::Disconnected))
+                    | (Step::InvalidState, Err(Error::InvalidState))
+                    | (Step::Platform, Err(Error::Platform(_))) => {}
+                    (_, other) => panic!("unexpected terminal item {other:?}"),
+                }
+                assert_eq!(device.remaining(), 1, "recv was called after the error");
+            }
+        }
+    }
+
+    /// A device whose `recv` fails immediately on every call, as a deleted
+    /// or disabled interface does, counting the calls.
+    struct AlwaysFails {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AlwaysFails {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn fail(&self) -> Result<usize> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Err(Error::InvalidState)
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl PacketIo for AlwaysFails {
+        fn recv(&self, _buf: &mut [u8]) -> Result<usize> {
+            self.fail()
+        }
+
+        fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    impl AsyncPacketIo for AlwaysFails {
+        fn recv(&self, _buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send {
+            let result = self.fail();
+            async move { result }
+        }
+
+        async fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    /// The native stream yields the repeating error once, ends, and releases
+    /// the device; it never polls `recv` again.
+    #[test]
+    fn from_async_device_ends_on_a_repeating_error_without_polling_again() {
+        let device = AlwaysFails::new();
+        let mut stream = from_async_device(Arc::clone(&device), 8);
+        let first = stream
+            .next()
+            .now_or_never()
+            .expect("ready")
+            .expect("an item");
+        assert!(matches!(first, Err(Error::InvalidState)));
+        assert!(stream.next().now_or_never().expect("ready").is_none());
+        assert!(stream.next().now_or_never().expect("ready").is_none());
+        assert_eq!(device.calls(), 1);
+        assert_eq!(
+            Arc::strong_count(&device),
+            1,
+            "the ended stream holds no device"
+        );
+    }
+
+    /// The thread-bridge worker forwards the repeating error once and exits:
+    /// the channel closes after exactly one item, `recv` was called once,
+    /// and the worker releases its device handle.
+    #[test]
+    fn from_device_worker_exits_on_a_repeating_error_and_the_channel_does_not_grow() {
+        let device = AlwaysFails::new();
+        let items = collect(from_device(Arc::clone(&device), 8));
+        assert_eq!(items.len(), 1, "one error item, then the channel closed");
+        assert!(matches!(items[0], Err(Error::InvalidState)));
+        assert_eq!(device.calls(), 1);
+
+        // The channel closing proves the worker dropped its sender; wait
+        // (bounded) for it to finish returning and drop its device clone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&device) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker thread did not exit"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(device.calls(), 1, "the worker called recv after the error");
     }
 
     #[test]

@@ -34,8 +34,20 @@ Both variants handle errors the same way:
   device that reports more bytes than `buf_len` (which a conforming backend
   never does) is treated the same way instead of being sliced out of
   bounds.
-- `Err(Error::Disconnected)` is yielded once, and then the stream ends.
-- Any other error is yielded and the stream keeps receiving.
+- Every other error is yielded once, and then the stream ends (polling it
+  again keeps returning `None`). That includes `Err(Error::Disconnected)`
+  (the device is gone for good) and errors the device can recover from,
+  such as `Err(Error::InvalidState)` for an administratively disabled
+  interface. After recovering, create a new stream (with the facade, call
+  `Handle::packet_stream` again).
+
+Ending on the first such error keeps a device whose `recv` fails
+immediately and repeatedly (for example after the interface was deleted or
+disabled) from turning the stream into a busy loop of error items. The
+`from_device` worker thread stops calling `recv` and exits as soon as it
+has forwarded the error, so it never keeps filling its channel. Transient
+native conditions, such as a signal interrupting the read, are retried
+inside a conforming backend's `recv` and never reach the stream.
 
 ## When to use which
 

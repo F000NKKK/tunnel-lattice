@@ -105,6 +105,45 @@ Every other `UnexpectedEof` still maps to `Error::Disconnected`, including
 `tun-rs`'s `"close"` error on a closed macOS device and Windows'
 `ERROR_HANDLE_EOF` when the adapter goes away.
 
+### When the device goes away
+
+`recv` and `send` also map the errors that mean the device was deleted or
+disabled underneath the handle, before the general table above:
+
+| OS                   | Native error                                                                  | `Error`         |
+|----------------------|-------------------------------------------------------------------------------|-----------------|
+| macOS                | `ENXIO`: the TAP's BPF descriptor after its `feth` interface was destroyed    | `Disconnected`  |
+| Linux                | `EBADFD`: the device was deleted and its queue detached                       | `Disconnected`  |
+| Linux (`recv`)       | `EFAULT`: a blocking read already waiting when the device was deleted         | `Disconnected`  |
+| Linux                | `ENXIO` (mapped for symmetry with macOS; the Linux tun driver does not return it on read or write) | `Disconnected` |
+| Windows TUN (`send`) | Wintun reports the adapter terminating, which `tun-rs` returns as `io::ErrorKind::WriteZero` without an OS code | `Disconnected` |
+| Windows TUN          | `"The interface has been disabled"` (no OS code; exact message pinned against `tun-rs` 2.8.11), after the adapter was disabled, for example by applying `DesiredAdminState::Down` | `InvalidState` |
+
+The disabled Wintun adapter is not `Disconnected`: applying
+`DesiredAdminState::Up` starts a new session and the same handle works
+again. The rules match raw OS codes only on the platform they belong to
+(code 6 is `ENXIO` on Linux and macOS but a different error on Windows;
+macOS has no `EBADFD`), and `WriteZero` and `EFAULT` are remapped on one
+direction only (`send` and `recv` respectively).
+
+On Linux, a blocking `recv` that is already waiting when the device is
+deleted is woken by the kernel with `EFAULT` rather than `EBADFD`; later
+calls get `EBADFD`. Both are `Disconnected`, so deleting a Linux device
+ends `recv` with `Disconnected` in every feature set. With the `tokio`
+feature on Linux, `recv` waits through a private duplicate of the device
+descriptor registered with Tokio for readable and error readiness: a
+deleted device reports error readiness only, which the readable-only wait
+`tun-rs` uses would never see. The duplicate costs one extra file
+descriptor per handle (per queue) and closes with the handle.
+
+`tunnel-lattice-async`'s `PacketStream` (and the facade's
+`Handle::packet_stream`) ends after any error except `BufferTooSmall`,
+so a stream over a deleted or disabled device yields one error and ends;
+create a new stream after recovering. The crate's privileged tests delete
+the device while a stream or a blocking `recv` is waiting (Linux `ip link
+del`, macOS `ifconfig <peer feth> destroy`, Windows adapter disable) and
+check that it ends.
+
 ## Opening a device
 
 ### Name and MTU prechecks
