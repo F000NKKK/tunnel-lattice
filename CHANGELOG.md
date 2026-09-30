@@ -200,6 +200,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Re-attaching to a Linux persistent or multi-queue device and adopting an
   existing Wintun adapter on Windows still work, and are now documented on
   `DeviceConfig::name`/`multi_queue`; neither deletes the device on drop.
+- **Raised every external dependency requirement to its latest release**,
+  matching the versions used by `net-lattice` and `dns-lattice` where they
+  share a dependency: `tokio` 1.53.1 (from `1` in the workspace and `1.49`
+  in `tunnel-lattice-backend-tunrs`), `futures` 0.3.34, `bitflags` 2.13.2,
+  `libc` 0.2.189, `blocking` 1.7.0, `libloading` 0.9.0, and the dev-only
+  `criterion` 0.8.2. `tun-rs` 2.8.11 is already the latest. No public API
+  change; the MSRV stays 1.93.
 
 ## [0.4.0]
 

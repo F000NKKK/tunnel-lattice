@@ -41,16 +41,16 @@ tunnel-lattice-model = { workspace = true }
 tunnel-lattice-platform = { workspace = true }
 tun-rs = { workspace = true }
 futures = { workspace = true, optional = true }
-# 1.49 is tun-rs 2.8.11's own tokio floor. The Linux error-aware receive
-# path also needs `Interest::ERROR` (1.32) and `task::coop::consume_budget`
-# (1.44), both below it.
-tokio = { version = "1.49", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
+# The latest tokio release, matching the workspace's own requirement (tun-rs
+# 2.8.11 needs 1.49; the Linux error-aware receive path needs
+# `Interest::ERROR` (1.32) and `task::coop::consume_budget` (1.44)).
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
 
 # `if_nametoindex`, used by `open` to tell an existing-name conflict apart
 # from other `EINVAL`/`EBUSY` failures. Already locked via tun-rs; adds no
 # package to Cargo.lock.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 # The macOS TAP receive path in async builds runs its bounded BPF wait on
 # the `blocking` thread pool (see `src/macos_tap.rs`), the pool tun-rs itself
@@ -58,7 +58,7 @@ libc = "0.2"
 # its async backends (locked at 1.7.0), so this adds no package to
 # Cargo.lock. Enabled by the internal `async` feature.
 [target.'cfg(target_os = "macos")'.dependencies]
-blocking = { version = "1.7", optional = true }
+blocking = { version = "1.7.0", optional = true }
 
 # `open` recognizes a failed wintun.dll load by downcasting the
 # `libloading::Error` that tun-rs wraps with `io::Error::other`. This MUST
@@ -67,7 +67,7 @@ blocking = { version = "1.7", optional = true }
 # stop matching. CI enforces a single version with
 # `cargo tree --target x86_64-pc-windows-msvc -i libloading`.
 [target.'cfg(target_os = "windows")'.dependencies]
-libloading = "0.9"
+libloading = "0.9.0"
 
 # Test-only: the privileged teardown tests drive a real device through
 # `tunnel-lattice-async`'s `PacketStream` (the native adapter in async
