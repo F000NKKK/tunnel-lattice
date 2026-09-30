@@ -19,6 +19,7 @@
 #![warn(missing_docs)]
 
 mod open_contract;
+mod recv_contract;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
@@ -112,6 +113,29 @@ impl TunRsBackend {
 /// `SyncDevice`/`AsyncDevice` both deref to the same `tun_rs::DeviceImpl`,
 /// so device metadata (name/mtu/if_index/enabled) reads identically either
 /// way.
+///
+/// # Receiving packets
+///
+/// `recv` (sync [`PacketIo`] and, with an async feature, `AsyncPacketIo`)
+/// never truncates a packet and never reports more bytes than the buffer
+/// holds. A packet that does not fit is discarded and `recv` returns
+/// [`Error::BufferTooSmall`]; the next `recv` receives the following packet.
+/// Size buffers with [`Device::recv_buffer_len`]. Per platform:
+///
+/// | OS / kind | Native behavior for an oversize packet | How it becomes [`Error::BufferTooSmall`] |
+/// |---|---|---|
+/// | Linux TUN/TAP, macOS TUN (`utun`) | silently truncated | the read uses a one-byte sentinel buffer after `buf`; a length past `buf.len()` means the packet did not fit |
+/// | macOS TAP (`feth`) | rejected with `InvalidData` | mapped |
+/// | Windows TUN (Wintun) / TAP (tap-windows6) | rejected with `InvalidInput` | mapped |
+///
+/// `recv` and `send` also retry two transient conditions internally
+/// instead of reporting them: a signal interrupting the call (`EINTR`, on
+/// Linux and macOS), and, on macOS TAP, a read that produced no complete
+/// frame (`tun-rs` reports it as an end-of-file with the message
+/// `"recv buffer is empty"`, which this crate matches exactly for
+/// `tun-rs` 2.8.11). Each retry re-enters the blocking read or readiness
+/// wait, so it never spins. Every other end-of-file, such as the device
+/// being closed or a Wintun session ending, is [`Error::Disconnected`].
 pub struct TunRsDevice {
     kind: DeviceKind,
     #[cfg(feature = "async")]
@@ -146,6 +170,11 @@ pub struct TunRsDevice {
 /// code. On a target other than Linux, Windows, and macOS, where
 /// [`PlatformErrorCode`] has no matching tag, every unmapped error is
 /// [`PlatformErrorCode::Unknown`].
+///
+/// `recv`/`send` apply their own rules first (retrying transient errors
+/// and reporting a too-small buffer as [`Error::BufferTooSmall`]; see
+/// [`TunRsDevice`], "Receiving packets"), so a retried `EINTR` or macOS
+/// `"recv buffer is empty"` end-of-file never reaches this table.
 fn io_error(err: std::io::Error) -> Error {
     use std::io::ErrorKind;
 
@@ -284,6 +313,9 @@ impl TunRsDevice {
     /// `AsyncDevice` has no such requirement, since it's built on the
     /// runtime-agnostic `async-io`/`blocking` crates instead.
     ///
+    /// Applies the `recv` error contract (internal retries and the
+    /// too-small-buffer normalization, see `recv_contract`) in every build.
+    ///
     /// **Also requires the caller's Tokio runtime to be multi-threaded.**
     /// `Handle::block_on` only drives a runtime's I/O reactor on the
     /// `multi_thread` flavor, whose worker threads poll it independently of
@@ -294,56 +326,107 @@ impl TunRsDevice {
     /// confirmed by an isolated repro against `tun-rs` directly, independent
     /// of this crate. See this crate's `privileged_tests` module (test-only,
     /// not part of the public API) and `ARCHITECTURE.md`, "Async design."
-    fn blocking_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn blocking_recv(&self, buf: &mut [u8]) -> Result<usize> {
         #[cfg(feature = "tokio")]
         {
-            tokio::runtime::Handle::current().block_on(self.handle.recv(buf))
+            tokio::runtime::Handle::current().block_on(self.async_recv(buf))
         }
         #[cfg(all(feature = "async", not(feature = "tokio")))]
         {
-            futures::executor::block_on(self.handle.recv(buf))
+            futures::executor::block_on(self.async_recv(buf))
         }
         #[cfg(not(feature = "async"))]
         {
-            self.handle.recv(buf)
+            recv_contract::recv_blocking(open_contract::HOST_OS, buf, |buf| {
+                sentinel_recv(&self.handle, buf)
+            })
         }
     }
 
     /// Blocking send; see [`Self::blocking_recv`].
-    fn blocking_send(&self, buf: &[u8]) -> std::io::Result<usize> {
+    fn blocking_send(&self, buf: &[u8]) -> Result<usize> {
         #[cfg(feature = "tokio")]
         {
-            tokio::runtime::Handle::current().block_on(self.handle.send(buf))
+            tokio::runtime::Handle::current().block_on(self.async_send(buf))
         }
         #[cfg(all(feature = "async", not(feature = "tokio")))]
         {
-            futures::executor::block_on(self.handle.send(buf))
+            futures::executor::block_on(self.async_send(buf))
         }
         #[cfg(not(feature = "async"))]
         {
-            self.handle.send(buf)
+            recv_contract::send_blocking(open_contract::HOST_OS, || self.handle.send(buf))
+        }
+    }
+
+    /// Async receive with the `recv` error contract applied.
+    #[cfg(feature = "async")]
+    async fn async_recv(&self, buf: &mut [u8]) -> Result<usize> {
+        recv_contract::recv_async(open_contract::HOST_OS, &self.handle, buf).await
+    }
+
+    /// Async send, retrying transient errors.
+    #[cfg(feature = "async")]
+    async fn async_send(&self, buf: &[u8]) -> Result<usize> {
+        recv_contract::send_async(open_contract::HOST_OS, || self.handle.send(buf)).await
+    }
+}
+
+/// One blocking native read. On unix it reads into `[buf, 1-byte
+/// sentinel]` so an oversize packet, which Linux TUN/TAP and macOS utun
+/// would otherwise truncate silently, reports a length past `buf.len()`.
+#[cfg(not(feature = "async"))]
+fn sentinel_recv(handle: &tun_rs::SyncDevice, buf: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::io::IoSliceMut;
+        let mut sentinel = [0u8; 1];
+        handle.recv_vectored(&mut [IoSliceMut::new(buf), IoSliceMut::new(&mut sentinel)])
+    }
+    #[cfg(not(unix))]
+    {
+        handle.recv(buf)
+    }
+}
+
+/// The async counterpart of `sentinel_recv`, re-awaited by
+/// `recv_contract::recv_async` after a transient error.
+#[cfg(feature = "async")]
+impl recv_contract::AsyncRecvSource for tun_rs::AsyncDevice {
+    async fn recv_native(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::io::IoSliceMut;
+            let mut sentinel = [0u8; 1];
+            self.recv_vectored(&mut [IoSliceMut::new(buf), IoSliceMut::new(&mut sentinel)])
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            self.recv(buf).await
         }
     }
 }
 
+/// See [`TunRsDevice`], "Receiving packets", for the `recv` contract.
 impl PacketIo for TunRsDevice {
     fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        self.blocking_recv(buf).map_err(io_error)
+        self.blocking_recv(buf)
     }
 
     fn send(&self, buf: &[u8]) -> Result<usize> {
-        self.blocking_send(buf).map_err(io_error)
+        self.blocking_send(buf)
     }
 }
 
 #[cfg(feature = "async")]
 impl AsyncPacketIo for TunRsDevice {
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        self.handle.recv(buf).await.map_err(io_error)
+        self.async_recv(buf).await
     }
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
-        self.handle.send(buf).await.map_err(io_error)
+        self.async_send(buf).await
     }
 }
 
@@ -951,6 +1034,186 @@ mod privileged_tests {
         device
             .snapshot()
             .expect("original queue still usable after the clone was dropped");
+    }
+
+    /// Runs a host network-configuration command, panicking with its
+    /// output if it fails. Used only on the test's own device.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn run_host_command(program: &str, args: &[&str]) {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("run {program}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Gives the test's own device `subnet.1` and returns where to send UDP
+    /// so the host routes it into the device: the peer `subnet.2` for TUN
+    /// (no link-layer resolution), the subnet broadcast for Linux TAP (no
+    /// ARP needed). The address lives on the device and goes away with it.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn route_traffic_into(kind: DeviceKind, name: &str, subnet: [u8; 3]) -> std::net::SocketAddr {
+        let [a, b, c] = subnet;
+        let local = format!("{a}.{b}.{c}.1");
+        let peer = format!("{a}.{b}.{c}.2");
+        #[cfg(target_os = "linux")]
+        {
+            run_host_command("ip", &["addr", "add", &format!("{local}/24"), "dev", name]);
+            run_host_command("ip", &["link", "set", "dev", name, "up"]);
+        }
+        #[cfg(target_os = "macos")]
+        run_host_command("ifconfig", &[name, "inet", &local, &peer, "up"]);
+        #[cfg(target_os = "windows")]
+        run_host_command(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                &format!("name={name}"),
+                "static",
+                &local,
+                "255.255.255.0",
+            ],
+        );
+        let target = match kind {
+            DeviceKind::Tap => format!("{a}.{b}.{c}.255:9"),
+            _ => format!("{peer}:9"),
+        };
+        target.parse().expect("a valid socket address")
+    }
+
+    /// A packet larger than the `recv` buffer is reported as
+    /// `BufferTooSmall` (never truncated), and the next `recv` with a
+    /// buffer of `recv_buffer_len()` bytes succeeds.
+    ///
+    /// A sender thread keeps sending 512-byte UDP datagrams (540-byte IPv4
+    /// packets) into the device. The receiver first reads with a 64-byte
+    /// buffer until it sees `BufferTooSmall` (small unsolicited packets,
+    /// such as IPv6 neighbor discovery, may fit and are skipped), then
+    /// reads once with a full-size buffer. The receiver runs on its own
+    /// thread so a missing packet fails the test after 60 s instead of
+    /// hanging it. Nothing outside the test's own device is changed: the
+    /// address is assigned to that device and removed with it.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn assert_oversize_packet_is_rejected_then_next_recv_succeeds(
+        kind: DeviceKind,
+        subnet: [u8; 3],
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        const SMALL: usize = 64;
+
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(kind).with_mtu(1400))
+                .expect("open a device"),
+        );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let buf_len = snapshot.recv_buffer_len();
+        let target = route_traffic_into(kind, &snapshot.name, subnet);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind a UDP socket");
+                socket.set_broadcast(true).expect("enable broadcast");
+                let payload = [0xa5u8; 512];
+                while !stop.load(Ordering::Acquire) {
+                    // Errors are expected until the address is usable
+                    // (e.g. Windows duplicate-address detection).
+                    let _ = socket.send_to(&payload, target);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        {
+            let device = Arc::clone(&device);
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                #[cfg(feature = "tokio")]
+                let _entered = runtime.enter();
+                let mut small = [0u8; SMALL];
+                let mut rejected = false;
+                let mut result = Ok(());
+                for _ in 0..10_000 {
+                    match PacketIo::recv(&*device, &mut small) {
+                        Err(Error::BufferTooSmall) => {
+                            rejected = true;
+                            break;
+                        }
+                        Ok(n) if n <= SMALL => {}
+                        other => {
+                            result = Err(format!("small-buffer recv: {other:?}"));
+                            break;
+                        }
+                    }
+                }
+                if result.is_ok() && !rejected {
+                    result = Err("no oversize packet was reported".to_owned());
+                }
+                if result.is_ok() {
+                    let mut full = vec![0u8; buf_len];
+                    result = match PacketIo::recv(&*device, &mut full) {
+                        Ok(n) if n <= buf_len => Ok(()),
+                        other => Err(format!("full-size recv after BufferTooSmall: {other:?}")),
+                    };
+                }
+                let _ = done.send(result);
+            });
+        }
+
+        let outcome = outcome.recv_timeout(Duration::from_secs(60));
+        stop.store(true, Ordering::Release);
+        sender.join().expect("the sender thread does not panic");
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => panic!("{kind:?}: {message}"),
+            Err(_) => panic!("{kind:?}: no packet arrived within 60 s"),
+        }
+    }
+
+    /// A per-process subnet octet, so parallel runs on one host differ.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn subnet_octet() -> u8 {
+        u8::try_from(std::process::id() % 200).expect("below 200") + 20
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open and address a TUN device"]
+    fn tun_oversize_packet_reports_buffer_too_small_and_the_next_recv_succeeds() {
+        assert_oversize_packet_is_rejected_then_next_recv_succeeds(
+            DeviceKind::Tun,
+            [10, 201, subnet_octet()],
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open and address a TAP device"]
+    fn tap_oversize_frame_reports_buffer_too_small_and_the_next_recv_succeeds_on_linux() {
+        assert_oversize_packet_is_rejected_then_next_recv_succeeds(
+            DeviceKind::Tap,
+            [10, 202, subnet_octet()],
+        );
     }
 
     /// A name unique to this test process and `tag`, within `IFNAMSIZ`.

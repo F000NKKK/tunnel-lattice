@@ -10,7 +10,9 @@
 //! fn main() -> Result<()> {
 //!     let tunnel = Tunnel::connect();
 //!     let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1500))?;
-//!     let mut buf = vec![0u8; 1500];
+//!     // Fits one packet at the current MTU; a larger packet is reported as
+//!     // `Error::BufferTooSmall`, never truncated.
+//!     let mut buf = vec![0u8; device.snapshot()?.recv_buffer_len()];
 //!     let len = device.recv(&mut buf)?;
 //!     println!("{} bytes", len);
 //!     Ok(())
@@ -235,7 +237,27 @@ where
 {
     /// Returns a `futures::Stream` of received packets.
     ///
-    /// `mtu` bounds the per-packet receive buffer. Uses
+    /// `buf_len` is the per-packet receive buffer size; use
+    /// `self.snapshot()?.recv_buffer_len()` ([`Device::recv_buffer_len`]),
+    /// which fits one packet at the device's current MTU, Ethernet framing
+    /// included for TAP. A packet larger than `buf_len` is never truncated:
+    /// it is discarded, the stream yields `Err(Error::BufferTooSmall)`, and
+    /// it keeps receiving. The stream ends after yielding
+    /// `Err(Error::Disconnected)`.
+    ///
+    /// ```no_run
+    /// # #[cfg(any(feature = "async-io", feature = "tokio"))]
+    /// # fn example() -> tunnel_lattice::Result<()> {
+    /// use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+    ///
+    /// let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tap))?;
+    /// let stream = device.packet_stream(device.snapshot()?.recv_buffer_len());
+    /// # let _ = stream;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Uses
     /// `tunnel-lattice-async::from_async_device` (no worker thread; dropping
     /// the stream drops the in-flight `recv` future, which is genuine,
     /// immediate cancellation) when the device reports
@@ -248,15 +270,15 @@ where
     /// makes a backend build its async-capable handle in the first place),
     /// so the fallback path exists for a hypothetical future backend with
     /// no native async support, not for anything shipped today.
-    pub fn packet_stream(&self, mtu: usize) -> tunnel_lattice_async::PacketStream {
+    pub fn packet_stream(&self, buf_len: usize) -> tunnel_lattice_async::PacketStream {
         if self
             .device
             .capabilities()
             .contains(Capability::NATIVE_ASYNC)
         {
-            tunnel_lattice_async::from_async_device(std::sync::Arc::clone(&self.device), mtu)
+            tunnel_lattice_async::from_async_device(std::sync::Arc::clone(&self.device), buf_len)
         } else {
-            tunnel_lattice_async::from_device(std::sync::Arc::clone(&self.device), mtu)
+            tunnel_lattice_async::from_device(std::sync::Arc::clone(&self.device), buf_len)
         }
     }
 }
@@ -300,7 +322,9 @@ mod privileged_tests {
              itself gets compiled in"
         );
 
-        let mut stream = device.packet_stream(1400);
+        let buf_len = device.snapshot().expect("snapshot").recv_buffer_len();
+        assert_eq!(buf_len, 1400, "a TUN buffer is exactly the MTU");
+        let mut stream = device.packet_stream(buf_len);
         // A freshly created Linux TUN device is not actually silent: the
         // kernel sends IPv6 neighbor-discovery traffic (router
         // solicitation) onto it almost immediately, confirmed by an

@@ -38,6 +38,14 @@ pub enum Error {
     /// missing): installing or loading the driver makes the same `open`
     /// call succeed.
     DriverUnavailable,
+    /// The buffer passed to `recv` was smaller than the next packet; that
+    /// packet was discarded.
+    ///
+    /// `recv` never truncates a packet silently and never reports more
+    /// bytes than the buffer holds. The device stays usable: the next
+    /// `recv` with a large enough buffer receives the following packet.
+    /// Size buffers with `tunnel_lattice_model::Device::recv_buffer_len`.
+    BufferTooSmall,
     /// Escape hatch preserving the raw backend-specific error for
     /// diagnostics. Not the primary way consumers are expected to match on
     /// failures.
@@ -122,6 +130,11 @@ impl Error {
         matches!(self, Error::DriverUnavailable)
     }
 
+    /// Returns `true` if this is [`Error::BufferTooSmall`].
+    pub const fn is_buffer_too_small(&self) -> bool {
+        matches!(self, Error::BufferTooSmall)
+    }
+
     /// Returns `true` if this is [`Error::Platform`].
     pub const fn is_platform(&self) -> bool {
         matches!(self, Error::Platform(_))
@@ -138,6 +151,7 @@ impl fmt::Display for Error {
             Error::InvalidState => write!(f, "invalid state"),
             Error::Disconnected => write!(f, "device channel disconnected"),
             Error::DriverUnavailable => write!(f, "required driver or runtime is unavailable"),
+            Error::BufferTooSmall => write!(f, "receive buffer too small for the packet"),
             Error::Platform(code) => write!(f, "platform error: {code:?}"),
         }
     }
@@ -161,6 +175,10 @@ mod tests {
             (
                 Error::DriverUnavailable,
                 "required driver or runtime is unavailable",
+            ),
+            (
+                Error::BufferTooSmall,
+                "receive buffer too small for the packet",
             ),
         ];
         for (error, expected) in cases {
@@ -217,6 +235,11 @@ mod tests {
         assert!(!Error::Unsupported.is_driver_unavailable());
         assert!(!Error::NotFound.is_driver_unavailable());
         assert!(!Error::Platform(PlatformErrorCode::Unknown).is_driver_unavailable());
+
+        assert!(Error::BufferTooSmall.is_buffer_too_small());
+        assert!(!Error::InvalidState.is_buffer_too_small());
+        assert!(!Error::Disconnected.is_buffer_too_small());
+        assert!(!Error::BufferTooSmall.is_invalid_state());
 
         assert!(Error::Platform(PlatformErrorCode::Linux(-1)).is_platform());
         assert!(!Error::PermissionDenied.is_platform());

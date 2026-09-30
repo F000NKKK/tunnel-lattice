@@ -47,6 +47,11 @@ use tunnel_lattice_platform::{AsyncPacketIo, PacketIo};
 /// (native async, genuinely cancellable on drop) or [`from_device`]
 /// (thread-bridge, best-effort shutdown only) — see each function's docs
 /// for which to prefer.
+///
+/// Both variants behave the same way on errors: a packet larger than the
+/// receive buffer yields `Err(Error::BufferTooSmall)` (the packet is
+/// discarded, never truncated) and the stream keeps receiving;
+/// `Err(Error::Disconnected)` is yielded once and then the stream ends.
 pub struct PacketStream {
     inner: Inner,
 }
@@ -68,9 +73,15 @@ enum Inner {
 /// Wraps a backend's native [`AsyncPacketIo`] as a [`PacketStream`] — no
 /// worker thread, no polling loop.
 ///
-/// `mtu` bounds the per-packet receive buffer; a packet larger than `mtu`
-/// bytes is truncated by the underlying device the same way `recv`
-/// documents it, not by this adapter.
+/// `buf_len` is the per-packet receive buffer size; for a device opened
+/// through the `tunnel-lattice` facade, use
+/// `handle.snapshot()?.recv_buffer_len()`, which fits one packet at the
+/// device's current MTU (Ethernet framing included for TAP). A packet
+/// larger than `buf_len` is never truncated: it is discarded and the stream
+/// yields `Err(Error::BufferTooSmall)`, then keeps receiving. A
+/// non-conforming device that reports more bytes than `buf_len` is treated
+/// the same way. The stream ends after yielding `Err(Error::Disconnected)`;
+/// every other error is yielded and the stream continues.
 ///
 /// Dropping the returned stream drops whatever `AsyncPacketIo::recv` future
 /// is currently in flight, the same way dropping any other future cancels
@@ -79,7 +90,7 @@ enum Inner {
 /// spawned it. Prefer this over `from_device` whenever the backend reports
 /// `Capability::NATIVE_ASYNC`; `tunnel_lattice::Handle::packet_stream`
 /// already does this automatically.
-pub fn from_async_device<D>(device: Arc<D>, mtu: usize) -> PacketStream
+pub fn from_async_device<D>(device: Arc<D>, buf_len: usize) -> PacketStream
 where
     D: AsyncPacketIo + Send + Sync + 'static,
 {
@@ -93,8 +104,8 @@ where
             State::Live(device) => device,
             State::Done => return None,
         };
-        let mut buf = vec![0u8; mtu];
-        match device.recv(&mut buf).await {
+        let mut buf = vec![0u8; buf_len];
+        match checked_len(device.recv(&mut buf).await, buf_len) {
             Ok(len) => {
                 buf.truncate(len);
                 Some((Ok(buf), State::Live(device)))
@@ -111,9 +122,11 @@ where
 /// Bridges a synchronous [`PacketIo`] device to a waker-aware stream of
 /// received packets.
 ///
-/// `mtu` bounds the per-packet receive buffer; a packet larger than `mtu`
-/// bytes is truncated by the underlying device the same way `recv` documents
-/// it, not by this adapter.
+/// `buf_len` is the per-packet receive buffer size, with the same meaning
+/// and the same too-small-buffer and end-of-stream behavior as
+/// [`from_async_device`]'s: use `handle.snapshot()?.recv_buffer_len()`; an
+/// oversize packet yields `Err(Error::BufferTooSmall)` and the stream keeps
+/// receiving; only `Err(Error::Disconnected)` ends it.
 ///
 /// **Shutdown limitation**: dropping the returned stream signals the worker
 /// thread to stop but does **not** join it: [`PacketIo::recv`] has no
@@ -123,30 +136,40 @@ where
 /// call (a packet arrives, or every other handle to the device is closed
 /// and the OS returns an error). Use [`from_async_device`] instead whenever
 /// the backend implements `AsyncPacketIo`, which has no such limitation.
-pub fn from_device<D>(device: Arc<D>, mtu: usize) -> PacketStream
+pub fn from_device<D>(device: Arc<D>, buf_len: usize) -> PacketStream
 where
     D: PacketIo + Send + Sync + 'static,
 {
     let (sender, receiver) = unbounded();
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    thread::spawn(move || forward_device(device, mtu, sender, worker_stop));
+    thread::spawn(move || forward_device(device, buf_len, sender, worker_stop));
     PacketStream {
         inner: Inner::ThreadBridge { receiver, stop },
     }
 }
 
+/// Enforces the `recv` contract's `n <= buf.len()` bound on a device's
+/// result: a larger `n` means the packet did not fit, reported as
+/// [`Error::BufferTooSmall`] instead of an out-of-bounds slice.
+fn checked_len(result: Result<usize>, buf_len: usize) -> Result<usize> {
+    match result {
+        Ok(len) if len > buf_len => Err(Error::BufferTooSmall),
+        other => other,
+    }
+}
+
 fn forward_device<D>(
     device: Arc<D>,
-    mtu: usize,
+    buf_len: usize,
     sender: futures::channel::mpsc::UnboundedSender<Result<Vec<u8>>>,
     stop: Arc<AtomicBool>,
 ) where
     D: PacketIo,
 {
-    let mut buf = vec![0u8; mtu];
+    let mut buf = vec![0u8; buf_len];
     while !stop.load(Ordering::Acquire) {
-        match device.recv(&mut buf) {
+        match checked_len(device.recv(&mut buf), buf_len) {
             Ok(len) => {
                 if sender.unbounded_send(Ok(buf[..len].to_vec())).is_err() {
                     break;
@@ -283,5 +306,140 @@ mod tests {
 
         let third = stream.next().now_or_never().expect("stream has ended");
         assert!(third.is_none(), "stream must end after Disconnected");
+    }
+
+    /// One scripted `recv` outcome.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// A packet that fits.
+        Packet(&'static [u8]),
+        /// A conforming device's report of an oversize packet.
+        TooSmall,
+        /// A non-conforming device reporting one byte more than the buffer.
+        Overlong,
+        /// End of life.
+        Disconnected,
+    }
+
+    /// A mock device implementing both `PacketIo` and `AsyncPacketIo`,
+    /// replaying `steps` in order; each resolves immediately.
+    struct Scripted {
+        steps: std::sync::Mutex<std::collections::VecDeque<Step>>,
+    }
+
+    impl Scripted {
+        fn new(steps: &[Step]) -> Arc<Self> {
+            Arc::new(Self {
+                steps: std::sync::Mutex::new(steps.iter().copied().collect()),
+            })
+        }
+
+        fn next(&self, buf: &mut [u8]) -> Result<usize> {
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the stream received past Disconnected");
+            match step {
+                Step::Packet(bytes) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Step::TooSmall => Err(Error::BufferTooSmall),
+                Step::Overlong => Ok(buf.len() + 1),
+                Step::Disconnected => Err(Error::Disconnected),
+            }
+        }
+    }
+
+    impl PacketIo for Scripted {
+        fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            self.next(buf)
+        }
+
+        fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    impl AsyncPacketIo for Scripted {
+        fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send {
+            let result = self.next(buf);
+            async move { result }
+        }
+
+        async fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    const SCRIPT: [Step; 5] = [
+        Step::TooSmall,
+        Step::Packet(b"abc"),
+        Step::Overlong,
+        Step::Packet(b"defg"),
+        Step::Disconnected,
+    ];
+
+    /// Collects every item until the stream ends, blocking on each (the
+    /// thread bridge delivers from another thread).
+    fn collect(mut stream: PacketStream) -> Vec<Result<Vec<u8>>> {
+        let mut items = Vec::new();
+        while let Some(item) = futures::executor::block_on(stream.next()) {
+            items.push(item);
+        }
+        items
+    }
+
+    /// Oversize packets (reported by the device, or implied by an overlong
+    /// length) yield `BufferTooSmall` without ending the stream; the
+    /// stream ends right after `Disconnected`.
+    fn assert_script_items(items: &[Result<Vec<u8>>]) {
+        assert_eq!(items.len(), 5, "one item per step, then the end");
+        assert!(matches!(items[0], Err(Error::BufferTooSmall)));
+        assert_eq!(items[1].as_deref().unwrap(), b"abc");
+        assert!(matches!(items[2], Err(Error::BufferTooSmall)));
+        assert_eq!(items[3].as_deref().unwrap(), b"defg");
+        assert!(matches!(items[4], Err(Error::Disconnected)));
+    }
+
+    #[test]
+    fn from_async_device_buffer_too_small_is_not_terminal() {
+        let items = collect(from_async_device(Scripted::new(&SCRIPT), 8));
+        assert_script_items(&items);
+    }
+
+    #[test]
+    fn from_device_buffer_too_small_is_not_terminal() {
+        let items = collect(from_device(Scripted::new(&SCRIPT), 8));
+        assert_script_items(&items);
+    }
+
+    /// A zero-length buffer cannot hold any packet: every non-empty packet
+    /// is `BufferTooSmall` on both paths, and neither slices out of bounds.
+    #[test]
+    fn a_zero_length_buffer_reports_every_packet_as_too_small() {
+        let script = [Step::Overlong, Step::Disconnected];
+        for stream in [
+            from_async_device(Scripted::new(&script), 0),
+            from_device(Scripted::new(&script), 0),
+        ] {
+            let items = collect(stream);
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0], Err(Error::BufferTooSmall)));
+            assert!(matches!(items[1], Err(Error::Disconnected)));
+        }
+    }
+
+    #[test]
+    fn checked_len_rejects_only_lengths_past_the_buffer() {
+        assert!(matches!(checked_len(Ok(8), 8), Ok(8)));
+        assert!(matches!(checked_len(Ok(0), 8), Ok(0)));
+        assert!(matches!(checked_len(Ok(9), 8), Err(Error::BufferTooSmall)));
+        assert!(matches!(
+            checked_len(Err(Error::Disconnected), 8),
+            Err(Error::Disconnected)
+        ));
     }
 }

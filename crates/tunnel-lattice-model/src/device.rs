@@ -259,6 +259,38 @@ impl Device {
             admin_state,
         }
     }
+
+    /// The smallest `recv` buffer guaranteed to hold one packet at this
+    /// device's current MTU.
+    ///
+    /// - TUN: `mtu` (a raw IP packet, no framing).
+    /// - TAP: `mtu + 18` (the 14-byte Ethernet header and one 4-byte 802.1Q
+    ///   VLAN tag; the same allowance `tun-rs` uses for its own buffers).
+    ///
+    /// A packet that does not fit is discarded and `recv` returns
+    /// `Error::BufferTooSmall`; nothing is truncated. Double-tagged (QinQ)
+    /// TAP frames need 4 more bytes and are not covered. The value reflects
+    /// the MTU observed in this snapshot: take a fresh snapshot after
+    /// changing the MTU.
+    ///
+    /// ```
+    /// use tunnel_lattice_model::{AdminState, Device, DeviceId, DeviceKind};
+    ///
+    /// let tun = Device::new(DeviceId::new(1), "tun0".into(), DeviceKind::Tun, 1500, AdminState::Up);
+    /// assert_eq!(tun.recv_buffer_len(), 1500);
+    ///
+    /// let tap = Device::new(DeviceId::new(2), "tap0".into(), DeviceKind::Tap, 1500, AdminState::Up);
+    /// assert_eq!(tap.recv_buffer_len(), 1518);
+    /// ```
+    pub const fn recv_buffer_len(&self) -> usize {
+        /// 14-byte Ethernet header + 4-byte 802.1Q tag.
+        const TAP_FRAME_OVERHEAD: usize = 14 + 4;
+        let mtu = self.mtu as usize;
+        match self.kind {
+            DeviceKind::Tun => mtu,
+            DeviceKind::Tap => mtu.saturating_add(TAP_FRAME_OVERHEAD),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +333,18 @@ mod tests {
         assert_eq!(patch.device_id(), device_id);
         assert_eq!(patch.admin_state(), Some(DesiredAdminState::Up));
         assert_eq!(patch.mtu(), None);
+    }
+
+    #[test]
+    fn recv_buffer_len_is_mtu_for_tun_and_adds_ethernet_framing_for_tap() {
+        let device =
+            |kind, mtu| Device::new(DeviceId::new(1), "d".into(), kind, mtu, AdminState::Up);
+        assert_eq!(device(DeviceKind::Tun, 1500).recv_buffer_len(), 1500);
+        assert_eq!(device(DeviceKind::Tun, 0).recv_buffer_len(), 0);
+        assert_eq!(device(DeviceKind::Tap, 1500).recv_buffer_len(), 1518);
+        assert_eq!(device(DeviceKind::Tap, 9000).recv_buffer_len(), 9018);
+        // Never overflows, even for an MTU no device reports.
+        assert!(device(DeviceKind::Tap, u32::MAX).recv_buffer_len() >= u32::MAX as usize);
     }
 
     #[test]

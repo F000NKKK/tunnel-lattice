@@ -35,6 +35,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documented the `recv` contract on `PacketIo` and `AsyncPacketIo`
   (rustdoc only, no signature change):** on `Ok(n)` an implementation must
   have written `buf[..n]`, and `n <= buf.len()`.
+- **Breaking: added `Error::BufferTooSmall`** (with
+  `Error::is_buffer_too_small`, Display "receive buffer too small for the
+  packet"). `PacketIo::recv` and `AsyncPacketIo::recv` must never truncate
+  a packet: one that does not fit in the caller's buffer is discarded, the
+  call returns `Error::BufferTooSmall`, and the device stays usable. The
+  contract no longer mentions `Error::InvalidState` for this case.
+  `tunnel-lattice-backend-tunrs` previously truncated the packet silently
+  on Linux TUN/TAP and macOS TUN, and reported `Error::Platform(Unknown)`
+  on macOS TAP and Windows. It now detects the case with a scatter read
+  into the buffer plus one spare byte on Linux and macOS, and maps `tun-rs`'s
+  code-less `InvalidData` (macOS TAP) and `InvalidInput` (Windows) receive
+  errors. `tunnel-lattice-async`'s streams yield `Err(BufferTooSmall)` for
+  such a packet and keep receiving; only `Err(Disconnected)` ends a stream.
+  A device that reports more bytes than the buffer holds is also reported
+  as `BufferTooSmall` by the streams instead of being sliced.
+- **Added `Device::recv_buffer_len` to `tunnel-lattice-model`
+  (additive):** a receive buffer size that fits one packet at the
+  snapshot's MTU — the MTU for TUN, MTU + 18 for TAP (Ethernet header plus
+  one 802.1Q tag; a double-tagged frame does not fit). The
+  facade's examples now size buffers with it.
+- **Renamed the `mtu` parameter of `Handle::packet_stream`,
+  `tunnel_lattice_async::from_async_device`, and `from_device` to
+  `buf_len` (source-compatible):** it has always been the per-packet
+  buffer size, not the device MTU, and must be `recv_buffer_len()` for a
+  TAP device.
+- **`tunnel-lattice-backend-tunrs` retries two transient conditions
+  inside `recv` (behavioral, no signature change):** a read interrupted by
+  a signal (`EINTR`) on Linux and macOS, which `send` now also retries, and
+  the macOS TAP empty read that `tun-rs` 2.8.11 reports as `UnexpectedEof`
+  with the message `"recv buffer is empty"`. Both were previously returned
+  to the caller (as `Platform(...)` and `Error::Disconnected`).
 - **Changed `tunnel-lattice-backend-tunrs`'s error mapping (behavioral,
   no signature change):** `io::Error`s are now mapped by `io::ErrorKind`
   onto the typed `Error` variants that previously existed but were never
@@ -47,7 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example `EPERM` when opening a device without `CAP_NET_ADMIN`) now
   receive the typed variant instead, without the raw code. (A missing
   tap-windows driver, which `tun-rs` reports as `io::ErrorKind::NotFound`,
-  is the exception: `open` reports it as `Error::DriverUnavailable`, below.)
+  is the exception: `open` reports it as `Error::DriverUnavailable`, below.
+  The macOS TAP transient empty read, also an `UnexpectedEof`, is retried
+  inside `recv` instead of being reported as `Disconnected`, above.)
 - **Breaking: `PlatformErrorCode`, `DesiredAdminState`, and `TunRsBackend`
   are now `#[non_exhaustive]`.** A `match` on `PlatformErrorCode` or
   `DesiredAdminState` outside its defining crate needs a wildcard arm, and

@@ -38,7 +38,8 @@
 Every `tun-rs`/OS `io::Error` is mapped onto `tunnel_lattice_core::Error`
 by its portable `io::ErrorKind` first, so callers can match on typed
 variants instead of raw platform codes (during `open`, the rules under
-"Opening a device" below are applied before this table):
+"Opening a device" below are applied before this table; during `recv` and
+`send`, the rules under "Receiving packets" below are):
 
 | `io::ErrorKind`                               | `Error`            |
 |-----------------------------------------------|--------------------|
@@ -67,6 +68,42 @@ so a `match` on it needs a wildcard arm.
 
 `TunRsBackend` is `#[non_exhaustive]` as well: construct it with
 `TunRsBackend::new()` or `TunRsBackend::default()`.
+
+## Receiving packets
+
+`PacketIo::recv` and `AsyncPacketIo::recv` never truncate a packet. A
+packet larger than the caller's buffer is discarded and reported as
+`Error::BufferTooSmall`; the device stays usable and the next `recv`
+returns the next packet. A buffer of `Device::recv_buffer_len()` bytes (the
+MTU for TUN, MTU + 18 for TAP) is always large enough.
+
+How the oversize case is detected depends on the platform:
+
+| OS / kind          | Mechanism                                                                                   |
+|--------------------|---------------------------------------------------------------------------------------------|
+| Linux TUN/TAP      | a scatter read into the buffer plus one spare byte; a read that reaches the spare byte did not fit |
+| macOS TUN (`utun`) | the same scatter read                                                                       |
+| macOS TAP (`feth`) | `tun-rs` reports `io::ErrorKind::InvalidData` without an OS code                            |
+| Windows TUN/TAP    | `tun-rs` reports `io::ErrorKind::InvalidInput` without an OS code                           |
+
+On Windows and macOS TAP only an error with no OS code is treated as a
+too-small buffer, so a real OS error of the same kind still maps to
+`Error::Platform`.
+
+Two conditions are retried inside `recv` instead of being returned:
+
+- `EINTR` (a signal interrupted the read) on Linux and macOS. `send`
+  retries it too. An `io::ErrorKind::Interrupted` without the raw `EINTR`
+  code is not retried;
+- on macOS TAP, the transient empty read that `tun-rs` reports as
+  `io::ErrorKind::UnexpectedEof` with the exact message
+  `"recv buffer is empty"`. The message is pinned against `tun-rs` 2.8.11;
+  a `tun-rs` release that changes it makes that read return
+  `Error::Disconnected` instead of being retried.
+
+Every other `UnexpectedEof` still maps to `Error::Disconnected`, including
+`tun-rs`'s `"close"` error on a closed macOS device and Windows'
+`ERROR_HANDLE_EOF` when the adapter goes away.
 
 ## Opening a device
 

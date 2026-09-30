@@ -88,12 +88,17 @@ use tunnel_lattice::{DeviceConfig, DeviceKind, Result, Tunnel};
 fn main() -> Result<()> {
     let tunnel = Tunnel::connect();
     let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1500))?;
-    let mut buf = vec![0u8; 1500];
+    let mut buf = vec![0u8; device.snapshot()?.recv_buffer_len()];
     let len = device.recv(&mut buf)?;
     println!("{len} bytes");
     Ok(())
 }
 ```
+
+`recv` никогда не обрезает пакет: пакет, который не помещается в буфер,
+отбрасывается с ошибкой `Error::BufferTooSmall`, а следующий `recv`
+работает как обычно. Буфера размером `recv_buffer_len()` (MTU для TUN,
+MTU + 18 для кадров Ethernet в TAP) достаточно при текущем MTU устройства.
 
 Флаги фич и более полный обзор использования — в
 `crates/tunnel-lattice/README.md`.

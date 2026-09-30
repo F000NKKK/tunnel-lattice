@@ -6,7 +6,7 @@ imposed by this crate itself.
 
 ## What it provides
 
-- `from_async_device(Arc<D>, mtu) -> PacketStream`, wrapping a backend's own
+- `from_async_device(Arc<D>, buf_len) -> PacketStream`, wrapping a backend's own
   `tunnel_lattice_platform::AsyncPacketIo` directly — no worker thread, no
   polling loop. Dropping the stream drops the in-flight `recv` future,
   which is genuine, immediate cancellation, the same way dropping any other
@@ -14,11 +14,28 @@ imposed by this crate itself.
   `Capability::NATIVE_ASYNC`** — `tunnel_lattice::Handle::packet_stream`
   already does this automatically, so most callers never call this
   directly.
-- `from_device(Arc<D>, mtu) -> PacketStream`, bridging a blocking
+- `from_device(Arc<D>, buf_len) -> PacketStream`, bridging a blocking
   `tunnel_lattice_platform::PacketIo::recv` loop (run on one dedicated
   worker thread) onto the stream instead — the fallback for a backend with
   no native async path at all. See "Known limitation" below for what this
   variant cannot guarantee that `from_async_device` can.
+
+## Buffer size and stream errors
+
+`buf_len` is the per-packet receive buffer size. For a device opened
+through the `tunnel-lattice` facade, pass
+`handle.snapshot()?.recv_buffer_len()`: the MTU for TUN, MTU + 18 for TAP
+(the Ethernet header and one 802.1Q tag).
+
+Both variants handle errors the same way:
+
+- A packet larger than `buf_len` is never truncated. It is discarded, the
+  stream yields `Err(Error::BufferTooSmall)`, and it keeps receiving. A
+  device that reports more bytes than `buf_len` (which a conforming backend
+  never does) is treated the same way instead of being sliced out of
+  bounds.
+- `Err(Error::Disconnected)` is yielded once, and then the stream ends.
+- Any other error is yielded and the stream keeps receiving.
 
 ## When to use which
 
@@ -48,6 +65,7 @@ use futures::StreamExt;
 use tunnel_lattice_async::from_async_device;
 
 let device = Arc::new(open_some_async_device()?);
+// A TUN device with a 1500-byte MTU; use `recv_buffer_len()` where available.
 let mut packets = from_async_device(device, 1500);
 while let Some(packet) = packets.next().await {
     let packet = packet?;
@@ -97,7 +115,7 @@ fn make_pool() -> Result<PacketPool> {
 ## Per-packet cost and benchmarks
 
 Today both paths yield an owned `Vec<u8>` per packet: the native path
-allocates one zeroed `mtu`-byte buffer per `recv`, and the thread bridge
+allocates one zeroed `buf_len`-byte buffer per `recv`, and the thread bridge
 copies each packet into a new `Vec` and an unbounded-channel node (two
 allocations per packet). The repository's `tests/alloc_count.rs` pins these
 counts, and `cargo bench -p tunnel-lattice-async` measures both paths

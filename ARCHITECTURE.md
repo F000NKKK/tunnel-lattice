@@ -85,7 +85,7 @@ completed work.
 
 Mirrors `net-lattice-core::Error`: one `#[non_exhaustive]` enum
 (`PermissionDenied`, `NotFound`, `AlreadyExists`, `Unsupported`,
-`InvalidState`, `Disconnected`, `DriverUnavailable`,
+`InvalidState`, `Disconnected`, `DriverUnavailable`, `BufferTooSmall`,
 `Platform(PlatformErrorCode)`) returned by
 every provider trait method instead of a raw OS error type. A backend maps
 its native error (`std::io::Error` for `tun-rs`, currently) into this shape
@@ -117,6 +117,24 @@ macOS/Windows, and the two remaining attach cases — Linux persistent or
 multi-queue devices, and existing Wintun adapters on Windows — are
 documented rather than refused, since neither deletes the interface and a
 check before opening would race with other processes.
+
+`recv` adds its own layer too. It never truncates a packet silently and
+never reports more bytes than the buffer holds: a packet that does not fit
+is discarded and `recv` returns `BufferTooSmall`, and the device stays
+usable. Natively this differs per OS — Linux TUN/TAP and macOS `utun`
+truncate silently, so the `tun-rs` backend reads into the caller's buffer
+plus a one-byte sentinel and treats a length past the buffer as "did not
+fit"; macOS TAP (`feth`) and Windows (Wintun, tap-windows6) reject the
+packet with an error that the backend maps to `BufferTooSmall`.
+`Device::recv_buffer_len()` (the MTU for TUN, MTU + 18 for TAP: the
+Ethernet header and one 802.1Q tag) gives a buffer that fits any packet at
+the snapshot's MTU, except a double-tagged (QinQ) TAP frame. `recv`
+and `send` also retry two transient conditions internally instead of
+reporting them: `EINTR` on Linux and macOS, and a macOS TAP read that
+produced no complete frame (which `tun-rs` reports as an end-of-file with
+a specific message). Every other end-of-file stays `Disconnected`. Both
+`PacketStream` variants yield `BufferTooSmall` and keep receiving; they end
+only after `Disconnected`.
 
 ## Frozen public API surface
 

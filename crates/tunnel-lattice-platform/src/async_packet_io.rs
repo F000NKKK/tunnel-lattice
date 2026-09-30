@@ -22,6 +22,13 @@ pub trait AsyncPacketIo {
     /// `n <= buf.len()`. Callers may reuse `buf` across calls without
     /// clearing it, so bytes past what was actually written must never be
     /// reported as part of the packet.
+    ///
+    /// A packet is never truncated silently. If the next packet does not
+    /// fit in `buf`, the implementation discards it and returns
+    /// [`tunnel_lattice_core::Error::BufferTooSmall`]; the device stays
+    /// usable, and the next `recv` with a large enough buffer receives the
+    /// following packet. `tunnel_lattice_model::Device::recv_buffer_len`
+    /// gives a buffer size that fits at the device's current MTU.
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send;
 
     /// Writes one packet from `buf`.

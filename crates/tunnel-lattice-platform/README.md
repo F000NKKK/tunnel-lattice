@@ -44,6 +44,10 @@ This crate is not used directly by application code — see the
 
 A backend's `PacketIo::recv` and `AsyncPacketIo::recv` must return
 `Ok(n)` only after writing all of `buf[..n]`, with `n <= buf.len()`.
+A packet that does not fit in `buf` must never be truncated: the backend
+discards it, returns `Error::BufferTooSmall`, and keeps the device usable
+for the next `recv`. `Device::recv_buffer_len` gives a buffer size that
+fits at the device's current MTU.
 Callers such as `tunnel-lattice-async`'s buffer pool reuse receive
 buffers without clearing them, so reporting bytes that were not written
 would expose data from an earlier packet.

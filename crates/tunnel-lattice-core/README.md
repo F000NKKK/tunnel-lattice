@@ -10,7 +10,9 @@ workspace. No OS dependency, no TUN/TAP-specific types.
   `errno`, a Windows `DWORD`). Besides the usual typed variants it has
   `DriverUnavailable`, returned only when opening a device fails because
   the OS driver or user-mode runtime (for example `wintun.dll` or the Linux
-  `tun` module) is missing;
+  `tun` module) is missing, and `BufferTooSmall`, returned by a receive
+  whose buffer was too small for the packet (the packet is discarded,
+  never truncated, and the device stays usable);
 - `PlatformErrorCode`, a platform-tagged raw error code preserved as a
   diagnostic escape hatch (`Error::Platform`): `Linux(i32)`,
   `Windows(u32)`, `Darwin(i32)`, or `Unknown` when the native failure

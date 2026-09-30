@@ -44,12 +44,18 @@ use tunnel_lattice::{DeviceConfig, DeviceKind, Result, Tunnel};
 fn main() -> Result<()> {
     let tunnel = Tunnel::connect();
     let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1500))?;
-    let mut buf = vec![0u8; 1500];
+    let mut buf = vec![0u8; device.snapshot()?.recv_buffer_len()];
     let len = device.recv(&mut buf)?;
     println!("{len} bytes: {:?}", &buf[..len]);
     Ok(())
 }
 ```
+
+`recv` never truncates a packet. One that does not fit in the buffer is
+discarded and reported as `Error::BufferTooSmall`, and the next `recv`
+works normally. `Device::recv_buffer_len()` (the MTU for TUN, MTU + 18 for
+TAP's Ethernet header and one VLAN tag) is large enough at the device's
+current MTU, except for a double-tagged (QinQ) TAP frame.
 
 ## Feature flags
 
@@ -66,8 +72,12 @@ fn main() -> Result<()> {
   it reports `Capability::NATIVE_ASYNC` — `tunnel-lattice-backend-tunrs`
   does with either feature, which is the case whenever this method is
   reachable at all — otherwise falls back to `tunnel-lattice-async`'s
-  thread-based adapter, whose shutdown is best-effort only. No async
-  runtime dependency is imposed when neither feature is enabled.
+  thread-based adapter, whose shutdown is best-effort only. Its `buf_len`
+  argument is the per-packet buffer size; pass
+  `handle.snapshot()?.recv_buffer_len()`. An oversize packet yields
+  `Err(Error::BufferTooSmall)` and the stream keeps receiving; only
+  `Err(Error::Disconnected)` ends it. No async runtime dependency is imposed
+  when neither feature is enabled.
 
   **With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
   multi-threaded Tokio runtime entered on the calling thread**

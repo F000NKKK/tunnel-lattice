@@ -15,7 +15,10 @@ system.
   (anything else is rejected with `Error::InvalidState` before any native
   call) and what happens when an interface with that name already exists;
 - `Device`, an observed, already-open device (id, actual name, kind, MTU,
-  administrative state);
+  administrative state). `Device::recv_buffer_len` returns a receive
+  buffer size that fits one packet at the snapshot's MTU: the MTU for TUN,
+  MTU + 18 for TAP (the 14-byte Ethernet header plus one 4-byte 802.1Q
+  tag, so a double-tagged frame does not fit);
 - `DeviceConfigPatch`, desired intent for changing an open device's MTU or
   administrative state, distinct from creation — built with
   `DeviceConfigPatch::new`, which rejects an empty or zero-MTU patch the
