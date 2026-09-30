@@ -54,3 +54,13 @@ while let Some(packet) = packets.next().await {
     println!("{} bytes", packet.len());
 }
 ```
+
+## Per-packet cost and benchmarks
+
+Today both paths yield an owned `Vec<u8>` per packet: the native path
+allocates one zeroed `mtu`-byte buffer per `recv`, and the thread bridge
+copies each packet into a new `Vec` and an unbounded-channel node (two
+allocations per packet). The repository's `tests/alloc_count.rs` pins these
+counts, and `cargo bench -p tunnel-lattice-async` measures both paths
+against a synchronous caller-buffer loop, using in-memory mock devices (no
+privileges or real device needed).

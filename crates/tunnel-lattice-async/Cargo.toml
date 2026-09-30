@@ -17,3 +17,19 @@ tunnel-lattice-core = { workspace = true }
 tunnel-lattice-platform = { workspace = true, features = ["async"] }
 
 futures = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Packet-path throughput benchmarks over in-memory mock devices (no
+# privilege, no real device). Build-checked in CI with `--no-run`.
+[[bench]]
+name = "packet_stream"
+harness = false
+
+# Counts heap allocations per received packet with a counting global
+# allocator, which needs its own binary (no libtest harness allocating
+# concurrently on the main thread).
+[[test]]
+name = "alloc_count"
+harness = false

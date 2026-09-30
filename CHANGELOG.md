@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Added packet-path benchmarks and an allocation-count test to
+  `tunnel-lattice-async` (development only, no API change):** `cargo bench
+  -p tunnel-lattice-async` measures the synchronous caller-buffer receive
+  loop and the current `Vec`-per-packet stream paths over in-memory mock
+  devices, and `tests/alloc_count.rs` pins today's per-packet heap cost
+  (one allocation per packet on the native stream, two on the thread
+  bridge) so later buffer changes can be compared against it. `criterion`
+  is a dev-dependency only. CI builds the benches on every OS without
+  running them.
 - **Changed `tunnel-lattice-backend-tunrs`'s error mapping (behavioral,
   no signature change):** `io::Error`s are now mapped by `io::ErrorKind`
   onto the typed `Error` variants that previously existed but were never

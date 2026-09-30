@@ -83,6 +83,15 @@ jobs:
       - name: cargo doc --no-deps --workspace
         run: cargo doc --no-deps --workspace ${{ matrix.features.flags }}
 
+      # Benches run on mocks and are not timed in CI (shared runners are too
+      # noisy); this only proves they still build in release mode, once per
+      # OS. `tunnel-lattice-async` has no features of its own, so the other
+      # feature sets would build it identically (their clippy
+      # `--all-targets` step above still type-checks the benches).
+      - name: cargo bench -p tunnel-lattice-async --no-run
+        if: matrix.features.name == 'default'
+        run: cargo bench -p tunnel-lattice-async --no-run
+
   privileged:
     name: privileged (${{ matrix.os }}, ${{ matrix.features.name }})
     runs-on: ${{ matrix.os }}

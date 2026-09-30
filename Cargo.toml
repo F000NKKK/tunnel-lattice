@@ -26,6 +26,9 @@ tunnel-lattice = { path = "crates/tunnel-lattice", version = "0.4.0" }
 
 bitflags = "2"
 futures = "0.3"
+# Dev-only: packet-path benchmarks in tunnel-lattice-async. No default
+# features (no rayon/plotters); 0.8.2 needs Rust 1.86, below our 1.93 floor.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", default-features = false }
 
 # Initial TUN/TAP backend (see ARCHITECTURE.md, "Backend replacement plan"):

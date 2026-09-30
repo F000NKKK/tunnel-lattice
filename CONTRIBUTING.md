@@ -36,6 +36,9 @@ Tunnel Lattice follows standard Rust ecosystem conventions:
 - Every affected crate must retain a standalone crate-local README, and
   English/Russian project documentation must remain synchronized.
 - Privileged network tests must be isolated, opt-in, and restore changed state.
+- Changes to the packet receive path should report before/after numbers
+  from `cargo bench -p tunnel-lattice-async` and keep
+  `crates/tunnel-lattice-async/tests/alloc_count.rs` passing.
 - Commit messages should be clear and descriptive.
 
 ## Reporting Issues
