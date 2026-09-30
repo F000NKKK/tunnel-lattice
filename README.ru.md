@@ -1,86 +1,151 @@
-# Tunnel Lattice
+<div align="center">
 
-**Языки**
+<a id="top"></a>
 
-🇺🇸 [English](README.md) | 🇷🇺 **Русский**
+# 🕸️ Tunnel Lattice
 
-[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
+### Типизированные кроссплатформенные TUN/TAP-интерфейсы для Rust
+
 [![crates.io](https://img.shields.io/crates/v/tunnel-lattice.svg)](https://crates.io/crates/tunnel-lattice)
 [![docs.rs](https://img.shields.io/docsrs/tunnel-lattice)](https://docs.rs/tunnel-lattice)
 [![Downloads](https://img.shields.io/crates/d/tunnel-lattice.svg)](https://crates.io/crates/tunnel-lattice)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
 [![CI](https://github.com/F000NKKK/tunnel-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/tunnel-lattice/actions/workflows/ci.yml)
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
 
 ![Linux](https://img.shields.io/badge/Linux-supported-success)
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
 ![macOS](https://img.shields.io/badge/macOS-supported-success)
 
-Кроссплатформенная Rust-библиотека для туннельных интерфейсов TUN/TAP,
-рассчитанная на совместную работу с остальным стеком Lattice.
+🇺🇸 [English](README.md) | 🇷🇺 **Русский**
 
-## Статус
+[Возможности](#-ключевые-возможности) • [Платформы](#-поддерживаемые-платформы) • [Производительность](#-производительность) • [Установка](#-установка) • [Быстрый старт](#-быстрый-старт) • [Сравнение](#-сравнение)
 
-**Опубликована `0.4.0`, идёт активное проектирование/реализация.** См.
-[ARCHITECTURE.ru.md](ARCHITECTURE.ru.md) — архитектура крейтов уже реальная,
-но ничего в ней не заморожено по API: любой тип, трейт и Cargo-фича могут
-измениться в будущем `0.x`-релизе (см. предрелизную политику в
-`versioning.md`).
+</div>
 
-## Что делает библиотека
+---
 
-- Создаёт и настраивает устройства TUN (сырой IP) и TAP (кадры Ethernet) на
-  Linux, Windows и macOS через крейт `tun-rs`;
-- Передаёт пакеты через открытое устройство: синхронно по умолчанию и, с
-  опциональной (взаимоисключающей) фичей `async-io` или `tokio`, через
-  `futures::Stream` — асинхронный рантайм подключается только при включении
-  одной из них;
-- Перечитывает и изменяет MTU и административное состояние открытого
-  устройства;
-- На Linux помечает устройство персистентным на время после завершения
-  процесса и дублирует аппаратно-распределяемую очередь того же устройства
-  для другого потока — см. `crates/tunnel-lattice/README.md`, раздел
-  "Persistent devices and multi-queue".
+## 📖 Обзор
 
-Tunnel Lattice не назначает IP-адреса созданным интерфейсам — см. раздел
-"Совместимость с net-lattice" ниже.
+**Tunnel Lattice** создаёт виртуальные сетевые интерфейсы TUN (сырой IP) и
+TAP (Ethernet) на Linux, Windows и macOS и работает с ними через один
+типизированный API на всех платформах. Это туннельный слой сетевого стека
+Lattice; адреса и маршруты настраиваются через
+[net-lattice](https://github.com/F000NKKK/net-lattice).
 
-## Совместимость с net-lattice
+### 🎯 Почему Tunnel Lattice?
 
-У Tunnel Lattice и `net-lattice` нет общей, независимой от процесса
-идентичности объектов: `tunnel_lattice::DeviceId` и `net_lattice::InterfaceId`
-— разные типы-обёртки с фантомным параметром, даже если их внутренний
-нативный индекс случайно совпадает, так что перепутать их местами не даст
-компилятор. Связывайте их через **имя интерфейса**, назначенное ОС, — это
-единственное поле, которое обе стороны отдают в одном и том же виде:
+- **🧭 Типизированные ошибки везде**: любая ошибка ОС превращается в один
+  `tunnel_lattice::Error`. `Disconnected`, `BufferTooSmall`,
+  `DriverUnavailable` и `PermissionDenied` значат одно и то же на Linux,
+  Windows и macOS — не нужно разбирать errno или коды Win32.
+- **🛑 Удалённое устройство всегда завершает `recv`**: удаление интерфейса
+  завершает ожидающий `recv` или `PacketStream` с `Disconnected` на всех
+  трёх ОС и во всех наборах фич, включая асинхронный TAP на macOS и Tokio на
+  Linux, где нижележащая библиотека ждёт вечно.
+- **📦 Без молчаливой обрезки**: пакет, не влезающий в буфер, отбрасывается
+  с ошибкой `BufferTooSmall`. Половину пакета вы не получите никогда.
+- **⚡ Async без привязки к рантайму**: `futures::Stream` пакетов на Tokio
+  или `async-io`; рантайм подключается только если вы его попросили.
+- **♻️ Ноль аллокаций на пакет**: поток читает прямо в переиспользуемый слот
+  `PacketPool`. Это закреплено тестом в репозитории.
+- **🔌 Заменяемые бэкенды**: трейты провайдера и флаги `Capability` отделяют
+  API от реализации. Сейчас под капотом
+  [`tun-rs`](https://github.com/tun-rs/tun-rs); нативные бэкенды под каждую
+  ОС встанут на его место без изменений в вашем коде.
 
-```rust,no_run
-use net_lattice::Lattice;
-use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+> **Статус:** опубликована `0.4.0`, идёт активная разработка. До `1.0` API
+> не заморожен; см. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
 
-let tunnel = Tunnel::connect();
-let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun))?;
-let snapshot = device.snapshot()?; // snapshot.name, например "tun0"
+## 🌟 Ключевые возможности
 
-let lattice = Lattice::connect()?;
-let interface = lattice
-    .interfaces()?
-    .into_iter()
-    .find(|i| i.name == snapshot.name)
-    .ok_or(net_lattice::Error::NotFound)?;
-// дальше — назначение адреса, поднятие интерфейса и т.д. через net-lattice.
-# Ok::<(), Box<dyn std::error::Error>>(())
+### Основное
+- ✅ **TUN и TAP**: устройства сырого IP (уровень 3) и Ethernet (уровень 2)
+- ✅ **Sync и async**: блокирующие `recv`/`send` или `futures::Stream` с
+  фичей `tokio` или `async-io`
+- ✅ **Чтение и изменение**: перечитать имя, MTU и административное
+  состояние; поменять MTU и up/down на открытом устройстве
+- ✅ **Дешёвое разделение**: `Handle` реализует `Clone`, а `recv`/`send`
+  принимают `&self` — одно устройство можно использовать из многих потоков
+
+### Платформенные возможности
+- 🐧 **Персистентность на Linux**: устройство переживает завершение процесса
+- 🔀 **Multi-queue на Linux**: независимые очереди ядра на одном устройстве
+- 🍎 **TAP на macOS**: пары `feth` с ограниченным ожиданием, чтобы
+  уничтоженный интерфейс завершал `recv`
+- 🪟 **TUN на Windows**: Wintun; отсутствие `wintun.dll` сообщается как
+  `DriverUnavailable`
+
+### Удобство разработки
+- 🎯 **Честные имена**: `open` отказывает, если не может выдать имя ровно
+  как запрошено, и никогда не подхватывает, а потом уничтожает чужой
+  интерфейс
+- 🧪 **Проверено на реальных устройствах**: привилегированный CI создаёт и
+  удаляет настоящие устройства на Linux, Windows и macOS во всех наборах фич
+- 🧩 **Флаги возможностей**: спросите устройство, что оно умеет, вместо
+  угадывания по ОС
+
+## 💻 Поддерживаемые платформы
+
+| Платформа   | TUN | TAP | Sync | Tokio | async-io | Примечания |
+|-------------|:---:|:---:|:----:|:-----:|:--------:|------------|
+| **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | Персистентные устройства и multi-queue |
+| **Windows** | ✅  | ⚠️  | ✅   | ✅    | ✅       | TUN нужен `wintun.dll`; TAP нужен драйвер tap-windows6 |
+| **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN через `utun`, TAP через пары `feth` |
+
+✅ проверено в CI на реальных устройствах. ⚠️ поддерживается, но в CI пока
+проверен только сценарий без драйвера.
+
+> Для создания устройства нужны `CAP_NET_ADMIN` на Linux, права
+> администратора на Windows или root на macOS.
+
+## 🚀 Производительность
+
+### 🏆 Особенности устройства
+
+- **Ноль аллокаций и копирований на пакет** в потоке: устройство пишет
+  прямо в слот пула, а `tests/alloc_count.rs` падает, если устойчивый поток
+  начинает аллоцировать.
+- **Без рабочего потока на async-пути**: с `tokio` или `async-io` поток
+  использует нативный async I/O бэкенда, а его drop отменяет ожидающий
+  `recv`.
+- **Обратное давление вместо буферизации**: когда все слоты заняты, поток
+  ждёт, пока вы освободите один; память ограничена размером пула.
+- **Multi-queue на Linux** для распределения трафика по ядрам.
+
+### 📊 Бенчмарки
+
+Микробенчмарки работают на моках устройств в памяти, привилегии не нужны:
+
+```bash
+cargo bench -p tunnel-lattice-async                # пути потока против простого цикла recv
+cargo bench -p tunnel-lattice-async --bench pool   # накладные расходы и конкуренция PacketPool
 ```
 
-Если `name` в `DeviceConfig` не задано, имя выбирает бэкенд или ОС. Заданное
-имя, которое платформа не может принять как есть, `open` отклоняет с
-`Error::InvalidState`, а занятое имя — с `Error::AlreadyExists`; допустимые
-форматы и случаи, когда `open` подключается к уже существующему устройству,
-описаны в документации поля `DeviceConfig::name`. Фактическое имя всегда
-берите из `snapshot()`/возвращённого `Device`, а не из переданного
-`DeviceConfig`.
+Сквозной бенчмарк пропускной способности на `iperf3` в стиле
+[tun-benchmark2](https://github.com/tun-rs/tun-benchmark2) в работе. Он
+измеряет Tunnel Lattice и «голый» `tun-rs` рядом, на одной машине. Таблица
+результатов появится здесь.
 
-## Быстрый старт
+## 📦 Установка
+
+```toml
+[dependencies]
+# Синхронный API, без async-рантайма
+tunnel-lattice = "0.4"
+
+# Асинхронный поток пакетов на Tokio (многопоточный рантайм)
+tunnel-lattice = { version = "0.4", features = ["tokio"] }
+
+# Асинхронный поток пакетов на async-io (smol, async-std, ...)
+tunnel-lattice = { version = "0.4", features = ["async-io"] }
+```
+
+`tokio` и `async-io` взаимоисключающие.
+
+## 🎓 Быстрый старт
+
+### Синхронный TUN
 
 ```rust,no_run
 use tunnel_lattice::{DeviceConfig, DeviceKind, Result, Tunnel};
@@ -95,44 +160,225 @@ fn main() -> Result<()> {
 }
 ```
 
-`recv` никогда не обрезает пакет: пакет, который не помещается в буфер,
-отбрасывается с ошибкой `Error::BufferTooSmall`, а следующий `recv`
-работает как обычно. Буфера размером `recv_buffer_len()` (MTU для TUN,
-MTU + 18 для кадров Ethernet в TAP) достаточно при текущем MTU устройства.
+`recv_buffer_len()` — это MTU для TUN и MTU + 18 для TAP; такого буфера
+всегда хватает на один пакет при текущем MTU.
 
-Флаги фич и более полный обзор использования — в
-`crates/tunnel-lattice/README.md`.
+### Асинхронный поток пакетов (Tokio)
 
-## Крейты воркспейса
+```rust,ignore
+use futures::StreamExt;
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
 
-Воркспейс разбит на сфокусированные крейты. У каждого — свой README с
-описанием области ответственности и примером использования:
+#[tokio::main]
+async fn main() -> tunnel_lattice::Result<()> {
+    let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
+    let mut packets = device.packet_stream(device.snapshot()?.recv_buffer_len())?;
+    while let Some(packet) = packets.next().await {
+        let packet = packet?; // представление слота пула; drop возвращает слот
+        println!("{} bytes", packet.len());
+    }
+    Ok(())
+}
+```
+
+Когда устройство исчезает, поток отдаёт одну ошибку и завершается; на
+слишком большой пакет он отдаёт `BufferTooSmall` и продолжает работу.
+
+## 📚 Примеры
+
+### Персистентное устройство и multi-queue (Linux)
+
+```rust,no_run
+# #[cfg(target_os = "linux")]
+# fn main() -> tunnel_lattice::Result<()> {
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+let device = Tunnel::connect()
+    .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
+device.persist()?;                          // переживёт завершение процесса
+let second_queue = device.additional_queue()?; // для другого потока
+# Ok(())
+# }
+# #[cfg(not(target_os = "linux"))]
+# fn main() {}
+```
+
+### Назначение адреса через net-lattice
+
+Tunnel Lattice создаёт интерфейс, `net-lattice` его настраивает. У крейтов
+намеренно нет общих идентификаторов объектов, поэтому связывайте их по
+имени интерфейса:
+
+```rust,no_run
+use net_lattice::Lattice;
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
+let snapshot = device.snapshot()?; // snapshot.name, например "tun0"
+
+let interface = Lattice::connect()?
+    .interfaces()?
+    .into_iter()
+    .find(|i| i.name == snapshot.name)
+    .ok_or(net_lattice::Error::NotFound)?;
+// дальше — адрес, поднятие интерфейса и маршруты через net-lattice.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Фактическое имя всегда берите из `snapshot()`, а не из переданного
+`DeviceConfig`.
+
+## 🔧 Настройка под платформу
+
+### Linux
+
+```bash
+sudo modprobe tun                          # если нет /dev/net/tun
+sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
+```
+
+Отсутствующий модуль `tun` сообщается как `Error::DriverUnavailable`.
+
+### Windows
+
+- **TUN**: скачайте `wintun.dll` под вашу архитектуру с
+  [wintun.net](https://www.wintun.net/) и положите рядом с исполняемым
+  файлом или в `PATH`.
+- **TAP**: установите драйвер
+  [tap-windows6](https://build.openvpn.net/downloads/releases/).
+- Запускайте от администратора. Без DLL или драйвера `open` вернёт
+  `Error::DriverUnavailable`.
+
+### macOS
+
+- Запускайте от root.
+- Устройства **TUN** — это `utun<N>`, **TAP** — пары `feth<N>` (`N` ≤
+  32767); оставьте имя пустым, чтобы его выбрала ОС.
+
+## 🤝 Сравнение
+
+Сейчас Tunnel Lattice работает поверх `tun-rs`, поэтому здесь сравнивается,
+что добавляет слой Tunnel Lattice и чего в нём пока нет.
+
+| Возможность | Tunnel Lattice | tun-rs (бэкенд под ним) |
+|-------------|----------------|-------------------------|
+| **Тип ошибки** | ✅ Один типизированный `Error`, одинаковый на всех ОС | ⚠️ `std::io::Error` с платформенными кодами |
+| **Устройство удалено во время `recv`** | ✅ Завершается с `Disconnected` на всех ОС и фичах | ⚠️ Ждёт вечно с Tokio на Linux и в async TAP на macOS |
+| **Слишком большой пакет** | ✅ `BufferTooSmall`, без обрезки | ⚠️ Поведение зависит от платформы |
+| **Async API** | ✅ `futures::Stream`, Tokio или async-io | ✅ async `recv`/`send`, Tokio или async-io |
+| **Поток пакетов без аллокаций** | ✅ Встроенный `PacketPool` | ➖ Буферы на стороне вызывающего |
+| **Флаги возможностей в рантайме** | ✅ | ❌ |
+| **Заменяемый бэкенд** | ✅ Трейты провайдера | ❌ |
+| **Аппаратный offload (TSO/GSO)** | 🚧 Запланирован на 0.6 | ✅ Linux |
+| **Настройка адресов и маршрутов** | ➖ Через net-lattice | ✅ Встроена |
+| **Платформы** | Linux, Windows, macOS | 11+, включая BSD, iOS, Android |
+
+## 🛠️ Обзор API
+
+| Элемент | Назначение |
+|---------|------------|
+| `Tunnel::connect()` | Подключение к бэкенду по умолчанию |
+| `Tunnel::open(DeviceConfig)` | Создать устройство TUN/TAP и вернуть `Handle` |
+| `Handle::recv` / `send` | Блокирующая передача пакетов |
+| `Handle::snapshot` | Текущие имя, MTU и административное состояние |
+| `Handle::apply(DeviceConfigPatch)` | Изменить MTU или up/down |
+| `Handle::capabilities` | Что устройство поддерживает в рантайме |
+| `Handle::persist` / `additional_queue` | Персистентность и multi-queue на Linux |
+| `Handle::packet_stream` | Асинхронный `Stream` пакетов из пула (`tokio` / `async-io`) |
+
+### Крейты воркспейса
 
 | Крейт | Назначение |
 | --- | --- |
-| [`tunnel-lattice`](crates/tunnel-lattice/README.md) | Публичный фасад: `Tunnel`/`Handle`, выбор backend'а через Cargo-фичи |
-| [`tunnel-lattice-model`](crates/tunnel-lattice-model/README.md) | Наблюдаемые/желаемые типы устройства (`Device`, `DeviceConfig`, `DeviceConfigPatch`) |
+| [`tunnel-lattice`](crates/tunnel-lattice/README.md) | Публичный фасад: `Tunnel`/`Handle`, выбор бэкенда через фичи |
+| [`tunnel-lattice-model`](crates/tunnel-lattice-model/README.md) | Наблюдаемые и желаемые типы устройства (`Device`, `DeviceConfig`, `DeviceConfigPatch`) |
 | [`tunnel-lattice-platform`](crates/tunnel-lattice-platform/README.md) | Трейты провайдера и контракт `Capability` |
 | [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Общие ошибки, результаты и идентификаторы |
-| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Независимый от рантайма `futures::Stream`: нативно поверх `AsyncPacketIo` backend'а, иначе через поток-мост |
-| [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | Кроссплатформенная реализация TUN/TAP на базе `tun-rs` |
+| [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Независимый от рантайма `Stream` пакетов и `PacketPool` |
+| [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | Реализация TUN/TAP на базе `tun-rs` |
 
-## Экосистема Lattice
+## 📖 Документация
+
+- **Справочник API**: [docs.rs/tunnel-lattice](https://docs.rs/tunnel-lattice)
+- **Архитектура**: [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md)
+- **Изменения**: [CHANGELOG.md](CHANGELOG.md)
+- **Поддержка и безопасность**: [SUPPORT.md](SUPPORT.md), [SECURITY.md](SECURITY.md)
+
+## 🐛 Решение проблем
+
+<details>
+<summary><b><code>PermissionDenied</code> при открытии устройства</b></summary>
+
+Для создания устройства нужны `CAP_NET_ADMIN` на Linux (`sudo` или
+`sudo setcap cap_net_admin+ep ./your-app`), права администратора на Windows
+или root на macOS.
+</details>
+
+<details>
+<summary><b><code>DriverUnavailable</code> на Windows или Linux</b></summary>
+
+На Windows нет `wintun.dll` (TUN) или драйвера tap-windows6 (TAP); см.
+[настройку Windows](#windows). На Linux не загружен модуль `tun` или нет
+`/dev/net/tun`; выполните `sudo modprobe tun`.
+</details>
+
+<details>
+<summary><b><code>recv</code> зависает с фичей <code>tokio</code></b></summary>
+
+С `tokio` каждому вызову устройства нужен **многопоточный** рантайм Tokio,
+в который вошёл вызывающий поток (вариант `#[tokio::main]` по умолчанию).
+Рантайм `current_thread` никогда не обслуживает I/O устройства. Если нужен
+однопоточный рантайм, используйте `async-io`.
+</details>
+
+<details>
+<summary><b><code>InvalidState</code> для имени устройства</b></summary>
+
+`open` отклоняет имя, которое не может выдать ровно как запрошено: длиннее
+15 байт или с `%` на Linux, всё, кроме `utun<N>` / `feth<N>`, на macOS.
+Оставьте имя пустым, чтобы его выбрала ОС.
+</details>
+
+## 🌐 Экосистема Lattice
 
 | Крейт | Назначение |
 | --- | --- |
 | [net-lattice](https://github.com/F000NKKK/net-lattice) | Инспекция и настройка сетевого стека ОС (маршруты, DNS, интерфейсы) |
 | [tunnel-lattice](https://github.com/F000NKKK/tunnel-lattice) | TUN/TAP туннельные интерфейсы |
 | [dns-lattice](https://github.com/F000NKKK/dns-lattice) | Программируемый DNS control plane |
-| [flow-lattice](https://github.com/F000NKKK/flow-lattice) | Компилятор политик: правила -> платформенно-нейтральные сетевые планы |
+| [flow-lattice](https://github.com/F000NKKK/flow-lattice) | Компилятор политик: правила в платформенно-нейтральные сетевые планы |
 | [sdk-lattice](https://github.com/F000NKKK/sdk-lattice) | Прикладной SDK, объединяющий крейты выше |
 
-## Участие в разработке
+## 🙏 Участие в разработке
 
-См. [CONTRIBUTING.md](CONTRIBUTING.md). На этой стадии наиболее ценна
-обратная связь по архитектуре крейтов и форме API в
+Мы рады вкладу; см. [CONTRIBUTING.md](CONTRIBUTING.md). На этой стадии
+ценнее всего обратная связь по архитектуре и форме API в
 [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
 
-## Лицензия
+```bash
+git clone https://github.com/F000NKKK/tunnel-lattice.git
+cd tunnel-lattice
+cargo test --workspace                                      # тесты без привилегий
+sudo -E cargo test -p tunnel-lattice-backend-tunrs -- --ignored   # на реальных устройствах
+```
+
+## 📄 Лицензия
 
 Распространяется под [Mozilla Public License 2.0](LICENSE).
+
+## 🌟 Благодарности
+
+- [`tun-rs`](https://github.com/tun-rs/tun-rs) — кроссплатформенная
+  TUN/TAP-библиотека, на которой сейчас работает Tunnel Lattice
+- [Wintun](https://www.wintun.net/) и асинхронная экосистема Rust (Tokio,
+  async-io)
+
+---
+
+<div align="center">
+
+**[⬆ Наверх](#top)**
+
+Часть сетевого стека Lattice
+
+</div>

@@ -1,14 +1,53 @@
-# tunnel-lattice-backend-tunrs
+<div align="center">
 
-`tun-rs`-backed cross-platform TUN/TAP backend for Tunnel Lattice, implementing
-`tunnel-lattice-platform`'s provider traits.
+# ⚙️ tunnel-lattice-backend-tunrs
 
-## What it provides
+### The `tun-rs`-Backed TUN/TAP Backend for Tunnel Lattice
 
-- `TunRsBackend`, a stateless handle whose `DeviceProvider::open` builds a
+[![crates.io](https://img.shields.io/crates/v/tunnel-lattice-backend-tunrs.svg)](https://crates.io/crates/tunnel-lattice-backend-tunrs)
+[![docs.rs](https://img.shields.io/docsrs/tunnel-lattice-backend-tunrs)](https://docs.rs/tunnel-lattice-backend-tunrs)
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/tunnel-lattice)
+
+![Linux](https://img.shields.io/badge/Linux-supported-success)
+![Windows](https://img.shields.io/badge/Windows-supported-success)
+![macOS](https://img.shields.io/badge/macOS-supported-success)
+
+[Overview](#-overview) • [Platforms](#-supported-platforms) • [Installation](#-installation) • [Errors](#-error-mapping) • [Receiving](#-receiving-packets) • [Opening](#-opening-a-device) • [Windows](#-windows-requires-wintundll)
+
+</div>
+
+---
+
+## 📖 Overview
+
+The cross-platform TUN/TAP backend of
+[Tunnel Lattice](https://github.com/F000NKKK/tunnel-lattice), built on
+[`tun-rs`](https://github.com/tun-rs/tun-rs). It implements
+`tunnel-lattice-platform`'s provider traits and turns every `tun-rs`/OS
+error into a typed `tunnel_lattice_core::Error`.
+
+> Not used directly: the
+> [`tunnel-lattice`](https://crates.io/crates/tunnel-lattice) facade selects
+> this backend by default through its `tun-rs` feature.
+
+### 🎯 What It Adds on Top of `tun-rs`
+
+- **🧭 Typed errors**: every native failure is mapped by platform-specific
+  rules to `Disconnected`, `DriverUnavailable`, `AlreadyExists`,
+  `BufferTooSmall`, and so on (tables below).
+- **🛑 Device removal always ends `recv`**, including the Linux Tokio and
+  async macOS TAP cases where `tun-rs`'s own wait never returns.
+- **📦 No truncation**: an oversize packet is reported, not cut.
+- **🎯 Honest open**: names the OS would not honor exactly are rejected up
+  front, and an existing interface is never adopted and then destroyed.
+
+## 🌟 Key Features
+
+- ✅ `TunRsBackend`, a stateless handle whose `DeviceProvider::open` builds a
   device via `tun_rs::DeviceBuilder`, mapping `DeviceKind::Tun`/`Tap` to
   `tun_rs::Layer::L3`/`L2`;
-- `TunRsDevice`, the open-device handle implementing `PacketIo`,
+- ✅ `TunRsDevice`, the open-device handle implementing `PacketIo`,
   `DeviceObserver`, `DeviceMutator` (MTU and administrative state), and
   `CapabilityProvider`. It holds exactly one underlying `tun-rs` handle —
   never both a sync and an async one, since `tun_rs::SyncDevice::try_clone`
@@ -23,17 +62,41 @@
   `AsyncPacketIo` directly on the same handle, reporting
   `Capability::NATIVE_ASYNC`. Without either feature, the handle is a
   `tun_rs::SyncDevice` and `PacketIo` calls it directly.
-- Administrative-state read-back (`DeviceObserver::snapshot`'s
+- ✅ Administrative-state read-back (`DeviceObserver::snapshot`'s
   `AdminState`) is exact only on Linux (`tun_rs`'s `is_running`); macOS,
   Windows, and BSD expose only a write-only `enabled(bool)` setter with no
   corresponding getter, so `snapshot()` reports `AdminState::Unknown` there.
-- `PersistentDevice`/`MultiQueueProvider`, both Linux-only: `TunRsDevice`
+- 🐧 `PersistentDevice`/`MultiQueueProvider`, both Linux-only: `TunRsDevice`
   implements them on Linux and does not implement them at all elsewhere
   (verified in `tun-rs`'s source — the underlying `persist`/`multi_queue`/
   `try_clone` methods are `#[cfg(target_os = "linux")]` there too, not
   merely no-ops off Linux). See "Persistent devices and multi-queue" below.
 
-## Error mapping
+## 💻 Supported Platforms
+
+| Platform    | TUN | TAP | Sync | Tokio | async-io | Mechanism |
+|-------------|:---:|:---:|:----:|:-----:|:--------:|-----------|
+| **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | `/dev/net/tun`; persistence and multi-queue |
+| **Windows** | ✅  | ⚠️  | ✅   | ✅    | ✅       | TUN via Wintun (`wintun.dll`), TAP via tap-windows6 |
+| **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via `utun`, TAP via `feth` pairs and BPF |
+
+✅ tested in CI on real devices. ⚠️ supported, but only the missing-driver
+path is tested in CI so far. Administrative-state read-back is exact only
+on Linux; elsewhere `snapshot()` reports `AdminState::Unknown`.
+
+## 📦 Installation
+
+```toml
+[dependencies]
+# Synchronous backend
+tunnel-lattice-backend-tunrs = "0.4"
+
+# With the native async path on Tokio or async-io (mutually exclusive)
+tunnel-lattice-backend-tunrs = { version = "0.4", features = ["tokio"] }
+tunnel-lattice-backend-tunrs = { version = "0.4", features = ["async-io"] }
+```
+
+## 🧭 Error mapping
 
 Every `tun-rs`/OS `io::Error` is mapped onto `tunnel_lattice_core::Error`
 by its portable `io::ErrorKind` first, so callers can match on typed
@@ -69,7 +132,7 @@ so a `match` on it needs a wildcard arm.
 `TunRsBackend` is `#[non_exhaustive]` as well: construct it with
 `TunRsBackend::new()` or `TunRsBackend::default()`.
 
-## Receiving packets
+## 📥 Receiving packets
 
 `PacketIo::recv` and `AsyncPacketIo::recv` never truncate a packet. A
 packet larger than the caller's buffer is discarded and reported as
@@ -158,7 +221,7 @@ the device while a stream or a blocking `recv` is waiting (Linux `ip link
 del`, macOS `ifconfig <peer feth> destroy`, Windows adapter disable) and
 check that it ends.
 
-## Opening a device
+## 🚪 Opening a device
 
 ### Name and MTU prechecks
 
@@ -251,7 +314,7 @@ rejects (`EINVAL` from setting the MTU) is reported as `AlreadyExists`,
 because the name exists — the same limitation as the other Linux `EINVAL`
 case above.
 
-## Feature flags
+## 🎛️ Feature flags
 
 `async-io` and `tokio` are mutually exclusive — they select `tun-rs`'s own
 two async backends (`tun-rs/async_io`, no runtime dependency beyond
@@ -278,7 +341,7 @@ directly (not a bug specific to this crate) and is exercised by this crate's
 `privileged_tests`. Prefer the `async-io` feature instead if a
 single-threaded runtime is a hard requirement.
 
-## Windows requires `wintun.dll`
+## 🪟 Windows requires `wintun.dll`
 
 `tun_rs::DeviceBuilder::build_sync`/`build_async` for a TUN device (the kind
 this crate's `privileged_tests` and the facade's Quick Start both use) loads
@@ -300,7 +363,7 @@ driver installed (without it, `open` for a TAP device also fails with
 `Error::DriverUnavailable`) — see `tun-rs`'s own README for details neither
 this crate nor `tunnel-lattice` re-derives.
 
-## Persistent devices and multi-queue
+## 🔀 Persistent devices and multi-queue
 
 Both gated by `Capability::PERSISTENT_DEVICES`/`Capability::MULTI_QUEUE`,
 Linux-only:
@@ -321,7 +384,7 @@ supports, so sharing one `Handle` clone across threads and calling them
 concurrently is always safe — see `tunnel_lattice::Handle`'s rustdoc and
 `ARCHITECTURE.md`'s "Ownership and concurrency contract."
 
-## Why this is one shared crate, not three
+## 🏗️ Why this is one shared crate, not three
 
 `tun-rs` already abstracts Linux/Windows/macOS/BSD TUN/TAP differences
 internally, so unlike `net-lattice`'s per-OS backend split there is no
@@ -330,7 +393,17 @@ platform-specific Rust code to isolate here yet. See the workspace
 per-OS backend (bypassing `tun-rs` entirely) would slot in alongside this
 crate behind the same `tunnel-lattice-platform` traits.
 
-## Usage
+## 📖 Documentation
 
-Not used directly — see the `tunnel-lattice` facade, which selects this
-backend by default.
+- **API reference**: [docs.rs/tunnel-lattice-backend-tunrs](https://docs.rs/tunnel-lattice-backend-tunrs)
+- **Facade**: [`tunnel-lattice`](https://crates.io/crates/tunnel-lattice), which selects this backend by default
+- **Project**: [github.com/F000NKKK/tunnel-lattice](https://github.com/F000NKKK/tunnel-lattice)
+
+## 📄 License
+
+Licensed under the [Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).
+
+## 🌟 Acknowledgments
+
+Built on [`tun-rs`](https://github.com/tun-rs/tun-rs) and, on Windows,
+[Wintun](https://www.wintun.net/).
