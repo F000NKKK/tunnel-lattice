@@ -8,7 +8,7 @@
 //!
 //! | OS | Native signal | Result |
 //! |---|---|---|
-//! | Linux, macOS | `Interrupted` with raw `EINTR` | retried (re-enters the blocking read or readiness wait) |
+//! | Linux, macOS | raw `EINTR` (`Interrupted`) | retried (re-enters the blocking read or readiness wait) |
 //! | macOS | code-less `UnexpectedEof`, message exactly `"recv buffer is empty"` (feth TAP: a BPF read with no complete frame) | retried |
 //! | Linux, macOS (recv) | `Ok(n)` with `n > buf.len()` from the sentinel read | [`Error::BufferTooSmall`] |
 //! | macOS (recv) | code-less `InvalidData` (feth TAP: frame larger than the buffer) | [`Error::BufferTooSmall`] |
@@ -56,9 +56,11 @@ pub(crate) enum Step {
 /// Returns `true` for a transient native error that `recv`/`send` retry
 /// instead of reporting (see the module table).
 pub(crate) fn is_transient(os: HostOs, err: &io::Error) -> bool {
-    let eintr = matches!(os, HostOs::Linux | HostOs::Macos)
-        && err.kind() == io::ErrorKind::Interrupted
-        && err.raw_os_error() == Some(EINTR);
+    // Matched on the raw code alone: on Linux and macOS code 4 is always
+    // `EINTR` (which std decodes as `Interrupted`), whereas `kind()` is
+    // decoded with the *running* host's table, so a kind check would make
+    // the Linux/macOS rule fail when the tests run on Windows.
+    let eintr = matches!(os, HostOs::Linux | HostOs::Macos) && err.raw_os_error() == Some(EINTR);
     let feth_empty_read = os == HostOs::Macos
         && err.kind() == io::ErrorKind::UnexpectedEof
         && err.raw_os_error().is_none()
