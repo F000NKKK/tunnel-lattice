@@ -18,6 +18,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(any(all(target_os = "macos", feature = "async"), all(test, unix)))]
+mod macos_tap;
 mod open_contract;
 mod recv_contract;
 #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -124,6 +126,17 @@ impl TunRsBackend {
 /// duplicate is owned by this handle, costs one extra descriptor, and
 /// closes with it. Sending stays on the `tun-rs` handle.
 ///
+/// On macOS with `async-io` or `tokio`, a TAP (`feth`) device's `recv`
+/// waits for its BPF read descriptor itself instead of through `tun-rs`:
+/// on a blocking-pool thread, in waits of at most 250 ms, checking at each
+/// timeout that the descriptor is still bound to its interface. macOS
+/// readiness notification for BPF does not report the interface going
+/// away, so a wait without that check would never end (see "When the
+/// device goes away"). `tun-rs` still reads every packet. This costs one
+/// extra descriptor per TAP handle, closed with it, and a pipe per pending
+/// wait, released as soon as the wait ends or its `recv` is dropped.
+/// Sending, and a macOS TUN (`utun`) device, stay on the `tun-rs` handle.
+///
 /// # Receiving packets
 ///
 /// `recv` (sync [`PacketIo`] and, with an async feature, `AsyncPacketIo`)
@@ -154,7 +167,7 @@ impl TunRsBackend {
 ///
 /// | OS | Native error | [`Error`] |
 /// |---|---|---|
-/// | macOS (and Linux, for symmetry) | `ENXIO`: on macOS, the TAP's BPF descriptor after its `feth` interface was destroyed | [`Error::Disconnected`] |
+/// | macOS (and Linux, for symmetry) | `ENXIO`: on macOS, the TAP's BPF descriptor after the peer `feth` it is bound to was destroyed | [`Error::Disconnected`] |
 /// | Linux | `EBADFD`: the device was deleted and its queue detached | [`Error::Disconnected`] |
 /// | Linux (`recv`) | `EFAULT`: a blocking read already waiting when the device was deleted | [`Error::Disconnected`] |
 /// | Windows TUN (`send`) | Wintun reports the adapter terminating (`tun-rs` returns `WriteZero`) | [`Error::Disconnected`] |
@@ -162,7 +175,9 @@ impl TunRsBackend {
 ///
 /// So on Linux, deleting the device (for example with `ip link del`) ends
 /// a pending or later `recv` with [`Error::Disconnected`] in every feature
-/// set. A `PacketStream` from `tunnel-lattice-async` ends after any of
+/// set, and so does destroying the peer `feth` of a macOS TAP device (with
+/// `async-io` or `tokio`, a pending `recv` notices within about 250 ms).
+/// A `PacketStream` from `tunnel-lattice-async` ends after any of
 /// these errors (every error except [`Error::BufferTooSmall`] ends it).
 pub struct TunRsDevice {
     kind: DeviceKind,
@@ -170,6 +185,11 @@ pub struct TunRsDevice {
     /// `handle` so it drops, and deregisters, first.
     #[cfg(all(target_os = "linux", feature = "tokio"))]
     reader: tokio_linux::ErrorAwareReader,
+    /// The bounded receive wait of a macOS TAP device (see above); `None`
+    /// for TUN. Declared before `handle` so its duplicate descriptor closes
+    /// first.
+    #[cfg(all(target_os = "macos", feature = "async"))]
+    tap_wait: Option<macos_tap::BpfWait>,
     #[cfg(feature = "async")]
     handle: tun_rs::AsyncDevice,
     #[cfg(not(feature = "async"))]
@@ -330,6 +350,13 @@ impl DeviceProvider for TunRsBackend {
             // attached persistent one is detached.
             #[cfg(all(target_os = "linux", feature = "tokio"))]
             reader: tokio_linux::ErrorAwareReader::new(&*handle).map_err(io_error)?,
+            // On failure `handle` drops, which destroys the new `feth` pair
+            // (`reuse_dev(false)` above, so the pair is always ours).
+            #[cfg(all(target_os = "macos", feature = "async"))]
+            tap_wait: match config.kind {
+                DeviceKind::Tap => Some(macos_tap::BpfWait::new(&*handle).map_err(io_error)?),
+                _ => None,
+            },
             handle,
         })
     }
@@ -398,10 +425,20 @@ impl TunRsDevice {
     }
 
     /// Async receive with the `recv` error contract applied. On Linux with
-    /// `tokio` it reads through the error-aware duplicate descriptor (see
-    /// [`TunRsDevice`]), otherwise through the `tun-rs` handle.
+    /// `tokio` it reads through the error-aware duplicate descriptor, and a
+    /// macOS TAP device waits through its bounded BPF wait (see
+    /// [`TunRsDevice`]); otherwise it reads and waits through the `tun-rs`
+    /// handle.
     #[cfg(feature = "async")]
     async fn async_recv(&self, buf: &mut [u8]) -> Result<usize> {
+        #[cfg(target_os = "macos")]
+        if let Some(wait) = &self.tap_wait {
+            let source = macos_tap::TapSource {
+                handle: &self.handle,
+                wait,
+            };
+            return recv_contract::recv_async(open_contract::HOST_OS, &source, buf).await;
+        }
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         let source = &self.reader;
         #[cfg(not(all(target_os = "linux", feature = "tokio")))]
@@ -435,7 +472,9 @@ fn sentinel_recv(handle: &tun_rs::SyncDevice, buf: &mut [u8]) -> std::io::Result
 
 /// The async counterpart of `sentinel_recv`, re-awaited by
 /// `recv_contract::recv_async` after a transient error. Not used on Linux
-/// with `tokio`, which receives through `tokio_linux::ErrorAwareReader`.
+/// with `tokio`, which receives through `tokio_linux::ErrorAwareReader`,
+/// nor for a macOS TAP device, which receives through
+/// `macos_tap::TapSource`.
 #[cfg(all(feature = "async", not(all(target_os = "linux", feature = "tokio"))))]
 impl recv_contract::AsyncRecvSource for tun_rs::AsyncDevice {
     async fn recv_native(&self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -1101,8 +1140,10 @@ mod privileged_tests {
 
     /// Gives the test's own device `subnet.1` and returns where to send UDP
     /// so the host routes it into the device: the peer `subnet.2` for TUN
-    /// (no link-layer resolution), the subnet broadcast for Linux TAP (no
-    /// ARP needed). The address lives on the device and goes away with it.
+    /// (no link-layer resolution), the subnet broadcast for TAP (no ARP
+    /// needed). A macOS `utun` gets a point-to-point address; a macOS
+    /// `feth` TAP, an Ethernet interface, gets a `/24` like Linux. The
+    /// address lives on the device and goes away with it.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn route_traffic_into(kind: DeviceKind, name: &str, subnet: [u8; 3]) -> std::net::SocketAddr {
         let [a, b, c] = subnet;
@@ -1114,7 +1155,13 @@ mod privileged_tests {
             run_host_command("ip", &["link", "set", "dev", name, "up"]);
         }
         #[cfg(target_os = "macos")]
-        run_host_command("ifconfig", &[name, "inet", &local, &peer, "up"]);
+        match kind {
+            DeviceKind::Tap => run_host_command(
+                "ifconfig",
+                &[name, "inet", &local, "netmask", "255.255.255.0", "up"],
+            ),
+            _ => run_host_command("ifconfig", &[name, "inet", &local, &peer, "up"]),
+        }
         #[cfg(target_os = "windows")]
         run_host_command(
             "netsh",
@@ -1171,6 +1218,15 @@ mod privileged_tests {
         );
         let snapshot = device.snapshot().expect("snapshot the device");
         let buf_len = snapshot.recv_buffer_len();
+        // A macOS `feth` pair outlives the process, so it gets the teardown
+        // guards; its peer (where the BPF descriptor reads) must be up to
+        // receive the frames the host sends out of `dev`.
+        #[cfg(target_os = "macos")]
+        let _feth = (kind == DeviceKind::Tap).then(|| {
+            let feth = guard_feth_pair(&snapshot.name);
+            run_host_command("ifconfig", &[&feth.peer, "up"]);
+            feth
+        });
         let target = route_traffic_into(kind, &snapshot.name, subnet);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1260,6 +1316,22 @@ mod privileged_tests {
         assert_oversize_packet_is_rejected_then_next_recv_succeeds(
             DeviceKind::Tap,
             [10, 202, subnet_octet()],
+        );
+    }
+
+    /// The macOS `feth` TAP rejects a frame larger than the buffer with
+    /// `InvalidData`, reported as `BufferTooSmall`, and the next `recv`
+    /// succeeds. In the async builds this is also the data path through the
+    /// bounded BPF wait: every `recv` here that finds no queued frame waits
+    /// in it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open and address a feth TAP device"]
+    fn tap_oversize_frame_reports_buffer_too_small_and_the_next_recv_succeeds_on_macos() {
+        let _serial = serialize_feth_tests();
+        assert_oversize_packet_is_rejected_then_next_recv_succeeds(
+            DeviceKind::Tap,
+            [10, 203, subnet_octet()],
         );
     }
 
@@ -1613,6 +1685,20 @@ mod privileged_tests {
         assert_linux_delete_ends_the_stream(DeviceKind::Tap, "pdel");
     }
 
+    /// Serializes the privileged macOS `feth` tests. macOS hands a new
+    /// `feth` the lowest free `fethN` name, and both the teardown guards and
+    /// `tun-rs`'s own drop destroy the pair by name, so a test whose pair was
+    /// already destroyed could otherwise destroy a concurrent test's freshly
+    /// created pair. Take it as the test's first local, so it is released
+    /// only after the device and every guard have dropped.
+    #[cfg(target_os = "macos")]
+    fn serialize_feth_tests() -> std::sync::MutexGuard<'static, ()> {
+        static FETH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        FETH_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The peer of the macOS TAP's `feth` interface `dev`, read from the
     /// `peer: fethN` line of `ifconfig <dev>`. `tun-rs` creates a `feth`
     /// pair and binds its BPF read descriptor to the peer, but does not
@@ -1632,19 +1718,52 @@ mod privileged_tests {
             .unwrap_or_else(|| panic!("no `peer:` line in `ifconfig {dev}`:\n{stdout}"))
     }
 
+    /// The teardown guards of a macOS TAP's `feth` pair, and the peer's
+    /// name. The fields drop in declaration order, so the peer is destroyed
+    /// before `dev`.
+    #[cfg(target_os = "macos")]
+    struct FethPair {
+        /// The peer, the interface the BPF read descriptor is bound to.
+        peer: String,
+        _peer_guard: RemoveOnDrop,
+        _dev_guard: RemoveOnDrop,
+    }
+
+    /// Arms the teardown guards of the `feth` pair whose `dev` side is
+    /// `dev`. The `dev` guard is armed before the peer is looked up, so a
+    /// failed lookup still removes `dev`.
+    #[cfg(target_os = "macos")]
+    fn guard_feth_pair(dev: &str) -> FethPair {
+        let dev_guard = RemoveOnDrop {
+            program: "ifconfig",
+            args: vec![dev.to_owned(), "destroy".into()],
+        };
+        let peer = feth_peer_of(dev);
+        let peer_guard = RemoveOnDrop {
+            program: "ifconfig",
+            args: vec![peer.clone(), "destroy".into()],
+        };
+        FethPair {
+            peer,
+            _peer_guard: peer_guard,
+            _dev_guard: dev_guard,
+        }
+    }
+
     /// Destroying the peer of the macOS TAP's `feth` pair with `ifconfig
-    /// <peer> destroy` while a stream is polling ends the stream. The peer
-    /// is the interface the BPF read descriptor is bound to; destroying
-    /// the other (`dev`) side would only unpeer it and the read would keep
-    /// waiting. The one terminal item is either `Disconnected` (the
-    /// blocking BPF read fails with `ENXIO`) or
-    /// `Platform(PlatformErrorCode::Unknown)` (the async builds' `select`
-    /// loop reports the descriptor's poll error as a code-less
-    /// `"fd error"`); the test prints which one occurred.
+    /// <peer> destroy` while a stream is polling ends the stream with
+    /// exactly `Disconnected`, in every feature set. The peer is the
+    /// interface the BPF read descriptor is bound to; destroying the other
+    /// (`dev`) side would only unpeer it and the read would keep waiting.
+    /// The sync build's blocking BPF read is woken and fails with `ENXIO`;
+    /// in the async builds the bounded BPF wait finds the descriptor
+    /// unbound at its next check, and the read that follows fails with
+    /// `ENXIO`. The test prints the terminal item.
     #[test]
     #[cfg(target_os = "macos")]
     #[ignore = "requires root to open and destroy a feth TAP device"]
     fn tap_stream_ends_when_the_feth_is_destroyed_on_macos() {
+        let _serial = serialize_feth_tests();
         #[cfg(feature = "tokio")]
         let runtime = enter_tokio_runtime();
         #[cfg(feature = "tokio")]
@@ -1654,39 +1773,89 @@ mod privileged_tests {
             .open(DeviceConfig::new(DeviceKind::Tap))
             .expect("open a feth TAP device");
         let dev = device.snapshot().expect("snapshot the device").name;
-        // Armed first so it drops last: locals drop in reverse order, so
-        // the peer is destroyed before `dev`.
-        let _dev_guard = RemoveOnDrop {
-            program: "ifconfig",
-            args: vec![dev.clone(), "destroy".into()],
-        };
-        let peer = feth_peer_of(&dev);
-        let _peer_guard = RemoveOnDrop {
-            program: "ifconfig",
-            args: vec![peer.clone(), "destroy".into()],
-        };
+        let feth = guard_feth_pair(&dev);
         let drained = drain_stream_across_teardown(device, |_| {
-            run_host_command("ifconfig", &[&peer, "destroy"]);
+            run_host_command("ifconfig", &[&feth.peer, "destroy"]);
             true
         })
         .expect("the teardown ran");
         assert_ended_after_one_error("feth peer destroy", &drained);
         let terminal = &drained.errors[0];
         eprintln!("feth peer destroy: terminal item {terminal:?}");
-        assert!(
-            matches!(
-                terminal,
-                Error::Disconnected | Error::Platform(PlatformErrorCode::Unknown)
-            ),
-            "{drained:?}"
+        assert!(matches!(terminal, Error::Disconnected), "{drained:?}");
+    }
+
+    /// A `PacketIo::recv` waiting when the peer of the macOS TAP's `feth`
+    /// pair is destroyed returns `Disconnected`, and does so within 5 s of
+    /// the destroy: the sync build's blocking BPF read is woken at once,
+    /// and the async builds' bounded BPF wait checks the descriptor's
+    /// binding every 250 ms (without it, the async builds would wait
+    /// forever). Unsolicited frames that arrive first are skipped. The
+    /// receiving thread is bounded by a 30 s wait; the guards destroy the
+    /// pair on every exit path that unwinds.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open and destroy a feth TAP device"]
+    fn recv_returns_disconnected_when_the_feth_is_destroyed_on_macos() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _serial = serialize_feth_tests();
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(DeviceKind::Tap))
+                .expect("open a feth TAP device"),
         );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let feth = guard_feth_pair(&snapshot.name);
+        let buf_len = snapshot.recv_buffer_len();
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        {
+            let device = Arc::clone(&device);
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                #[cfg(feature = "tokio")]
+                let _entered = runtime.enter();
+                let mut buf = vec![0u8; buf_len];
+                let err = loop {
+                    if let Err(err) = PacketIo::recv(&*device, &mut buf) {
+                        break err;
+                    }
+                };
+                let _ = done.send(err);
+            });
+        }
+
+        // Let the receiver reach its blocking read or bounded wait first.
+        std::thread::sleep(Duration::from_millis(500));
+        run_host_command("ifconfig", &[&feth.peer, "destroy"]);
+        let destroyed = Instant::now();
+        match outcome.recv_timeout(Duration::from_secs(30)) {
+            Ok(err) => {
+                let elapsed = destroyed.elapsed();
+                eprintln!("feth peer destroy: recv returned {err:?} after {elapsed:?}");
+                assert!(matches!(err, Error::Disconnected), "{err:?}");
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "recv returned {elapsed:?} after the destroy, expected under 5 s"
+                );
+            }
+            Err(_) => panic!("recv did not return within 30 s of the feth peer destroy"),
+        }
     }
 
     /// `ifconfig <utun> destroy` while a stream is polling. A `utun`
     /// interface is created through a kernel-control socket, not an
     /// interface cloner, so the kernel is expected to refuse the destroy;
     /// the test then records that nothing was torn down (only the `feth`
-    /// test above exercises macOS teardown) and leaves the device to be
+    /// tests above exercise macOS teardown) and leaves the device to be
     /// removed when the test process exits. If the destroy does succeed,
     /// the stream must end like on every other platform.
     #[test]

@@ -16,7 +16,7 @@ readme = "README.md"
 # Internal marker: "we have a tun_rs::AsyncDevice handle", turned on by
 # whichever concrete async runtime feature below is selected. Never enable
 # this directly.
-async = ["tunnel-lattice-platform/async", "dep:futures"]
+async = ["tunnel-lattice-platform/async", "dep:futures", "dep:blocking"]
 # `async-io`/`tokio` select tun-rs's own two mutually exclusive async
 # backends (verified in tun-rs 2.8.11's Cargo.toml: `async_io` = async-io +
 # `blocking`, no tokio dependency; `async_tokio` = tokio + `blocking`).
@@ -51,6 +51,14 @@ tokio = { version = "1.49", default-features = false, features = ["rt", "rt-mult
 # package to Cargo.lock.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
+
+# The macOS TAP receive path in async builds runs its bounded BPF wait on
+# the `blocking` thread pool (see `src/macos_tap.rs`), the pool tun-rs itself
+# waits on there. tun-rs 2.8.11 already requires `blocking` 1.6 for both of
+# its async backends (locked at 1.7.0), so this adds no package to
+# Cargo.lock. Enabled by the internal `async` feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+blocking = { version = "1.7", optional = true }
 
 # `open` recognizes a failed wintun.dll load by downcasting the
 # `libloading::Error` that tun-rs wraps with `io::Error::other`. This MUST

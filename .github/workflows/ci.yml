@@ -189,6 +189,20 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --nocapture
 
+      # A macOS TAP device is a `feth` interface pair, a cloned interface
+      # that outlives the test process, so the privileged tests must tear
+      # down every pair they create (the device's own drop, or the tests'
+      # teardown guards on a failure). Fails the job if any `feth` interface
+      # is left on the runner, also after a failed test run.
+      - name: No feth interface left behind (macOS)
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        run: |
+          leftover=$(ifconfig -l | tr ' ' '\n' | grep '^feth' || true)
+          if [ -n "$leftover" ]; then
+            echo "::error::feth interfaces left behind by the privileged tests: $(echo $leftover)"
+            exit 1
+          fi
+
       # windows-latest runners already execute as Administrator; opening a
       # TUN/TAP device there does not need an explicit elevation step the
       # way `sudo` provides one on Linux/macOS. The missing-driver tests ran
