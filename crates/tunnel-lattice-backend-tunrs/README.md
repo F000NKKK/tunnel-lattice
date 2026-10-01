@@ -57,9 +57,9 @@ error into a typed `tunnel_lattice_core::Error`.
   `tokio::runtime::Handle::current().block_on` — required because a
   Tokio-backed `AsyncDevice`'s readiness is only ever delivered by Tokio's
   own I/O driver, which `futures::executor::block_on` never polls (a real
-  `send()` call hangs forever otherwise; see the "Runtime requirement"
-  caveat below). Either way, this crate also implements the native
-  `AsyncPacketIo` directly on the same handle, reporting
+  `send()` call hangs forever otherwise; see "`tokio` requires a
+  multi-threaded runtime" below). Either way, this crate also implements
+  the native `AsyncPacketIo` directly on the same handle, reporting
   `Capability::NATIVE_ASYNC`. Without either feature, the handle is a
   `tun_rs::SyncDevice` and `PacketIo` calls it directly.
 - ✅ Administrative-state read-back (`DeviceObserver::snapshot`'s
@@ -138,7 +138,8 @@ so a `match` on it needs a wildcard arm.
 packet larger than the caller's buffer is discarded and reported as
 `Error::BufferTooSmall`; the device stays usable and the next `recv`
 returns the next packet. A buffer of `Device::recv_buffer_len()` bytes (the
-MTU for TUN, MTU + 18 for TAP) is always large enough.
+MTU for TUN, MTU + 18 for TAP) is large enough at the device's current
+MTU, except for a double-tagged (QinQ) TAP frame.
 
 How the oversize case is detected depends on the platform:
 

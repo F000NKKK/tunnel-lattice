@@ -63,6 +63,8 @@ contracts; it never inspects or changes the host system.
 ```toml
 [dependencies]
 tunnel-lattice-model = "0.4"
+# For `tunnel_lattice_core::Error`, used in the example below
+tunnel-lattice-core = "0.4"
 ```
 
 ## 🎓 Quick Start

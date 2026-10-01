@@ -159,8 +159,10 @@ fn main() -> Result<()> {
 }
 ```
 
-`recv_buffer_len()` is the MTU for TUN and MTU + 18 for TAP, which always
-fits one packet at the current MTU.
+`recv_buffer_len()` is the MTU for TUN and MTU + 18 for TAP (the Ethernet
+header and one VLAN tag), which fits one packet at the current MTU except
+a double-tagged (QinQ) TAP frame. A packet that does not fit is never
+truncated: it is discarded and reported as `Error::BufferTooSmall`.
 
 ### Async Packet Stream (Tokio)
 
@@ -202,8 +204,11 @@ fn main() -> tunnel_lattice::Result<()> {
 ### Assigning an Address with net-lattice
 
 Tunnel Lattice creates the interface; `net-lattice` configures it. The two
-crates share no object IDs on purpose, so bridge them by the interface
-name:
+crates share no object IDs on purpose: a `tunnel_lattice::DeviceId` and a
+`net_lattice::InterfaceId` are distinct phantom-typed wrappers even when
+their native index happens to coincide, so the compiler never lets you
+pass one where the other is expected. Bridge them by the OS-assigned
+interface name, the one field both sides expose in the same shape:
 
 ```rust,no_run
 use net_lattice::Lattice;
@@ -223,8 +228,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Always read the actual name back from `snapshot()`, never from the
-`DeviceConfig` you passed in.
+With no `name` on `DeviceConfig`, the backend or OS picks one. A requested
+name the platform cannot honor as given is rejected by `open` with
+`Error::InvalidState`, and a name already in use with `Error::AlreadyExists`;
+see `DeviceConfig::name` for the accepted formats and the cases where `open`
+attaches to an existing device instead (a Linux persistent or multi-queue
+device, a Windows Wintun adapter). Always read the actual name back from
+`snapshot()`/the returned `Device`, never from the `DeviceConfig` you
+passed in.
 
 ## 🔧 Platform-Specific Setup
 

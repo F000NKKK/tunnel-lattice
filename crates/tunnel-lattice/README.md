@@ -211,7 +211,7 @@ not a requirement for sharing a device across threads — see [Ownership](#-owne
 ## 🔐 Platform and Privilege Notes
 
 Creating a TUN/TAP device generally requires `CAP_NET_ADMIN` on Linux,
-Administrator on Windows, or root on macOS/BSD. Runtime `Capability` flags
+Administrator on Windows, or root on macOS. Runtime `Capability` flags
 describe implemented surfaces, not a guarantee the current process is
 authorized.
 

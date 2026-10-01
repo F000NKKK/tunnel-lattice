@@ -70,6 +70,9 @@ the crate depends only on `tunnel-lattice-core`, `tunnel-lattice-platform`
 ```toml
 [dependencies]
 tunnel-lattice-async = "0.4"
+# Used by the example below
+futures = "0.3"
+tunnel-lattice-platform = { version = "0.4", features = ["async"] }
 ```
 
 ## 🎓 Quick Start
