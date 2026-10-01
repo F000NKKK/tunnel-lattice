@@ -325,6 +325,22 @@ jobs:
             exit 1
           }
 
+      # The facade's Windows concurrency test adds an inbound ICMP echo
+      # firewall rule named `tunnel-lattice-test-echo-<address>` (netsh's
+      # `name=` is the rule's display name) and removes it on every exit
+      # path. Fails the job if one is left on the runner, also after a
+      # failed test run.
+      - name: No test firewall rule left behind (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $left = @(Get-NetFirewallRule -DisplayName 'tunnel-lattice-test-echo-*' -ErrorAction SilentlyContinue)
+          if ($left.Count -gt 0) {
+            $left | Format-Table DisplayName, Direction, Action, Enabled -AutoSize | Out-String | Write-Host
+            Write-Host "::error::firewall rules left behind by the privileged tests"
+            exit 1
+          }
+
       # On a failure, records why a driver might not have loaded: test
       # signing, the staged packages, devices with a problem code, Code
       # Integrity events, and the tail of the SetupAPI device log.
