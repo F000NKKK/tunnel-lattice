@@ -188,18 +188,15 @@ oversize packet yields `BufferTooSmall` and the stream keeps going.
 ### Persistent Device and Multi-Queue (Linux)
 
 ```rust,no_run
-# #[cfg(target_os = "linux")]
-# fn main() -> tunnel_lattice::Result<()> {
 use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
 
-let device = Tunnel::connect()
-    .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
-device.persist()?;                          // survives this process exiting
-let second_queue = device.additional_queue()?; // for another thread
-# Ok(())
-# }
-# #[cfg(not(target_os = "linux"))]
-# fn main() {}
+fn main() -> tunnel_lattice::Result<()> {
+    let device = Tunnel::connect()
+        .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
+    device.persist()?;                             // survives this process exiting
+    let second_queue = device.additional_queue()?; // for another thread
+    Ok(())
+}
 ```
 
 ### Assigning an Address with net-lattice
@@ -212,16 +209,18 @@ name:
 use net_lattice::Lattice;
 use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
 
-let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
-let snapshot = device.snapshot()?; // `snapshot.name`, e.g. "tun0"
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
+    let snapshot = device.snapshot()?; // `snapshot.name`, e.g. "tun0"
 
-let interface = Lattice::connect()?
-    .interfaces()?
-    .into_iter()
-    .find(|i| i.name == snapshot.name)
-    .ok_or(net_lattice::Error::NotFound)?;
-// assign an address, bring it up, add routes through net-lattice from here.
-# Ok::<(), Box<dyn std::error::Error>>(())
+    let interface = Lattice::connect()?
+        .interfaces()?
+        .into_iter()
+        .find(|i| i.name == snapshot.name)
+        .ok_or(net_lattice::Error::NotFound)?;
+    // assign an address, bring it up, add routes through net-lattice from here.
+    Ok(())
+}
 ```
 
 Always read the actual name back from `snapshot()`, never from the

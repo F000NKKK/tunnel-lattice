@@ -189,18 +189,15 @@ async fn main() -> tunnel_lattice::Result<()> {
 ### Персистентное устройство и multi-queue (Linux)
 
 ```rust,no_run
-# #[cfg(target_os = "linux")]
-# fn main() -> tunnel_lattice::Result<()> {
 use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
 
-let device = Tunnel::connect()
-    .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
-device.persist()?;                          // переживёт завершение процесса
-let second_queue = device.additional_queue()?; // для другого потока
-# Ok(())
-# }
-# #[cfg(not(target_os = "linux"))]
-# fn main() {}
+fn main() -> tunnel_lattice::Result<()> {
+    let device = Tunnel::connect()
+        .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
+    device.persist()?;                             // переживёт завершение процесса
+    let second_queue = device.additional_queue()?; // для другого потока
+    Ok(())
+}
 ```
 
 ### Назначение адреса через net-lattice
@@ -213,16 +210,18 @@ Tunnel Lattice создаёт интерфейс, `net-lattice` его наст�
 use net_lattice::Lattice;
 use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
 
-let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
-let snapshot = device.snapshot()?; // snapshot.name, например "tun0"
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
+    let snapshot = device.snapshot()?; // snapshot.name, например "tun0"
 
-let interface = Lattice::connect()?
-    .interfaces()?
-    .into_iter()
-    .find(|i| i.name == snapshot.name)
-    .ok_or(net_lattice::Error::NotFound)?;
-// дальше — адрес, поднятие интерфейса и маршруты через net-lattice.
-# Ok::<(), Box<dyn std::error::Error>>(())
+    let interface = Lattice::connect()?
+        .interfaces()?
+        .into_iter()
+        .find(|i| i.name == snapshot.name)
+        .ok_or(net_lattice::Error::NotFound)?;
+    // дальше — адрес, поднятие интерфейса и маршруты через net-lattice.
+    Ok(())
+}
 ```
 
 Фактическое имя всегда берите из `snapshot()`, а не из переданного

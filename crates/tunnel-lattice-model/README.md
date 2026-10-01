@@ -70,16 +70,18 @@ tunnel-lattice-model = "0.4"
 ```rust
 use tunnel_lattice_model::{DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, DesiredAdminState};
 
-let config = DeviceConfig::new(DeviceKind::Tun)
-    .with_name("tun0")
-    .with_mtu(1500)
-    .with_multi_queue(true);
-assert_eq!(config.kind, DeviceKind::Tun);
-assert!(config.multi_queue);
+fn main() -> Result<(), tunnel_lattice_core::Error> {
+    let config = DeviceConfig::new(DeviceKind::Tun)
+        .with_name("tun0")
+        .with_mtu(1500)
+        .with_multi_queue(true);
+    assert_eq!(config.kind, DeviceKind::Tun);
+    assert!(config.multi_queue);
 
-let patch = DeviceConfigPatch::new(DeviceId::new(1), Some(DesiredAdminState::Up), None)?;
-assert_eq!(patch.admin_state(), Some(DesiredAdminState::Up));
-# Ok::<(), tunnel_lattice_core::Error>(())
+    let patch = DeviceConfigPatch::new(DeviceId::new(1), Some(DesiredAdminState::Up), None)?;
+    assert_eq!(patch.admin_state(), Some(DesiredAdminState::Up));
+    Ok(())
+}
 ```
 
 ## 📖 Documentation
