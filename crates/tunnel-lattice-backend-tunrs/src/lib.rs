@@ -3063,58 +3063,31 @@ mod privileged_tests {
         );
     }
 
-    /// Observational: what a Windows TAP read that is already waiting when
-    /// `apply(Down)` disconnects the media returns, once through the
-    /// `recv` contract and once as the raw `tun-rs` read (no contract),
-    /// each on its own adapter. Prints each outcome after 2 s and, if it
-    /// is still waiting, after 10 s, plus the admin state; asserts nothing.
+    /// A Windows TAP `recv` already waiting when `apply(Down)` disconnects
+    /// the adapter's media is not ended by it: tap-windows fails only the
+    /// reads issued while the media is disconnected, so the waiting read
+    /// keeps waiting, as on a down Linux device. The test checks that the
+    /// call is still waiting 10 s after `apply(Down)` (the admin state
+    /// reads `Down`), and still waiting 2 s after a later `apply(Up)` (the
+    /// admin state reads `Up`). Disabling the adapter with
+    /// `Disable-NetAdapter` ([`release_waiting_recv`]) then ends it within
+    /// 30 s with exactly `InvalidState`, and the call lets go of the
+    /// device. Frames that arrive meanwhile are skipped. The test prints
+    /// how long each `apply` took and each step's elapsed time. A failing
+    /// assertion drops the [`BlockingCall`] first, which releases the call
+    /// before the device drops.
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Administrator and the tap-windows6 driver"]
     fn windows_tap_read_pending_across_apply_down() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
         let _serial = serialize_windows_tap_tests();
         #[cfg(feature = "tokio")]
         let runtime = enter_tokio_runtime();
         #[cfg(feature = "tokio")]
         let _entered = runtime.enter();
-
-        observe_read_across_down("contract recv", PacketIo::recv);
-        observe_read_across_down("raw tun-rs recv", |device, buf| {
-            let result = raw_tap_recv(device, buf);
-            eprintln!(
-                "raw tun-rs recv returned {result:?} (raw code {:?})",
-                result.as_ref().err().and_then(std::io::Error::raw_os_error)
-            );
-            result.map_err(io_error)
-        });
-    }
-
-    /// One `tun-rs` read on `device`'s handle, without the `recv`
-    /// contract, blocking the way [`TunRsDevice::blocking_recv`] does.
-    #[cfg(target_os = "windows")]
-    fn raw_tap_recv(device: &TunRsDevice, buf: &mut [u8]) -> std::io::Result<usize> {
-        #[cfg(feature = "tokio")]
-        {
-            tokio::runtime::Handle::current().block_on(device.handle.recv(buf))
-        }
-        #[cfg(all(feature = "async", not(feature = "tokio")))]
-        {
-            futures::executor::block_on(device.handle.recv(buf))
-        }
-        #[cfg(not(feature = "async"))]
-        {
-            device.handle.recv(buf)
-        }
-    }
-
-    /// Opens a TAP adapter, starts `read` in a loop that ends on the first
-    /// error (frames are skipped), applies `Down` once it waits, and
-    /// prints what the loop returns. A loop still waiting is released
-    /// ([`BlockingCall`]) before the device drops.
-    #[cfg(target_os = "windows")]
-    fn observe_read_across_down(label: &str, read: fn(&TunRsDevice, &mut [u8]) -> Result<usize>) {
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
 
         let device = Arc::new(
             TunRsBackend::new()
@@ -3125,32 +3098,82 @@ mod privileged_tests {
         let name = snapshot.name.clone();
         let buf_len = snapshot.recv_buffer_len();
         let (state, waited) = poll_admin_state(&device, AdminState::Up);
-        eprintln!("{label}: {state:?} {waited:?} after open");
+        eprintln!("windows TAP pending recv: {state:?} {waited:?} after open");
+        assert_eq!(state, AdminState::Up, "the adapter is up after open");
 
         let call = BlockingCall::spawn(&device, &name, move |device| {
             let mut buf = vec![0u8; buf_len];
+            // Skips frames until the first error.
             loop {
-                read(device, &mut buf)?;
+                PacketIo::recv(device, &mut buf)?;
             }
         });
         // Let it reach its wait first.
         std::thread::sleep(Duration::from_millis(500));
+        let before = call.wait(Duration::ZERO);
+        assert!(
+            before.is_none(),
+            "recv waits before apply(Down): {before:?}"
+        );
+
         let applied = Instant::now();
         let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
             .expect("build a patch");
         device.apply(patch).expect("apply Down");
         let apply_took = applied.elapsed();
-        let first = call.wait(Duration::from_secs(2));
+        let (state, waited) = poll_admin_state(&device, AdminState::Down);
         eprintln!(
-            "{label}: pending across apply(Down) (apply took {apply_took:?}): {first:?} after {:?}",
+            "windows TAP pending recv: apply(Down) took {apply_took:?}, {state:?} after {waited:?}"
+        );
+        assert_eq!(state, AdminState::Down, "the adapter is down after apply");
+        let across_down = call.wait(Duration::from_secs(10));
+        eprintln!(
+            "windows TAP pending recv across apply(Down): {across_down:?} after {:?}",
             applied.elapsed()
         );
-        if first.is_none() {
-            let later = call.wait(Duration::from_secs(8));
-            eprintln!("{label}: {later:?} after {:?}", applied.elapsed());
-        }
-        let state = device.snapshot().map(|snapshot| snapshot.admin_state);
-        eprintln!("{label}: admin state at the end: {state:?}");
+        assert!(
+            across_down.is_none(),
+            "a recv already waiting when Down is applied keeps waiting: {across_down:?}"
+        );
+
+        let applied = Instant::now();
+        let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Up), None)
+            .expect("build a patch");
+        device.apply(patch).expect("apply Up");
+        let apply_took = applied.elapsed();
+        let (state, waited) = poll_admin_state(&device, AdminState::Up);
+        eprintln!(
+            "windows TAP pending recv: apply(Up) took {apply_took:?}, {state:?} after {waited:?}"
+        );
+        assert_eq!(state, AdminState::Up, "the adapter is up again after apply");
+        let across_up = call.wait(Duration::from_secs(2));
+        eprintln!(
+            "windows TAP pending recv across apply(Up): {across_up:?} after {:?}",
+            applied.elapsed()
+        );
+        assert!(
+            across_up.is_none(),
+            "a recv already waiting when Down is applied is not ended by Up: {across_up:?}"
+        );
+
+        let released = Instant::now();
+        release_waiting_recv(&device, &name, None);
+        let ended = call.wait(Duration::from_secs(30));
+        eprintln!(
+            "windows TAP pending recv after Disable-NetAdapter: {ended:?} after {:?}",
+            released.elapsed()
+        );
+        assert!(
+            matches!(ended, Some(Err(Error::InvalidState))),
+            "Disable-NetAdapter ends the waiting recv with InvalidState: {ended:?}"
+        );
+        // The call returned, so this only joins its thread.
+        drop(call);
+        assert_eq!(
+            Arc::strong_count(&device),
+            1,
+            "the receiver let go of the device"
+        );
     }
 
     /// A TAP device opened with a MAC address reports it, reports
