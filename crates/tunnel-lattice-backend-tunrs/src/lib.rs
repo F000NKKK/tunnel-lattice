@@ -565,26 +565,76 @@ impl DeviceMutator for TunRsDevice {
     type DeviceConfigPatch = DeviceConfigPatch;
 
     fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()> {
-        use tunnel_lattice_model::DesiredAdminState;
-
-        // Resolve the requested admin state before any native call, so a
-        // `DesiredAdminState` variant this backend does not know (the enum is
-        // `#[non_exhaustive]`) is rejected without changing the MTU first.
-        let enable = match patch.admin_state() {
-            None => None,
-            Some(DesiredAdminState::Up) => Some(true),
-            Some(DesiredAdminState::Down) => Some(false),
-            Some(_) => return Err(Error::Unsupported),
-        };
-        if let Some(mtu) = patch.mtu() {
-            let mtu = u16::try_from(mtu).map_err(|_| Error::InvalidState)?;
-            self.handle.set_mtu(mtu).map_err(io_error)?;
-        }
-        if let Some(enable) = enable {
-            self.handle.enabled(enable).map_err(io_error)?;
-        }
-        Ok(())
+        apply_patch(&*self.handle, self.id, &patch)
     }
+}
+
+/// The native steps [`apply_patch`] drives, split out so the ordering and
+/// compensation logic is testable without a real device.
+trait ApplySteps {
+    fn mtu(&self) -> Result<u16>;
+    fn set_mtu(&self, mtu: u16) -> Result<()>;
+    fn set_enabled(&self, enabled: bool) -> Result<()>;
+}
+
+impl ApplySteps for tun_rs::DeviceImpl {
+    fn mtu(&self) -> Result<u16> {
+        tun_rs::DeviceImpl::mtu(self).map_err(io_error)
+    }
+
+    fn set_mtu(&self, mtu: u16) -> Result<()> {
+        tun_rs::DeviceImpl::set_mtu(self, mtu).map_err(io_error)
+    }
+
+    fn set_enabled(&self, enabled: bool) -> Result<()> {
+        tun_rs::DeviceImpl::enabled(self, enabled).map_err(io_error)
+    }
+}
+
+/// [`DeviceMutator::apply`]'s contract: every precondition before any
+/// native call, then MTU before administrative state, and on a failed step
+/// a best-effort revert of the earlier ones before returning the original
+/// error.
+fn apply_patch(steps: &impl ApplySteps, id: DeviceId, patch: &DeviceConfigPatch) -> Result<()> {
+    use tunnel_lattice_model::DesiredAdminState;
+
+    if patch.device_id() != id {
+        return Err(Error::InvalidState);
+    }
+    let mtu = patch
+        .mtu()
+        .map(|mtu| u16::try_from(mtu).map_err(|_| Error::InvalidState))
+        .transpose()?;
+    // `DesiredAdminState` is `#[non_exhaustive]`: a variant this backend
+    // does not know is unsupported, not a malformed patch.
+    let enable = match patch.admin_state() {
+        None => None,
+        Some(DesiredAdminState::Up) => Some(true),
+        Some(DesiredAdminState::Down) => Some(false),
+        Some(_) => return Err(Error::Unsupported),
+    };
+
+    // Administrative state goes last: it cannot be read back off Linux, so
+    // it cannot be reverted. The MTU is read first only when a later step
+    // could need reverting.
+    let previous_mtu = match (mtu, enable) {
+        (Some(_), Some(_)) => Some(steps.mtu()?),
+        _ => None,
+    };
+    if let Some(mtu) = mtu {
+        steps.set_mtu(mtu)?;
+    }
+    if let Some(enable) = enable
+        && let Err(error) = steps.set_enabled(enable)
+    {
+        if let Some(previous) = previous_mtu {
+            // Best effort: the original error is what the caller needs, and
+            // `snapshot()` is authoritative after any `Err`.
+            let _ = steps.set_mtu(previous);
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -621,6 +671,203 @@ impl CapabilityProvider for TunRsDevice {
         {
             base
         }
+    }
+}
+
+/// Ordinary tests of [`apply_patch`]'s preconditions, ordering, and
+/// compensation against recorded fake steps (no device).
+#[cfg(test)]
+mod apply_tests {
+    use std::cell::RefCell;
+
+    use tunnel_lattice_model::DesiredAdminState;
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Call {
+        ReadMtu,
+        SetMtu(u16),
+        SetEnabled(bool),
+    }
+
+    /// Records every native call; each step fails when its flag is set.
+    #[derive(Default)]
+    struct Fake {
+        calls: RefCell<Vec<Call>>,
+        fail_read: bool,
+        fail_set_mtu: bool,
+        fail_enable: bool,
+    }
+
+    impl ApplySteps for Fake {
+        fn mtu(&self) -> Result<u16> {
+            self.calls.borrow_mut().push(Call::ReadMtu);
+            if self.fail_read {
+                return Err(Error::Platform(PlatformErrorCode::Unknown));
+            }
+            Ok(1500)
+        }
+
+        fn set_mtu(&self, mtu: u16) -> Result<()> {
+            self.calls.borrow_mut().push(Call::SetMtu(mtu));
+            if self.fail_set_mtu {
+                return Err(Error::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn set_enabled(&self, enabled: bool) -> Result<()> {
+            self.calls.borrow_mut().push(Call::SetEnabled(enabled));
+            if self.fail_enable {
+                return Err(Error::PermissionDenied);
+            }
+            Ok(())
+        }
+    }
+
+    const ID: DeviceId = DeviceId::new(3);
+
+    fn patch(
+        id: DeviceId,
+        admin: Option<DesiredAdminState>,
+        mtu: Option<u32>,
+    ) -> DeviceConfigPatch {
+        DeviceConfigPatch::new(id, admin, mtu).expect("a valid patch")
+    }
+
+    #[test]
+    fn a_patch_for_another_device_is_rejected_without_a_native_call() {
+        let fake = Fake::default();
+        let patch = patch(DeviceId::new(4), Some(DesiredAdminState::Up), Some(1400));
+        let result = apply_patch(&fake, ID, &patch);
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_mtu_above_u16_is_rejected_without_a_native_call() {
+        let fake = Fake::default();
+        let patch = patch(ID, Some(DesiredAdminState::Up), Some(70_000));
+        let result = apply_patch(&fake, ID, &patch);
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_single_step_skips_the_pre_read() {
+        let fake = Fake::default();
+        apply_patch(&fake, ID, &patch(ID, None, Some(1400))).expect("apply");
+        assert_eq!(*fake.calls.borrow(), [Call::SetMtu(1400)]);
+
+        let fake = Fake::default();
+        apply_patch(&fake, ID, &patch(ID, Some(DesiredAdminState::Down), None)).expect("apply");
+        assert_eq!(*fake.calls.borrow(), [Call::SetEnabled(false)]);
+    }
+
+    #[test]
+    fn both_steps_run_mtu_first_after_a_pre_read() {
+        let fake = Fake::default();
+        apply_patch(
+            &fake,
+            ID,
+            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
+        )
+        .expect("apply");
+        assert_eq!(
+            *fake.calls.borrow(),
+            [Call::ReadMtu, Call::SetMtu(1400), Call::SetEnabled(true)]
+        );
+    }
+
+    #[test]
+    fn a_failed_pre_read_changes_nothing() {
+        let fake = Fake {
+            fail_read: true,
+            ..Fake::default()
+        };
+        let result = apply_patch(
+            &fake,
+            ID,
+            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
+        );
+        assert!(
+            matches!(result, Err(Error::Platform(PlatformErrorCode::Unknown))),
+            "{result:?}"
+        );
+        assert_eq!(*fake.calls.borrow(), [Call::ReadMtu]);
+    }
+
+    #[test]
+    fn a_failed_mtu_step_skips_the_admin_step() {
+        let fake = Fake {
+            fail_set_mtu: true,
+            ..Fake::default()
+        };
+        let result = apply_patch(
+            &fake,
+            ID,
+            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
+        );
+        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
+        assert_eq!(*fake.calls.borrow(), [Call::ReadMtu, Call::SetMtu(1400)]);
+    }
+
+    #[test]
+    fn a_failed_admin_step_restores_the_mtu_and_returns_its_own_error() {
+        let fake = Fake {
+            fail_enable: true,
+            ..Fake::default()
+        };
+        let result = apply_patch(
+            &fake,
+            ID,
+            &patch(ID, Some(DesiredAdminState::Down), Some(1400)),
+        );
+        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
+        assert_eq!(
+            *fake.calls.borrow(),
+            [
+                Call::ReadMtu,
+                Call::SetMtu(1400),
+                Call::SetEnabled(false),
+                Call::SetMtu(1500),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_revert_still_returns_the_original_error() {
+        // `set_mtu` succeeds the first time and fails on the revert.
+        struct FlakyRevert(RefCell<u8>);
+
+        impl ApplySteps for FlakyRevert {
+            fn mtu(&self) -> Result<u16> {
+                Ok(1500)
+            }
+
+            fn set_mtu(&self, _mtu: u16) -> Result<()> {
+                let mut calls = self.0.borrow_mut();
+                *calls += 1;
+                if *calls > 1 {
+                    return Err(Error::Platform(PlatformErrorCode::Unknown));
+                }
+                Ok(())
+            }
+
+            fn set_enabled(&self, _enabled: bool) -> Result<()> {
+                Err(Error::NotFound)
+            }
+        }
+
+        let steps = FlakyRevert(RefCell::new(0));
+        let result = apply_patch(
+            &steps,
+            ID,
+            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
+        );
+        assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
+        assert_eq!(*steps.0.borrow(), 2, "the revert was attempted");
     }
 }
 
@@ -996,6 +1243,17 @@ mod privileged_tests {
 
         let updated = device.snapshot().expect("snapshot after the patch");
         assert_eq!(updated.mtu, 1300);
+
+        let other = DeviceId::new(device_id.value().wrapping_add(1));
+        let patch = DeviceConfigPatch::new(other, None, Some(1200)).expect("build a patch");
+        assert!(
+            matches!(device.apply(patch), Err(Error::InvalidState)),
+            "a patch for another device must be rejected"
+        );
+        let unchanged = device
+            .snapshot()
+            .expect("snapshot after the rejected patch");
+        assert_eq!(unchanged.mtu, 1300, "a rejected patch changes nothing");
     }
 
     #[test]

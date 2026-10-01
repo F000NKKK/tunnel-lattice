@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking (behavioral): `DeviceMutator::apply` rejects a patch for
+  another device and reverts a partly applied patch.** The contract is now
+  written on the trait and binds every backend.
+  - All preconditions are checked before any native call, and nothing
+    changes when one fails. A patch whose device identifier differs from
+    the handle's `DeviceObserver::id()` returns `InvalidState`; previously
+    it was applied to whichever device the handle wrapped. An MTU above
+    `u16::MAX` returns `InvalidState`, then a setting the backend cannot
+    apply returns `Unsupported`.
+  - The MTU is applied before the administrative state. When a patch sets
+    both and changing the administrative state fails,
+    `tunnel-lattice-backend-tunrs` restores the previous MTU on a
+    best-effort basis and returns the original error. Previously the new
+    MTU stayed in place. A failed revert is not reported: after any `Err`,
+    `snapshot()` is authoritative.
+
 - **Breaking: `DeviceObserver` gains a required `id()` method, and the
   facade can wrap any backend.** `id()` returns the device identity
   captured when the device was opened, without a native call; the record

@@ -173,6 +173,22 @@ retry is required: without it a signal would end a healthy stream. On
 Windows no condition is retried, so `BufferTooSmall` is the only error that
 does not end a stream there.
 
+`DeviceMutator::apply` has one contract for every backend. It checks
+every precondition before any native call:
+
+- a patch for another device, or an MTU above `u16::MAX`, returns
+  `InvalidState`;
+- then a setting the backend cannot apply returns `Unsupported`.
+
+It then applies the MTU before the administrative state, which goes last
+because it cannot be read back off Linux and so cannot be reverted. If a
+step fails, it reverts the earlier steps on a best-effort basis and returns
+the failed step's own error. To make that revert possible it reads the
+previous MTU first, but only when a later step exists. There is no
+`PartiallyApplied` error: after any `Err`, `snapshot()` is authoritative.
+`InvalidState` therefore always means that a precondition was rejected and
+nothing changed, the same rule `net-lattice` follows.
+
 ## Frozen public API surface
 
 `0.4.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this

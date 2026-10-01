@@ -16,5 +16,28 @@ pub trait DeviceMutator: DeviceObserver {
     type DeviceConfigPatch;
 
     /// Applies `patch` to this device.
+    ///
+    /// Every implementation follows the same contract:
+    ///
+    /// 1. **Preconditions, before any native call.** A patch for another
+    ///    device (its identifier differs from [`DeviceObserver::id`]) or a
+    ///    value outside what the platform can represent (for example an MTU
+    ///    above `u16::MAX`) returns
+    ///    [`Error::InvalidState`](tunnel_lattice_core::Error::InvalidState).
+    ///    After those checks, a requested setting this backend cannot apply
+    ///    returns [`Error::Unsupported`](tunnel_lattice_core::Error::Unsupported).
+    ///    Either way nothing has changed.
+    /// 2. **Order.** The MTU is applied before the administrative state.
+    ///    The administrative state goes last because some platforms cannot
+    ///    read it back, so it cannot be reverted.
+    /// 3. **Compensation.** If a step fails, the steps already applied are
+    ///    reverted in reverse order, on a best-effort basis, and the failed
+    ///    step's own error is returned. A failed revert is not reported. To
+    ///    revert, a step's previous value is read before any change, and
+    ///    only when a later step exists; if that read fails, `apply`
+    ///    returns its error and changes nothing.
+    ///
+    /// After any `Err`, [`DeviceObserver::snapshot`] is authoritative for
+    /// what the device's settings now are.
     fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()>;
 }
