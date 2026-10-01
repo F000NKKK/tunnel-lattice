@@ -1081,14 +1081,74 @@ mod privileged_tests {
         );
     }
 
+    /// What [`address_tun_device`] changed on the host outside the device
+    /// itself; dropping it (also while a failed test unwinds) undoes that.
+    /// On Windows this is a firewall rule; elsewhere nothing.
+    struct HostChanges {
+        #[cfg(target_os = "windows")]
+        firewall_rule: String,
+    }
+
+    impl Drop for HostChanges {
+        fn drop(&mut self) {
+            #[cfg(target_os = "windows")]
+            {
+                let rule = format!("name={}", self.firewall_rule);
+                let _ = std::process::Command::new("netsh")
+                    .args(["advfirewall", "firewall", "delete", "rule", &rule])
+                    .output();
+            }
+        }
+    }
+
+    /// Lets the Windows host answer ICMPv4 echo requests to `local` only:
+    /// Windows Firewall drops inbound echo requests by default, so without
+    /// this the host never replies. Logs the firewall state for the record.
+    /// The rule is named after `local`, so parallel tests do not share one.
+    #[cfg(target_os = "windows")]
+    fn allow_echo_requests_to(local: &str) -> HostChanges {
+        let state = std::process::Command::new("netsh")
+            .args(["advfirewall", "show", "currentprofile", "state"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+        eprintln!("firewall state: {state:?}");
+        let firewall_rule = format!("tunnel-lattice-test-echo-{local}");
+        let changes = HostChanges { firewall_rule };
+        let name = format!("name={}", changes.firewall_rule);
+        let local_ip = format!("localip={local}");
+        let args = [
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            name.as_str(),
+            "dir=in",
+            "action=allow",
+            "protocol=icmpv4:8,any",
+            local_ip.as_str(),
+        ];
+        let output = std::process::Command::new("netsh")
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("run netsh: {err}"));
+        assert!(
+            output.status.success(),
+            "netsh {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        changes
+    }
+
     /// Gives the test's own TUN device the address `subnet.1` with the peer
     /// `subnet.2` reachable through it, and brings it up. Returns
-    /// `(local, peer)`. An echo request from the peer written into the
-    /// device is answered by the host with an echo reply routed back into
-    /// the same device. The address lives on the device and goes away with
-    /// it.
+    /// `(local, peer, changes)`. An echo request from the peer written into
+    /// the device is answered by the host with an echo reply routed back
+    /// into the same device. The address lives on the device and goes away
+    /// with it; on Windows a firewall rule letting echo requests to `local`
+    /// in is removed when `changes` drops.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn address_tun_device(name: &str, subnet: [u8; 3]) -> ([u8; 4], [u8; 4]) {
+    fn address_tun_device(name: &str, subnet: [u8; 3]) -> ([u8; 4], [u8; 4], HostChanges) {
         let [a, b, c] = subnet;
         let (local, peer) = ([a, b, c, 1], [a, b, c, 2]);
         let local_text = format!("{a}.{b}.{c}.1");
@@ -1140,7 +1200,11 @@ mod privileged_tests {
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
-        (local, peer)
+        #[cfg(target_os = "windows")]
+        let changes = allow_echo_requests_to(&local_text);
+        #[cfg(not(target_os = "windows"))]
+        let changes = HostChanges {};
+        (local, peer, changes)
     }
 
     /// Makes a `recv` blocked on the test's own TUN device return, best
@@ -1200,8 +1264,10 @@ mod privileged_tests {
         /// [`REPLY_TIMEOUT`] (it was then released and given
         /// [`RELEASE_TIMEOUT`] more).
         received: Option<std::result::Result<String, String>>,
-        /// Whether the receiver returned at all, even after a release.
-        receiver_returned: bool,
+        /// What the receiver returned after it was released, `None` if it
+        /// did not return then either (or was never released). Never
+        /// counts as a delivered reply.
+        late: Option<std::result::Result<String, String>>,
         /// The sender's result, `None` if it did not stop in time.
         sent: Option<std::result::Result<usize, String>>,
     }
@@ -1219,8 +1285,8 @@ mod privileged_tests {
                 Some(Ok(_)) => {}
                 Some(Err(err)) => problems.push(format!("receiver failed: {err}")),
                 None => problems.push(format!(
-                    "no echo reply within {REPLY_TIMEOUT:?} (receiver returned after release: {})",
-                    self.receiver_returned
+                    "no echo reply within {REPLY_TIMEOUT:?}; after release the receiver returned {:?}",
+                    self.late
                 )),
             }
             match &self.sent {
@@ -1262,7 +1328,7 @@ mod privileged_tests {
             .expect("open a TUN device");
         let snapshot = device.snapshot().expect("snapshot the device");
         let octet = u8::try_from(per_process(200)).expect("below 200") + 20;
-        let (local, peer) = address_tun_device(&snapshot.name, [10, 202, octet]);
+        let (local, peer, _host_changes) = address_tun_device(&snapshot.name, [10, 202, octet]);
         let ident = u16::try_from(per_process(0x8000)).expect("below 0x8000");
         let request = icmp_echo_request(peer, local, ident);
         let buf_len = snapshot.recv_buffer_len();
@@ -1283,7 +1349,9 @@ mod privileged_tests {
                             break Ok(format!("{n}-byte echo reply after {skipped} other packets"));
                         }
                         Ok(_) | Err(Error::BufferTooSmall) => skipped += 1,
-                        Err(err) => break Err(format!("recv: {err:?}")),
+                        Err(err) => {
+                            break Err(format!("recv after {skipped} other packets: {err:?}"));
+                        }
                     }
                 };
                 let _ = received_tx.send(result);
@@ -1307,23 +1375,23 @@ mod privileged_tests {
 
         let received = received_rx.recv_timeout(REPLY_TIMEOUT).ok();
         stop.store(true, Ordering::Release);
-        let receiver_returned = if received.is_some() {
-            true
+        let late = if received.is_some() {
+            None
         } else {
             release_blocked_recv(&device, &snapshot.name);
-            received_rx.recv_timeout(RELEASE_TIMEOUT).is_ok()
+            received_rx.recv_timeout(RELEASE_TIMEOUT).ok()
         };
         let sent = sent_rx.recv_timeout(RELEASE_TIMEOUT).ok();
         if sent.is_some() {
             sender.join().expect("the sender thread does not panic");
         }
-        if receiver_returned {
+        if received.is_some() || late.is_some() {
             receiver.join().expect("the receiver thread does not panic");
         }
         drop(device);
         Concurrency {
             received,
-            receiver_returned,
+            late,
             sent,
         }
         .assert_ok("threads, blocking recv/send");
@@ -1356,7 +1424,7 @@ mod privileged_tests {
             .expect("open a TUN device");
         let snapshot = device.snapshot().expect("snapshot the device");
         let octet = u8::try_from(per_process(200)).expect("below 200") + 20;
-        let (local, peer) = address_tun_device(&snapshot.name, [10, 203, octet]);
+        let (local, peer, _host_changes) = address_tun_device(&snapshot.name, [10, 203, octet]);
         let ident = u16::try_from(per_process(0x8000)).expect("below 0x8000") | 0x8000;
         let request = icmp_echo_request(peer, local, ident);
 
@@ -1385,7 +1453,10 @@ mod privileged_tests {
             };
             let result = match futures::future::select(Box::pin(wait), cancel_rx).await {
                 futures::future::Either::Left((result, _)) => result,
-                futures::future::Either::Right(_) => Err("cancelled".to_owned()),
+                futures::future::Either::Right((_, wait)) => {
+                    drop(wait);
+                    Err(format!("cancelled after {skipped} other packets"))
+                }
             };
             let _ = received_tx.send(result);
         };
@@ -1418,17 +1489,17 @@ mod privileged_tests {
 
         let received = received_rx.recv_timeout(REPLY_TIMEOUT).ok();
         stop.store(true, Ordering::Release);
-        let receiver_returned = if received.is_some() {
-            true
+        let late = if received.is_some() {
+            None
         } else {
             let _ = cancel_tx.send(());
-            received_rx.recv_timeout(RELEASE_TIMEOUT).is_ok()
+            received_rx.recv_timeout(RELEASE_TIMEOUT).ok()
         };
         let sent = sent_rx.recv_timeout(RELEASE_TIMEOUT).ok();
         if sent.is_some() {
             sender.join().expect("the sender thread does not panic");
         }
-        if receiver_returned {
+        if received.is_some() || late.is_some() {
             #[cfg(feature = "tokio")]
             runtime
                 .block_on(receiver)
@@ -1439,7 +1510,7 @@ mod privileged_tests {
         drop(device);
         Concurrency {
             received,
-            receiver_returned,
+            late,
             sent,
         }
         .assert_ok("packet_stream + send_async");
