@@ -268,7 +268,10 @@ futures are polled by the runtime, so `send_async` also works on a
 
 `Handle<D>` wraps its device in an `Arc` and can be cloned cheaply to share
 one open device across threads — `recv`/`send` take `&self`, so concurrent
-calls through separate clones are always safe. The device stays open until
+calls through separate clones are always safe. Privileged CI checks this
+on a real TUN device on Linux, macOS, and Windows in every feature set:
+one clone blocks in `recv` while another sends, and the reply reaches the
+waiting receiver. The device stays open until
 every `Handle` clone (and any `PacketStream` derived from one) has been
 dropped; there is no explicit close method. See the project's
 `ARCHITECTURE.md`, "Ownership and concurrency contract", for the full

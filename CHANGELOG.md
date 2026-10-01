@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Concurrent `recv`/`send` through cloned `Handle`s checked on real
+  devices, test-only.** The `Handle` contract's claim that clones of one
+  handle can receive and send concurrently on Linux, macOS, and Windows is
+  now exercised by privileged facade tests in every feature set. Each
+  addresses a TUN device; one clone blocks in `recv` while another clone
+  writes ICMP echo requests from the peer address, and the host's echo
+  reply, routed back into the same device, must reach the waiting receiver
+  within 60 seconds (identifier, sequence number, and payload checked). With
+  `async-io` or `tokio` a second test does the same with a `packet_stream`
+  polled as a task on one clone and `send_async` on another. On a timeout
+  the waiting receive is released, both sides are joined, and the device is
+  dropped before the test fails. On Windows the test adds a firewall rule
+  that lets echo requests to the device's own address in (Windows Firewall
+  drops them by default) and deletes it again on every exit path. The
+  `Handle` rustdoc, the architecture documents, and the facade README say
+  so.
+
 - **Exact capability sets checked on real devices, test-only.** New
   privileged facade tests assert, on Linux, macOS, and Windows and in every
   feature set, that `Tunnel::capabilities()` and a real TUN handle's

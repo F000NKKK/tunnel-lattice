@@ -227,7 +227,15 @@ deliberate, explicit contract, not an implementation detail of
   `WintunSendPacket` calls specifically so this holds without any special
   handling on our side. No capability check or feature gates this — sharing
   a `Handle` clone across threads and calling `recv`/`send` concurrently is
-  the baseline, portable multiplexing story.
+  the baseline, portable multiplexing story. The privileged CI job checks
+  it on a real TUN device on Linux, macOS, and Windows in all three
+  feature sets: the device gets an address, one clone blocks in `recv`
+  while another clone writes ICMP echo requests from the peer address,
+  and the host's echo reply, routed back into the same device, must reach
+  the waiting `recv` within 60 seconds (with `async-io`/`tokio` also with
+  a `packet_stream` task on one clone and `send_async` on another). On
+  Windows the test adds a firewall rule letting echo requests to the
+  device's address in, and removes it afterwards.
 - **`Handle::additional_queue`** (gated by `D: MultiQueueProvider`, see
   below) is a *different, stronger* thing: an independent `Handle` over a
   second OS-scheduled queue, not a second reference to the same one. The

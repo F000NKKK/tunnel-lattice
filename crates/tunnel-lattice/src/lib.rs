@@ -205,7 +205,11 @@ impl Tunnel<TunRsBackend> {
 ///   threads sharing one `Handle` clone. This "naive" multiplexing needs no
 ///   feature or capability check; see `ARCHITECTURE.md`'s async design
 ///   notes for why `tun-rs`'s own `recv`/`send` signatures already commit
-///   to this.
+///   to this. The project's privileged CI checks it on a real TUN device on
+///   each of the three platforms and in every feature set: one clone
+///   blocks in `recv` (or, with `async-io`/`tokio`, a `packet_stream` is
+///   polled) while another clone sends, and the host's reply reaches the
+///   waiting receiver.
 /// - **`additional_queue` (with `D: MultiQueueProvider`) is a different,
 ///   stronger thing**: it returns an independent `Handle` over a *second*
 ///   OS-level queue on the same device (Linux `IFF_MULTI_QUEUE` only —
