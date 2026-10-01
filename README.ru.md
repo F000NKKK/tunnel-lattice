@@ -63,8 +63,9 @@ Lattice; адреса и маршруты настраиваются через
 - ✅ **TUN и TAP**: устройства сырого IP (уровень 3) и Ethernet (уровень 2)
 - ✅ **Sync и async**: блокирующие `recv`/`send` или `futures::Stream` с
   фичей `tokio` или `async-io`
-- ✅ **Чтение и изменение**: перечитать имя, MTU и административное
-  состояние; поменять MTU и up/down на открытом устройстве
+- ✅ **Чтение и изменение**: перечитать имя, MTU, административное
+  состояние и MAC-адрес TAP-устройства; поменять MTU, MAC и up/down на
+  открытом устройстве
 - ✅ **Дешёвое разделение**: `Handle` реализует `Clone`, а `recv`/`send`
   принимают `&self` — одно устройство можно использовать из многих потоков
 
@@ -294,8 +295,8 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 | `Tunnel::open(DeviceConfig)` | Создать устройство TUN/TAP и вернуть `Handle` |
 | `Handle::id` / `kind` | Идентификатор и тип, зафиксированные при открытии (без нативного вызова) |
 | `Handle::recv` / `send` | Блокирующая передача пакетов |
-| `Handle::snapshot` | Текущие имя, MTU и административное состояние |
-| `Handle::apply(DeviceConfigPatch)` | Изменить MTU или up/down |
+| `Handle::snapshot` | Текущие имя, MTU, административное состояние и MAC-адрес TAP |
+| `Handle::apply(DeviceConfigPatch)` | Изменить MTU, MAC-адрес TAP (Linux, macOS) или up/down |
 | `Handle::capabilities` | Что устройство поддерживает в рантайме |
 | `Handle::persist` / `additional_queue` | Персистентность и multi-queue на Linux |
 | `Handle::packet_stream` | Асинхронный `Stream` пакетов из пула (`tokio` / `async-io`) |

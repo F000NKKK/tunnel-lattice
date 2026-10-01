@@ -31,20 +31,27 @@ contracts; it never inspects or changes the host system.
 
 - ✅ **`DeviceKind`**: TUN (raw IP) or TAP (Ethernet-framed).
 - ✅ **`DeviceConfig`**: desired intent for creating a device (kind, an
-  optional name, an optional MTU, a multi-queue request), built with
-  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_multi_queue`. The `name`
+  optional name, an optional MTU, an optional TAP MAC address, a
+  multi-queue request), built with
+  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_mac`/`with_multi_queue`. The `name`
   field's docs list the per-OS name formats a backend accepts (anything
   else is rejected with `Error::InvalidState` before any native call) and
   what happens when an interface with that name already exists.
 - ✅ **`Device`**: an observed, already-open device (id, actual name, kind,
-  MTU, administrative state). `Device::recv_buffer_len` returns a receive
+  MTU, administrative state, and a TAP device's MAC address; `None` for
+  TUN). `Device::recv_buffer_len` returns a receive
   buffer size that fits one packet at the snapshot's MTU: the MTU for TUN,
   MTU + 18 for TAP (the 14-byte Ethernet header plus one 4-byte 802.1Q tag,
   so a double-tagged frame does not fit).
 - ✅ **`DeviceConfigPatch`**: desired intent for changing an open device's
-  MTU or administrative state, separate from creation. Built with
-  `DeviceConfigPatch::new`, which rejects an empty or zero-MTU patch the
-  same way `net-lattice-model::InterfaceConfig::new` does.
+  MTU, administrative state, or TAP MAC address, separate from creation.
+  Built with `DeviceConfigPatch::new`, which rejects an empty or zero-MTU
+  patch the same way `net-lattice-model::InterfaceConfig::new` does, or
+  with `DeviceConfigPatch::new_mac` for a MAC-only patch; `with_mac` adds a
+  MAC address to either.
+- ✅ **`MacAddress`**: six octets in transmission order, displayed as
+  lowercase colon hex. Shaped like `net-lattice-model`'s own `MacAddress`,
+  so the two convert through `[u8; 6]`.
 - ✅ **`AdminState` / `DesiredAdminState`**: observed and requested states
   are split the same way `net-lattice-model::interface`'s pair is, so the
   observed `Unknown` is never requested back. Both enums are

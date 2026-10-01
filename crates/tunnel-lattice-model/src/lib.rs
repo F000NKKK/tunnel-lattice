@@ -7,7 +7,9 @@
 #![warn(missing_docs)]
 
 mod device;
+mod mac;
 
 pub use device::{
     AdminState, DesiredAdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
 };
+pub use mac::MacAddress;

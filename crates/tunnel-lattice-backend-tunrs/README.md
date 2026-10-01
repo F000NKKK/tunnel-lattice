@@ -48,7 +48,8 @@ error into a typed `tunnel_lattice_core::Error`.
   device via `tun_rs::DeviceBuilder`, mapping `DeviceKind::Tun`/`Tap` to
   `tun_rs::Layer::L3`/`L2`;
 - ✅ `TunRsDevice`, the open-device handle implementing `PacketIo`,
-  `DeviceObserver`, `DeviceMutator` (MTU and administrative state), and
+  `DeviceObserver`, `DeviceMutator` (MTU, TAP MAC address, and
+  administrative state), and
   `CapabilityProvider`. It holds exactly one underlying `tun-rs` handle —
   never both a sync and an async one, since `tun_rs::SyncDevice::try_clone`
   only exists on Linux. With `async-io`, that handle is a
@@ -71,6 +72,13 @@ error into a typed `tunnel_lattice_core::Error`.
   (verified in `tun-rs`'s source — the underlying `persist`/`multi_queue`/
   `try_clone` methods are `#[cfg(target_os = "linux")]` there too, not
   merely no-ops off Linux). See "Persistent devices and multi-queue" below.
+- ✅ A TAP device's MAC address: `DeviceConfig::with_mac` sets it at open
+  on every platform, and the backend reads it back, returning
+  `Unsupported` and tearing the device down if it was not applied.
+  `TunRsDevice` reports `Capability::MAC_MUTATION` on a TAP handle on
+  Linux and macOS, where a `DeviceConfigPatch` can change it later; on
+  Windows the tap-windows6 driver takes the address only when the adapter
+  is created.
 
 ## 💻 Supported Platforms
 

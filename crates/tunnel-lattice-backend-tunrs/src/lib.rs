@@ -27,7 +27,7 @@ mod tokio_linux;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
-    AdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
+    AdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
 };
 #[cfg(feature = "async")]
 use tunnel_lattice_platform::AsyncPacketIo;
@@ -305,6 +305,9 @@ impl DeviceProvider for TunRsBackend {
             .mtu
             .map(|mtu| u16::try_from(mtu).map_err(|_| Error::InvalidState))
             .transpose()?;
+        if config.mac.is_some() && config.kind != DeviceKind::Tap {
+            return Err(Error::InvalidState);
+        }
 
         let mut builder = tun_rs::DeviceBuilder::new().layer(layer);
         // `tun-rs` defaults `reuse_dev` to `true`, which on macOS/Windows TAP
@@ -331,6 +334,9 @@ impl DeviceProvider for TunRsBackend {
         if let Some(mtu) = mtu {
             builder = builder.mtu(mtu);
         }
+        if let Some(mac) = config.mac {
+            builder = builder.mac_addr(mac.octets());
+        }
 
         #[cfg(feature = "async")]
         let built = builder.build_async();
@@ -348,6 +354,9 @@ impl DeviceProvider for TunRsBackend {
         // On failure `handle` drops: a new device is torn down, an attached
         // persistent one is detached.
         let id = read_device_id(&handle)?;
+        if let Some(mac) = config.mac {
+            confirm_requested_mac(&handle, mac)?;
+        }
 
         Ok(TunRsDevice {
             kind: config.kind,
@@ -373,6 +382,18 @@ impl DeviceProvider for TunRsBackend {
 /// failed, so `0` is an error rather than an identity.
 fn read_device_id(handle: &tun_rs::DeviceImpl) -> Result<DeviceId> {
     device_id_from_index(handle.if_index())
+}
+
+/// Reads the MAC back after a TAP device was opened with one, so a platform
+/// that silently ignored the request fails `open` with
+/// [`Error::Unsupported`] instead of handing out a device with another MAC.
+fn confirm_requested_mac(handle: &tun_rs::DeviceImpl, requested: MacAddress) -> Result<()> {
+    let actual = handle.mac_address().map_err(io_error)?;
+    if actual == requested.octets() {
+        Ok(())
+    } else {
+        Err(Error::Unsupported)
+    }
 }
 
 fn device_id_from_index(index: std::io::Result<u32>) -> Result<DeviceId> {
@@ -561,7 +582,15 @@ impl DeviceObserver for TunRsDevice {
         #[cfg(not(target_os = "linux"))]
         let admin_state = AdminState::Unknown;
 
-        Ok(Device::new(id, name, self.kind, mtu, admin_state))
+        let device = Device::new(id, name, self.kind, mtu, admin_state);
+        if self.kind != DeviceKind::Tap {
+            return Ok(device);
+        }
+        match self.handle.mac_address() {
+            Ok(octets) => Ok(device.with_mac(MacAddress::new(octets))),
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => Ok(device),
+            Err(err) => Err(io_error(err)),
+        }
     }
 }
 
@@ -569,7 +598,12 @@ impl DeviceMutator for TunRsDevice {
     type DeviceConfigPatch = DeviceConfigPatch;
 
     fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()> {
-        apply_patch(&*self.handle, self.id, &patch)
+        let target = ApplyTarget {
+            id: self.id,
+            kind: self.kind,
+            mac_mutation: self.capabilities().contains(Capability::MAC_MUTATION),
+        };
+        apply_patch(&*self.handle, target, &patch)
     }
 }
 
@@ -578,6 +612,8 @@ impl DeviceMutator for TunRsDevice {
 trait ApplySteps {
     fn mtu(&self) -> Result<u16>;
     fn set_mtu(&self, mtu: u16) -> Result<()>;
+    fn mac(&self) -> Result<MacAddress>;
+    fn set_mac(&self, mac: MacAddress) -> Result<()>;
     fn set_enabled(&self, enabled: bool) -> Result<()>;
 }
 
@@ -590,25 +626,50 @@ impl ApplySteps for tun_rs::DeviceImpl {
         tun_rs::DeviceImpl::set_mtu(self, mtu).map_err(io_error)
     }
 
+    fn mac(&self) -> Result<MacAddress> {
+        self.mac_address().map(MacAddress::new).map_err(io_error)
+    }
+
+    fn set_mac(&self, mac: MacAddress) -> Result<()> {
+        self.set_mac_address(mac.octets()).map_err(io_error)
+    }
+
     fn set_enabled(&self, enabled: bool) -> Result<()> {
         tun_rs::DeviceImpl::enabled(self, enabled).map_err(io_error)
     }
 }
 
+/// What [`apply_patch`] checks a patch against.
+#[derive(Clone, Copy)]
+struct ApplyTarget {
+    id: DeviceId,
+    kind: DeviceKind,
+    /// Whether the handle reports `Capability::MAC_MUTATION`.
+    mac_mutation: bool,
+}
+
 /// [`DeviceMutator::apply`]'s contract: every precondition before any
-/// native call, then MTU before administrative state, and on a failed step
-/// a best-effort revert of the earlier ones before returning the original
-/// error.
-fn apply_patch(steps: &impl ApplySteps, id: DeviceId, patch: &DeviceConfigPatch) -> Result<()> {
+/// native call, then MTU, MAC, and administrative state in that order, and
+/// on a failed step a best-effort revert of the earlier ones in reverse
+/// before returning the original error.
+fn apply_patch(
+    steps: &impl ApplySteps,
+    target: ApplyTarget,
+    patch: &DeviceConfigPatch,
+) -> Result<()> {
     use tunnel_lattice_model::DesiredAdminState;
 
-    if patch.device_id() != id {
+    if patch.device_id() != target.id {
         return Err(Error::InvalidState);
     }
     let mtu = patch
         .mtu()
         .map(|mtu| u16::try_from(mtu).map_err(|_| Error::InvalidState))
         .transpose()?;
+    let mac = patch.mac();
+    if mac.is_some() && target.kind != DeviceKind::Tap {
+        return Err(Error::InvalidState);
+    }
     // `DesiredAdminState` is `#[non_exhaustive]`: a variant this backend
     // does not know is unsupported, not a malformed patch.
     let enable = match patch.admin_state() {
@@ -617,25 +678,45 @@ fn apply_patch(steps: &impl ApplySteps, id: DeviceId, patch: &DeviceConfigPatch)
         Some(DesiredAdminState::Down) => Some(false),
         Some(_) => return Err(Error::Unsupported),
     };
+    if mac.is_some() && !target.mac_mutation {
+        return Err(Error::Unsupported);
+    }
 
     // Administrative state goes last: it cannot be read back off Linux, so
-    // it cannot be reverted. The MTU is read first only when a later step
-    // could need reverting.
-    let previous_mtu = match (mtu, enable) {
-        (Some(_), Some(_)) => Some(steps.mtu()?),
+    // it cannot be reverted. A step's previous value is read first, before
+    // any change, and only when a later step could need it reverted.
+    let previous_mtu = match mtu {
+        Some(_) if mac.is_some() || enable.is_some() => Some(steps.mtu()?),
         _ => None,
     };
+    let previous_mac = match mac {
+        Some(_) if enable.is_some() => Some(steps.mac()?),
+        _ => None,
+    };
+    // Best effort: the original error is what the caller needs, and
+    // `snapshot()` is authoritative after any `Err`.
+    let revert_mtu = || {
+        if let Some(previous) = previous_mtu {
+            let _ = steps.set_mtu(previous);
+        }
+    };
+
     if let Some(mtu) = mtu {
         steps.set_mtu(mtu)?;
+    }
+    if let Some(mac) = mac
+        && let Err(error) = steps.set_mac(mac)
+    {
+        revert_mtu();
+        return Err(error);
     }
     if let Some(enable) = enable
         && let Err(error) = steps.set_enabled(enable)
     {
-        if let Some(previous) = previous_mtu {
-            // Best effort: the original error is what the caller needs, and
-            // `snapshot()` is authoritative after any `Err`.
-            let _ = steps.set_mtu(previous);
+        if let Some(previous) = previous_mac {
+            let _ = steps.set_mac(previous);
         }
+        revert_mtu();
         return Err(error);
     }
     Ok(())
@@ -667,6 +748,14 @@ impl CapabilityProvider for TunRsDevice {
         let base = Capability::DEVICE_MUTATION | Capability::TAP_DEVICES;
         #[cfg(target_os = "linux")]
         let base = base | Capability::PERSISTENT_DEVICES | Capability::MULTI_QUEUE;
+        // The Windows TAP driver takes a MAC only at creation; `tun-rs`
+        // returns `Unsupported` for a later change there.
+        #[cfg(not(target_os = "windows"))]
+        let base = if self.kind == DeviceKind::Tap {
+            base | Capability::MAC_MUTATION
+        } else {
+            base
+        };
         #[cfg(feature = "async")]
         {
             base | Capability::NATIVE_ASYNC
@@ -692,6 +781,8 @@ mod apply_tests {
     enum Call {
         ReadMtu,
         SetMtu(u16),
+        ReadMac,
+        SetMac(MacAddress),
         SetEnabled(bool),
     }
 
@@ -701,6 +792,7 @@ mod apply_tests {
         calls: RefCell<Vec<Call>>,
         fail_read: bool,
         fail_set_mtu: bool,
+        fail_set_mac: bool,
         fail_enable: bool,
     }
 
@@ -721,6 +813,19 @@ mod apply_tests {
             Ok(())
         }
 
+        fn mac(&self) -> Result<MacAddress> {
+            self.calls.borrow_mut().push(Call::ReadMac);
+            Ok(OLD_MAC)
+        }
+
+        fn set_mac(&self, mac: MacAddress) -> Result<()> {
+            self.calls.borrow_mut().push(Call::SetMac(mac));
+            if self.fail_set_mac {
+                return Err(Error::PermissionDenied);
+            }
+            Ok(())
+        }
+
         fn set_enabled(&self, enabled: bool) -> Result<()> {
             self.calls.borrow_mut().push(Call::SetEnabled(enabled));
             if self.fail_enable {
@@ -731,6 +836,22 @@ mod apply_tests {
     }
 
     const ID: DeviceId = DeviceId::new(3);
+    const OLD_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 0x01]);
+    const NEW_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 0x02]);
+
+    /// A TUN device: no MAC address at all.
+    const TUN: ApplyTarget = ApplyTarget {
+        id: ID,
+        kind: DeviceKind::Tun,
+        mac_mutation: false,
+    };
+
+    /// A TAP device whose handle reports `MAC_MUTATION`.
+    const TAP: ApplyTarget = ApplyTarget {
+        id: ID,
+        kind: DeviceKind::Tap,
+        mac_mutation: true,
+    };
 
     fn patch(
         id: DeviceId,
@@ -744,7 +865,7 @@ mod apply_tests {
     fn a_patch_for_another_device_is_rejected_without_a_native_call() {
         let fake = Fake::default();
         let patch = patch(DeviceId::new(4), Some(DesiredAdminState::Up), Some(1400));
-        let result = apply_patch(&fake, ID, &patch);
+        let result = apply_patch(&fake, TUN, &patch);
         assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
         assert!(fake.calls.borrow().is_empty());
     }
@@ -753,20 +874,107 @@ mod apply_tests {
     fn an_mtu_above_u16_is_rejected_without_a_native_call() {
         let fake = Fake::default();
         let patch = patch(ID, Some(DesiredAdminState::Up), Some(70_000));
-        let result = apply_patch(&fake, ID, &patch);
+        let result = apply_patch(&fake, TUN, &patch);
         assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_mac_for_a_tun_device_is_rejected_without_a_native_call() {
+        let fake = Fake::default();
+        let patch = patch(ID, None, Some(1400)).with_mac(NEW_MAC);
+        let result = apply_patch(&fake, TUN, &patch);
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_mac_without_mac_mutation_is_unsupported_without_a_native_call() {
+        let fake = Fake::default();
+        let target = ApplyTarget {
+            mac_mutation: false,
+            ..TAP
+        };
+        let patch = patch(ID, Some(DesiredAdminState::Up), Some(1400)).with_mac(NEW_MAC);
+        let result = apply_patch(&fake, target, &patch);
+        assert!(matches!(result, Err(Error::Unsupported)), "{result:?}");
         assert!(fake.calls.borrow().is_empty());
     }
 
     #[test]
     fn a_single_step_skips_the_pre_read() {
         let fake = Fake::default();
-        apply_patch(&fake, ID, &patch(ID, None, Some(1400))).expect("apply");
+        apply_patch(&fake, TUN, &patch(ID, None, Some(1400))).expect("apply");
         assert_eq!(*fake.calls.borrow(), [Call::SetMtu(1400)]);
 
         let fake = Fake::default();
-        apply_patch(&fake, ID, &patch(ID, Some(DesiredAdminState::Down), None)).expect("apply");
+        apply_patch(&fake, TUN, &patch(ID, Some(DesiredAdminState::Down), None)).expect("apply");
         assert_eq!(*fake.calls.borrow(), [Call::SetEnabled(false)]);
+
+        let fake = Fake::default();
+        apply_patch(&fake, TAP, &DeviceConfigPatch::new_mac(ID, NEW_MAC)).expect("apply");
+        assert_eq!(*fake.calls.borrow(), [Call::SetMac(NEW_MAC)]);
+    }
+
+    #[test]
+    fn every_step_runs_mtu_then_mac_then_admin_after_the_pre_reads() {
+        let fake = Fake::default();
+        let patch = patch(ID, Some(DesiredAdminState::Up), Some(1400)).with_mac(NEW_MAC);
+        apply_patch(&fake, TAP, &patch).expect("apply");
+        assert_eq!(
+            *fake.calls.borrow(),
+            [
+                Call::ReadMtu,
+                Call::ReadMac,
+                Call::SetMtu(1400),
+                Call::SetMac(NEW_MAC),
+                Call::SetEnabled(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_mac_step_restores_the_mtu_and_skips_the_admin_step() {
+        let fake = Fake {
+            fail_set_mac: true,
+            ..Fake::default()
+        };
+        let patch = patch(ID, Some(DesiredAdminState::Up), Some(1400)).with_mac(NEW_MAC);
+        let result = apply_patch(&fake, TAP, &patch);
+        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
+        assert_eq!(
+            *fake.calls.borrow(),
+            [
+                Call::ReadMtu,
+                Call::ReadMac,
+                Call::SetMtu(1400),
+                Call::SetMac(NEW_MAC),
+                Call::SetMtu(1500),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_admin_step_restores_the_mac_then_the_mtu() {
+        let fake = Fake {
+            fail_enable: true,
+            ..Fake::default()
+        };
+        let patch = patch(ID, Some(DesiredAdminState::Down), Some(1400)).with_mac(NEW_MAC);
+        let result = apply_patch(&fake, TAP, &patch);
+        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
+        assert_eq!(
+            *fake.calls.borrow(),
+            [
+                Call::ReadMtu,
+                Call::ReadMac,
+                Call::SetMtu(1400),
+                Call::SetMac(NEW_MAC),
+                Call::SetEnabled(false),
+                Call::SetMac(OLD_MAC),
+                Call::SetMtu(1500),
+            ]
+        );
     }
 
     #[test]
@@ -774,7 +982,7 @@ mod apply_tests {
         let fake = Fake::default();
         apply_patch(
             &fake,
-            ID,
+            TUN,
             &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
         )
         .expect("apply");
@@ -792,7 +1000,7 @@ mod apply_tests {
         };
         let result = apply_patch(
             &fake,
-            ID,
+            TUN,
             &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
         );
         assert!(
@@ -810,7 +1018,7 @@ mod apply_tests {
         };
         let result = apply_patch(
             &fake,
-            ID,
+            TUN,
             &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
         );
         assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
@@ -825,7 +1033,7 @@ mod apply_tests {
         };
         let result = apply_patch(
             &fake,
-            ID,
+            TUN,
             &patch(ID, Some(DesiredAdminState::Down), Some(1400)),
         );
         assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
@@ -859,6 +1067,14 @@ mod apply_tests {
                 Ok(())
             }
 
+            fn mac(&self) -> Result<MacAddress> {
+                Ok(OLD_MAC)
+            }
+
+            fn set_mac(&self, _mac: MacAddress) -> Result<()> {
+                Ok(())
+            }
+
             fn set_enabled(&self, _enabled: bool) -> Result<()> {
                 Err(Error::NotFound)
             }
@@ -867,7 +1083,7 @@ mod apply_tests {
         let steps = FlakyRevert(RefCell::new(0));
         let result = apply_patch(
             &steps,
-            ID,
+            TUN,
             &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
         );
         assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
@@ -1773,6 +1989,57 @@ mod privileged_tests {
             matches!(result, Err(Error::DriverUnavailable)),
             "open(Tap) without the tap-windows6 driver should report DriverUnavailable, got {:?}",
             result.err()
+        );
+    }
+
+    /// A TAP device opened with a MAC address reports it, reports
+    /// `MAC_MUTATION`, and a later patch's MAC is observable on the next
+    /// snapshot; a TUN device reports no MAC and refuses one at open. The
+    /// macOS `feth` pair gets the teardown guards, the Linux TAP goes away
+    /// with its handle.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[ignore = "requires CAP_NET_ADMIN/root to open a TAP device"]
+    fn tap_mac_is_set_at_open_and_changed_by_apply() {
+        use tunnel_lattice_platform::CapabilityProvider;
+
+        #[cfg(target_os = "macos")]
+        let _serial = serialize_feth_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        // Locally administered unicast addresses.
+        let initial = MacAddress::new([0x02, 0x7c, 0x1a, 0x00, 0x00, 0x01]);
+        let changed = MacAddress::new([0x02, 0x7c, 0x1a, 0x00, 0x00, 0x02]);
+
+        let backend = TunRsBackend::new();
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tap).with_mac(initial))
+            .expect("open a TAP device with a MAC");
+        let snapshot = device.snapshot().expect("snapshot the device");
+        #[cfg(target_os = "macos")]
+        let _feth = guard_feth_pair(&snapshot.name);
+        assert_eq!(snapshot.mac, Some(initial));
+        assert!(device.capabilities().contains(Capability::MAC_MUTATION));
+
+        device
+            .apply(DeviceConfigPatch::new_mac(device.id(), changed))
+            .expect("apply a new MAC");
+        let snapshot = device.snapshot().expect("snapshot after apply");
+        assert_eq!(snapshot.mac, Some(changed));
+
+        let tun = backend
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a TUN device");
+        assert_eq!(tun.snapshot().expect("snapshot the TUN device").mac, None);
+        assert!(!tun.capabilities().contains(Capability::MAC_MUTATION));
+        let refused = backend.open(DeviceConfig::new(DeviceKind::Tun).with_mac(initial));
+        assert!(
+            matches!(refused, Err(Error::InvalidState)),
+            "{:?}",
+            refused.err()
         );
     }
 

@@ -62,7 +62,7 @@ public API. The workspace
 ### Capabilities
 - 🧩 **`Capability`**: a `bitflags` set of runtime-dependent features:
   `DEVICE_MUTATION`, `PERSISTENT_DEVICES`, `TAP_DEVICES`, `MULTI_QUEUE`,
-  `NATIVE_ASYNC`.
+  `NATIVE_ASYNC`, `MAC_MUTATION`.
 - 🧩 **`CapabilityProvider`**: reports which of them a connected device has.
 
 ## 📦 Installation

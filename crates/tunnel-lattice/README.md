@@ -46,9 +46,11 @@ configuration once a device exists.
   returning a `Handle` to it;
 - ✅ `Handle::recv`/`send`, blocking packet transfer on an open device;
 - ✅ `Handle::snapshot`, re-reading a device's current name/MTU/administrative
-  state;
-- ✅ `Handle::apply(DeviceConfigPatch)`, changing an open device's MTU or
-  administrative state;
+  state and, for TAP, its MAC address;
+- ✅ `Handle::apply(DeviceConfigPatch)`, changing an open device's MTU,
+  administrative state, or TAP MAC address (the last where the handle
+  reports `Capability::MAC_MUTATION`: Linux and macOS; on Windows a TAP
+  MAC address can only be requested at open with `DeviceConfig::with_mac`);
 - 🐧 `Handle::persist`/`Handle::additional_queue`, on backends that implement
   `PersistentDevice`/`MultiQueueProvider` (Linux only, via
   `tunnel-lattice-backend-tunrs` — see

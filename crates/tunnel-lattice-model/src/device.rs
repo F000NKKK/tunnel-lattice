@@ -1,5 +1,7 @@
 use tunnel_lattice_core::{Error, Id, Result};
 
+use crate::MacAddress;
+
 /// Identifies a [`Device`].
 ///
 /// Construction convention mirrors `net-lattice-model::InterfaceId`: a
@@ -138,17 +140,28 @@ pub struct DeviceConfig {
     /// sharing is not intended. A multi-queue mismatch with an existing
     /// device fails with [`Error::AlreadyExists`].
     pub multi_queue: bool,
+    /// A requested MAC address for a TAP device; `None` lets the OS or
+    /// driver assign one.
+    ///
+    /// Requesting a MAC for a TUN device is rejected by `open` with
+    /// [`Error::InvalidState`] before any native call. On Windows this is
+    /// the only way to choose a TAP device's MAC address: the TAP driver
+    /// cannot change it after creation, so `Capability::MAC_MUTATION` is
+    /// not reported there.
+    pub mac: Option<MacAddress>,
 }
 
 impl DeviceConfig {
     /// Creates a device-creation descriptor for `kind` with no name or MTU
-    /// preference — the backend chooses both — and multi-queue disabled.
+    /// preference — the backend chooses both — multi-queue disabled, and
+    /// no MAC address preference.
     pub const fn new(kind: DeviceKind) -> Self {
         Self {
             kind,
             name: None,
             mtu: None,
             multi_queue: false,
+            mac: None,
         }
     }
 
@@ -174,10 +187,17 @@ impl DeviceConfig {
         self.multi_queue = multi_queue;
         self
     }
+
+    /// Requests `mac` for a new TAP device (see [`Self::mac`]).
+    #[must_use]
+    pub const fn with_mac(mut self, mac: MacAddress) -> Self {
+        self.mac = Some(mac);
+        self
+    }
 }
 
-/// A patch requesting a change to an already-open [`Device`]'s MTU or
-/// administrative state.
+/// A patch requesting a change to an already-open [`Device`]'s MTU, MAC
+/// address, or administrative state.
 ///
 /// Mirrors `net-lattice-model::interface::InterfaceConfig`'s "don't touch"
 /// semantics: a field left `None` is left exactly as it is, and the
@@ -188,6 +208,7 @@ pub struct DeviceConfigPatch {
     device_id: DeviceId,
     admin_state: Option<DesiredAdminState>,
     mtu: Option<u32>,
+    mac: Option<MacAddress>,
 }
 
 impl DeviceConfigPatch {
@@ -209,7 +230,30 @@ impl DeviceConfigPatch {
             device_id,
             admin_state,
             mtu,
+            mac: None,
         })
+    }
+
+    /// Creates a patch for `device_id` that changes only its MAC address.
+    ///
+    /// Infallible: a MAC-only patch always requests something. Applying it
+    /// to a TUN device fails with [`Error::InvalidState`], and to a device
+    /// without `Capability::MAC_MUTATION` with [`Error::Unsupported`].
+    pub const fn new_mac(device_id: DeviceId, mac: MacAddress) -> Self {
+        Self {
+            device_id,
+            admin_state: None,
+            mtu: None,
+            mac: Some(mac),
+        }
+    }
+
+    /// Also requests `mac` as the device's MAC address (see
+    /// [`Self::new_mac`] for when applying it fails).
+    #[must_use]
+    pub const fn with_mac(mut self, mac: MacAddress) -> Self {
+        self.mac = Some(mac);
+        self
     }
 
     /// Returns the device targeted by this patch.
@@ -225,6 +269,11 @@ impl DeviceConfigPatch {
     /// Returns the requested MTU, if any.
     pub const fn mtu(&self) -> Option<u32> {
         self.mtu
+    }
+
+    /// Returns the requested MAC address, if any.
+    pub const fn mac(&self) -> Option<MacAddress> {
+        self.mac
     }
 }
 
@@ -242,10 +291,14 @@ pub struct Device {
     pub mtu: u32,
     /// The device's current administrative state.
     pub admin_state: AdminState,
+    /// The device's current MAC address: always `None` for TUN, and `None`
+    /// for TAP where the backend cannot read it.
+    pub mac: Option<MacAddress>,
 }
 
 impl Device {
-    /// Constructs an observed device record.
+    /// Constructs an observed device record with no MAC address; add one
+    /// with [`Self::with_mac`].
     ///
     /// The only constructor available outside this crate: `Device` is
     /// `#[non_exhaustive]`, so a backend crate cannot use a struct literal
@@ -264,7 +317,15 @@ impl Device {
             kind,
             mtu,
             admin_state,
+            mac: None,
         }
+    }
+
+    /// Records `mac` as this TAP device's observed MAC address.
+    #[must_use]
+    pub const fn with_mac(mut self, mac: MacAddress) -> Self {
+        self.mac = Some(mac);
+        self
     }
 
     /// The smallest `recv` buffer guaranteed to hold one packet at this
@@ -360,5 +421,52 @@ mod tests {
         let patch = DeviceConfigPatch::new(device_id, None, Some(1400)).unwrap();
         assert_eq!(patch.admin_state(), None);
         assert_eq!(patch.mtu(), Some(1400));
+        assert_eq!(patch.mac(), None);
+    }
+
+    const MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 1]);
+
+    #[test]
+    fn mac_defaults_to_unset_everywhere() {
+        assert_eq!(DeviceConfig::new(DeviceKind::Tap).mac, None);
+        let device = Device::new(
+            DeviceId::new(1),
+            "d".into(),
+            DeviceKind::Tap,
+            1500,
+            AdminState::Up,
+        );
+        assert_eq!(device.mac, None);
+    }
+
+    #[test]
+    fn mac_builders_set_only_the_mac() {
+        let config = DeviceConfig::new(DeviceKind::Tap).with_mac(MAC);
+        assert_eq!(config.mac, Some(MAC));
+        assert_eq!((config.name, config.mtu), (None, None));
+
+        let device = Device::new(
+            DeviceId::new(1),
+            "d".into(),
+            DeviceKind::Tap,
+            1500,
+            AdminState::Up,
+        )
+        .with_mac(MAC);
+        assert_eq!(device.mac, Some(MAC));
+    }
+
+    #[test]
+    fn a_mac_only_patch_needs_no_other_setting() {
+        let device_id = DeviceId::new(1);
+        let patch = DeviceConfigPatch::new_mac(device_id, MAC);
+        assert_eq!(patch.device_id(), device_id);
+        assert_eq!(patch.mac(), Some(MAC));
+        assert_eq!((patch.admin_state(), patch.mtu()), (None, None));
+
+        let combined = DeviceConfigPatch::new(device_id, None, Some(1400))
+            .unwrap()
+            .with_mac(MAC);
+        assert_eq!((combined.mtu(), combined.mac()), (Some(1400), Some(MAC)));
     }
 }

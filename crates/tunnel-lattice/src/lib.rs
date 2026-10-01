@@ -53,6 +53,7 @@ pub use tunnel_lattice_backend_tunrs::{TunRsBackend, TunRsDevice};
 pub use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 pub use tunnel_lattice_model::{
     AdminState, DesiredAdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
+    MacAddress,
 };
 #[cfg(feature = "async")]
 pub use tunnel_lattice_platform::AsyncPacketIo;

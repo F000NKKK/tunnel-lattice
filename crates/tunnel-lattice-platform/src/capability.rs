@@ -30,6 +30,11 @@ bitflags::bitflags! {
         /// `tunnel-lattice-async`'s thread-based adapter over
         /// [`crate::PacketIo`]. Only meaningful with the `async` feature.
         const NATIVE_ASYNC = 1 << 4;
+        /// The device's MAC address can be changed after creation, through
+        /// a [`crate::DeviceMutator`] patch. Reported on a TAP device's
+        /// handle only, and only where the platform allows it; where it is
+        /// absent, a MAC can still be requested when the device is opened.
+        const MAC_MUTATION = 1 << 5;
     }
 }
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **TAP MAC address.** Added `MacAddress`, a six-octet value shaped like
+  `net-lattice-model`'s own so the two convert through `[u8; 6]`; the
+  facade re-exports it.
+  - `Device::mac` reports a TAP device's MAC address (`None` for TUN).
+  - `DeviceConfig::with_mac` requests one at open. A MAC for a TUN device
+    returns `InvalidState` before anything is created. The
+    `tunnel-lattice-backend-tunrs` backend reads the address back after
+    opening and returns `Unsupported`, tearing the new device down, if the
+    platform did not apply it.
+  - `DeviceConfigPatch::new_mac` and `DeviceConfigPatch::with_mac` change
+    it later through `DeviceMutator::apply`, which now applies the MTU,
+    then the MAC address, then the administrative state, and reverts the
+    earlier steps in reverse order if a later one fails. A MAC in a patch
+    for a TUN device returns `InvalidState`.
+  - Added `Capability::MAC_MUTATION`. `tunnel-lattice-backend-tunrs`
+    reports it on a TAP handle on Linux and macOS. On Windows the
+    tap-windows6 driver takes the address only when the adapter is
+    created, so a patch with a MAC returns `Unsupported` there.
+
 - **Breaking (behavioral): `DeviceMutator::apply` rejects a patch for
   another device and reverts a partly applied patch.** The contract is now
   written on the trait and binds every backend.

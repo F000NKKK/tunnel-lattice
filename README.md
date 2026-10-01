@@ -63,8 +63,9 @@ addresses and routes.
 - ✅ **TUN and TAP**: raw IP (Layer 3) and Ethernet (Layer 2) devices
 - ✅ **Sync and async**: blocking `recv`/`send`, or a `futures::Stream` with
   the `tokio` or `async-io` feature
-- ✅ **Observe and mutate**: re-read name, MTU, and administrative state;
-  change MTU and up/down on an open device
+- ✅ **Observe and mutate**: re-read name, MTU, administrative state, and
+  a TAP device's MAC address; change MTU, MAC, and up/down on an open
+  device
 - ✅ **Cheap sharing**: `Handle` is `Clone` and `recv`/`send` take `&self`,
   so one device can be used from many threads
 
@@ -292,8 +293,8 @@ Tunnel Lattice layer adds and what it does not have yet.
 | `Tunnel::open(DeviceConfig)` | Create a TUN/TAP device and return a `Handle` |
 | `Handle::id` / `kind` | The identity and kind captured at open (no native call) |
 | `Handle::recv` / `send` | Blocking packet transfer |
-| `Handle::snapshot` | Current name, MTU, and administrative state |
-| `Handle::apply(DeviceConfigPatch)` | Change MTU or up/down |
+| `Handle::snapshot` | Current name, MTU, administrative state, and TAP MAC address |
+| `Handle::apply(DeviceConfigPatch)` | Change MTU, TAP MAC address (Linux, macOS), or up/down |
 | `Handle::capabilities` | What this device supports at runtime |
 | `Handle::persist` / `additional_queue` | Linux persistence and multi-queue |
 | `Handle::packet_stream` | Async `Stream` of pooled packets (`tokio` / `async-io`) |

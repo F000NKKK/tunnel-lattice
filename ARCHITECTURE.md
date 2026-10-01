@@ -176,18 +176,33 @@ does not end a stream there.
 `DeviceMutator::apply` has one contract for every backend. It checks
 every precondition before any native call:
 
-- a patch for another device, or an MTU above `u16::MAX`, returns
-  `InvalidState`;
-- then a setting the backend cannot apply returns `Unsupported`.
+- a patch for another device, an MTU above `u16::MAX`, or a MAC address
+  for a TUN device returns `InvalidState`;
+- then a setting the backend cannot apply, such as a MAC address on a
+  handle without `Capability::MAC_MUTATION`, returns `Unsupported`.
 
-It then applies the MTU before the administrative state, which goes last
-because it cannot be read back off Linux and so cannot be reverted. If a
-step fails, it reverts the earlier steps on a best-effort basis and returns
-the failed step's own error. To make that revert possible it reads the
-previous MTU first, but only when a later step exists. There is no
+It then applies the MTU, then the MAC address, then the administrative
+state, which goes last because it cannot be read back off Linux and so
+cannot be reverted. If a step fails, it reverts the earlier steps in
+reverse order on a best-effort basis and returns the failed step's own
+error. To make that revert possible it reads the previous MTU and MAC
+first, but only when a later step exists. There is no
 `PartiallyApplied` error: after any `Err`, `snapshot()` is authoritative.
 `InvalidState` therefore always means that a precondition was rejected and
 nothing changed, the same rule `net-lattice` follows.
+
+A TAP device has a MAC address; a TUN device has none. `Device::mac`
+reports it for TAP (`None` for TUN), `DeviceConfig::with_mac` requests one
+at open, and `DeviceConfigPatch::with_mac` changes it later. `MacAddress`
+is pure data shaped like `net-lattice-model`'s own, so the two convert
+through `[u8; 6]`. A MAC requested for a TUN device is refused with
+`InvalidState` before anything is created. After opening, the backend
+reads the address back; if the platform did not apply it, `open` returns
+`Unsupported` and the new device is torn down. A later change needs
+`Capability::MAC_MUTATION`, which the `tun-rs` backend reports on a TAP
+handle on Linux and macOS. On Windows the tap-windows6 driver takes the
+address from the adapter's registry settings when the adapter is created,
+so it can be requested at open but not changed afterwards.
 
 ## Frozen public API surface
 
