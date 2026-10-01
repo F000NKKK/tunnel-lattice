@@ -135,10 +135,22 @@ impl FiniteDevice {
     }
 
     fn recv_now(&self, buf: &mut [u8]) -> Result<usize> {
-        let took = self
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_ok();
+        // Decrement-if-positive as an explicit CAS loop: `fetch_update` is
+        // deprecated on newer toolchains, and its `try_update` replacement is
+        // newer than the workspace MSRV.
+        let mut n = self.remaining.load(Ordering::Acquire);
+        let took = loop {
+            let Some(next) = n.checked_sub(1) else {
+                break false;
+            };
+            match self
+                .remaining
+                .compare_exchange_weak(n, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break true,
+                Err(current) => n = current,
+            }
+        };
         if !took {
             return Err(Error::Disconnected);
         }
