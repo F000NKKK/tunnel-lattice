@@ -833,7 +833,6 @@ mod privileged_tests {
     }
 
     /// The 16-bit one's-complement sum of `bytes` (RFC 1071).
-    #[cfg(feature = "async")]
     fn ones_complement_sum(bytes: &[u8]) -> u16 {
         let (words, rest) = bytes.as_chunks::<2>();
         assert!(rest.is_empty(), "an even number of bytes");
@@ -986,5 +985,463 @@ mod privileged_tests {
         eprintln!("TAP handle capabilities: {handle:?}");
         assert_eq!(handle, expected, "a TAP handle's capabilities()");
         assert_eq!(tunnel.capabilities(), host, "unchanged by an open");
+    }
+
+    /// The payload of every echo request the concurrency tests send; the
+    /// host's echo reply carries it back unchanged.
+    const ECHO_PAYLOAD: &[u8; 16] = b"lattice-echo-req";
+
+    /// How long the concurrency tests wait for the echo reply before they
+    /// fail, and then for a released receiver to return.
+    const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// An IPv4 ICMP echo request from `source` to `destination` with
+    /// identifier `ident`, sequence number 1, and [`ECHO_PAYLOAD`], with
+    /// valid IPv4 header and ICMP checksums.
+    fn icmp_echo_request(source: [u8; 4], destination: [u8; 4], ident: u16) -> Vec<u8> {
+        let total = 20 + 8 + ECHO_PAYLOAD.len();
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x45; // version 4, header length 5 words
+        packet[2..4].copy_from_slice(&u16::try_from(total).expect("fits").to_be_bytes());
+        packet[8] = 64; // TTL
+        packet[9] = 1; // ICMP
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        let header = !ones_complement_sum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header.to_be_bytes());
+        packet[20] = 8; // echo request, code 0
+        packet[24..26].copy_from_slice(&ident.to_be_bytes());
+        packet[26..28].copy_from_slice(&1u16.to_be_bytes()); // sequence
+        packet[28..].copy_from_slice(ECHO_PAYLOAD);
+        let icmp = !ones_complement_sum(&packet[20..]);
+        packet[22..24].copy_from_slice(&icmp.to_be_bytes());
+        packet
+    }
+
+    /// Whether `packet` is the IPv4 echo reply from `local` to `peer` that
+    /// answers [`icmp_echo_request`]`(peer, local, ident)`: identifier,
+    /// sequence number, and payload all match.
+    fn is_echo_reply(packet: &[u8], local: [u8; 4], peer: [u8; 4], ident: u16) -> bool {
+        if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 1 {
+            return false;
+        }
+        let header_len = usize::from(packet[0] & 0x0f) * 4;
+        let Some(icmp) = packet.get(header_len..) else {
+            return false;
+        };
+        packet[12..16] == local
+            && packet[16..20] == peer
+            && icmp.len() == 8 + ECHO_PAYLOAD.len()
+            && icmp[0] == 0 // echo reply
+            && icmp[1] == 0
+            && icmp[4..6] == ident.to_be_bytes()
+            && icmp[6..8] == 1u16.to_be_bytes()
+            && icmp[8..] == ECHO_PAYLOAD[..]
+    }
+
+    #[test]
+    fn the_echo_request_has_valid_checksums_and_its_reply_is_recognized() {
+        let (local, peer) = ([10, 202, 7, 1], [10, 202, 7, 2]);
+        let request = icmp_echo_request(peer, local, 0x1234);
+        assert_eq!(ones_complement_sum(&request[..20]), 0xffff, "IPv4 header");
+        assert_eq!(ones_complement_sum(&request[20..]), 0xffff, "ICMP message");
+        assert!(!is_echo_reply(&request, local, peer, 0x1234), "a request");
+        // What the host answers: addresses swapped, type 0, the same
+        // identifier, sequence, and payload.
+        let mut reply = icmp_echo_request(local, peer, 0x1234);
+        reply[20] = 0;
+        assert!(is_echo_reply(&reply, local, peer, 0x1234));
+        assert!(!is_echo_reply(&reply, local, peer, 0x1235), "another ident");
+        assert!(
+            !is_echo_reply(&reply[..30], local, peer, 0x1234),
+            "truncated"
+        );
+    }
+
+    /// A per-process value, so parallel runs on one host use different
+    /// subnets and identifiers.
+    fn per_process(modulus: u32) -> u32 {
+        std::process::id() % modulus
+    }
+
+    /// Runs a host network-configuration command on the test's own device,
+    /// panicking with its output if it fails.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_host_command(program: &str, args: &[&str]) {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("run {program}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Gives the test's own TUN device the address `subnet.1` with the peer
+    /// `subnet.2` reachable through it, and brings it up. Returns
+    /// `(local, peer)`. An echo request from the peer written into the
+    /// device is answered by the host with an echo reply routed back into
+    /// the same device. The address lives on the device and goes away with
+    /// it.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn address_tun_device(name: &str, subnet: [u8; 3]) -> ([u8; 4], [u8; 4]) {
+        let [a, b, c] = subnet;
+        let (local, peer) = ([a, b, c, 1], [a, b, c, 2]);
+        let local_text = format!("{a}.{b}.{c}.1");
+        #[cfg(target_os = "linux")]
+        {
+            run_host_command(
+                "ip",
+                &["addr", "add", &format!("{local_text}/24"), "dev", name],
+            );
+            run_host_command("ip", &["link", "set", "dev", name, "up"]);
+        }
+        #[cfg(target_os = "macos")]
+        run_host_command(
+            "ifconfig",
+            &[name, "inet", &local_text, &format!("{a}.{b}.{c}.2"), "up"],
+        );
+        // As in the backend's tests: a fresh Wintun adapter is not always
+        // registered with the IP helper yet, so netsh is retried for a
+        // bounded time.
+        #[cfg(target_os = "windows")]
+        {
+            let name_arg = format!("name={name}");
+            let args = [
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                name_arg.as_str(),
+                "static",
+                &local_text,
+                "255.255.255.0",
+            ];
+            let mut attempts = 0;
+            loop {
+                let output = std::process::Command::new("netsh")
+                    .args(args)
+                    .output()
+                    .unwrap_or_else(|err| panic!("run netsh: {err}"));
+                if output.status.success() {
+                    break;
+                }
+                attempts += 1;
+                assert!(
+                    attempts < 20,
+                    "netsh {args:?} failed after {attempts} attempts: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        (local, peer)
+    }
+
+    /// Makes a `recv` blocked on the test's own TUN device return, best
+    /// effort, so a failing test can join its receiver and drop the device
+    /// before it panics: Linux deletes the device, Windows disables the
+    /// Wintun adapter (which ends its session). A macOS `utun` cannot be
+    /// destroyed from outside; like the other two, it goes away when the
+    /// test process exits.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn release_blocked_recv(device: &Handle<TunRsDevice>, name: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = device;
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", name])
+                .output();
+        }
+        #[cfg(target_os = "macos")]
+        let _ = (device, name);
+        #[cfg(target_os = "windows")]
+        {
+            let _ = name;
+            if let Ok(patch) =
+                DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
+            {
+                let _ = device.apply(patch);
+            }
+        }
+    }
+
+    /// Sends `request` through `send` every 200 ms until `stop` is set,
+    /// starting 200 ms in so the receiver is already waiting. Repeats
+    /// because the host may not answer at once (for example while Windows
+    /// still checks the new address for duplicates). Returns how many
+    /// requests went out, or the first send error.
+    fn send_until_stopped(
+        stop: &std::sync::atomic::AtomicBool,
+        request: &[u8],
+        mut send: impl FnMut(&[u8]) -> Result<usize>,
+    ) -> std::result::Result<usize, String> {
+        let mut sent = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(sent);
+            }
+            match send(request) {
+                Ok(n) if n == request.len() => sent += 1,
+                other => return Err(format!("send #{}: {other:?}", sent + 1)),
+            }
+        }
+    }
+
+    /// The outcome of one concurrent receive/send check.
+    struct Concurrency {
+        /// The receiver's result, `None` if it had not returned within
+        /// [`REPLY_TIMEOUT`] (it was then released and given
+        /// [`RELEASE_TIMEOUT`] more).
+        received: Option<std::result::Result<String, String>>,
+        /// Whether the receiver returned at all, even after a release.
+        receiver_returned: bool,
+        /// The sender's result, `None` if it did not stop in time.
+        sent: Option<std::result::Result<usize, String>>,
+    }
+
+    impl Concurrency {
+        /// Panics with every problem found, after the caller dropped the
+        /// device.
+        fn assert_ok(self, label: &str) {
+            eprintln!(
+                "{label}: received {:?}, sent {:?}",
+                self.received, self.sent
+            );
+            let mut problems = Vec::new();
+            match &self.received {
+                Some(Ok(_)) => {}
+                Some(Err(err)) => problems.push(format!("receiver failed: {err}")),
+                None => problems.push(format!(
+                    "no echo reply within {REPLY_TIMEOUT:?} (receiver returned after release: {})",
+                    self.receiver_returned
+                )),
+            }
+            match &self.sent {
+                Some(Ok(sent)) if *sent > 0 => {}
+                Some(Ok(_)) => problems.push("no request was sent".to_owned()),
+                Some(Err(err)) => problems.push(format!("sender failed: {err}")),
+                None => problems.push(format!(
+                    "the sender did not stop within {RELEASE_TIMEOUT:?}: send may be deadlocked"
+                )),
+            }
+            assert!(problems.is_empty(), "{label}: {}", problems.join("; "));
+        }
+    }
+
+    /// Two clones of one `Handle` on two threads: one blocks in
+    /// `Handle::recv` while the other writes ICMP echo requests with
+    /// `Handle::send`; the host's echo reply must reach the blocked `recv`
+    /// within [`REPLY_TIMEOUT`]. In the `tokio` build both threads enter
+    /// the test's multi-thread runtime, as the blocking calls require.
+    ///
+    /// On a timeout the receiver is released ([`release_blocked_recv`]) and
+    /// joined if it returns; the sender is joined once it stops. The device
+    /// is dropped before any assertion fails.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open and address a TUN device"]
+    fn cloned_handles_recv_and_send_concurrently_on_two_threads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = Tunnel::connect()
+            .open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))
+            .expect("open a TUN device");
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let octet = u8::try_from(per_process(200)).expect("below 200") + 20;
+        let (local, peer) = address_tun_device(&snapshot.name, [10, 202, octet]);
+        let ident = u16::try_from(per_process(0x8000)).expect("below 0x8000");
+        let request = icmp_echo_request(peer, local, ident);
+        let buf_len = snapshot.recv_buffer_len();
+
+        let (received_tx, received_rx) = mpsc::channel();
+        let receiver = {
+            let reader = device.clone();
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                #[cfg(feature = "tokio")]
+                let _entered = runtime.enter();
+                let mut buf = vec![0u8; buf_len];
+                let mut skipped = 0usize;
+                let result = loop {
+                    match reader.recv(&mut buf) {
+                        Ok(n) if is_echo_reply(&buf[..n], local, peer, ident) => {
+                            break Ok(format!("{n}-byte echo reply after {skipped} other packets"));
+                        }
+                        Ok(_) | Err(Error::BufferTooSmall) => skipped += 1,
+                        Err(err) => break Err(format!("recv: {err:?}")),
+                    }
+                };
+                let _ = received_tx.send(result);
+            })
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let sender = {
+            let writer = device.clone();
+            let stop = Arc::clone(&stop);
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                #[cfg(feature = "tokio")]
+                let _entered = runtime.enter();
+                let result = send_until_stopped(&stop, &request, |packet| writer.send(packet));
+                let _ = sent_tx.send(result);
+            })
+        };
+
+        let received = received_rx.recv_timeout(REPLY_TIMEOUT).ok();
+        stop.store(true, Ordering::Release);
+        let receiver_returned = if received.is_some() {
+            true
+        } else {
+            release_blocked_recv(&device, &snapshot.name);
+            received_rx.recv_timeout(RELEASE_TIMEOUT).is_ok()
+        };
+        let sent = sent_rx.recv_timeout(RELEASE_TIMEOUT).ok();
+        if sent.is_some() {
+            sender.join().expect("the sender thread does not panic");
+        }
+        if receiver_returned {
+            receiver.join().expect("the receiver thread does not panic");
+        }
+        drop(device);
+        Concurrency {
+            received,
+            receiver_returned,
+            sent,
+        }
+        .assert_ok("threads, blocking recv/send");
+    }
+
+    /// The async counterpart: a `packet_stream` on one clone is polled as
+    /// a task (on the Tokio runtime with `tokio`, on its own thread with
+    /// `async-io`) while another thread sends the echo requests with
+    /// `send_async` through a second clone; the reply must come out of the
+    /// stream. On a timeout the stream is cancelled, which drops it and
+    /// its in-flight receive.
+    #[cfg(feature = "async")]
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open and address a TUN device"]
+    fn cloned_handles_stream_and_send_async_concurrently() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        use futures::StreamExt;
+
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = Tunnel::connect()
+            .open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))
+            .expect("open a TUN device");
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let octet = u8::try_from(per_process(200)).expect("below 200") + 20;
+        let (local, peer) = address_tun_device(&snapshot.name, [10, 203, octet]);
+        let ident = u16::try_from(per_process(0x8000)).expect("below 0x8000") | 0x8000;
+        let request = icmp_echo_request(peer, local, ident);
+
+        let mut stream = device
+            .clone()
+            .packet_stream(snapshot.recv_buffer_len())
+            .expect("a valid buf_len");
+        let (cancel_tx, cancel_rx) = futures::channel::oneshot::channel::<()>();
+        let (received_tx, received_rx) = mpsc::channel();
+        let receive = async move {
+            let mut skipped = 0usize;
+            let wait = async {
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(packet) if is_echo_reply(&packet, local, peer, ident) => {
+                            return Ok(format!(
+                                "{}-byte echo reply after {skipped} other packets",
+                                packet.len()
+                            ));
+                        }
+                        Ok(_) | Err(Error::BufferTooSmall) => skipped += 1,
+                        Err(err) => return Err(format!("stream item: {err:?}")),
+                    }
+                }
+                Err("the stream ended".to_owned())
+            };
+            let result = match futures::future::select(Box::pin(wait), cancel_rx).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => Err("cancelled".to_owned()),
+            };
+            let _ = received_tx.send(result);
+        };
+        #[cfg(feature = "tokio")]
+        let receiver = runtime.spawn(receive);
+        #[cfg(not(feature = "tokio"))]
+        let receiver = std::thread::spawn(move || futures::executor::block_on(receive));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let sender = {
+            let writer = device.clone();
+            let stop = Arc::clone(&stop);
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                let result = send_until_stopped(&stop, &request, |packet| {
+                    #[cfg(feature = "tokio")]
+                    {
+                        runtime.block_on(writer.send_async(packet))
+                    }
+                    #[cfg(not(feature = "tokio"))]
+                    {
+                        futures::executor::block_on(writer.send_async(packet))
+                    }
+                });
+                let _ = sent_tx.send(result);
+            })
+        };
+
+        let received = received_rx.recv_timeout(REPLY_TIMEOUT).ok();
+        stop.store(true, Ordering::Release);
+        let receiver_returned = if received.is_some() {
+            true
+        } else {
+            let _ = cancel_tx.send(());
+            received_rx.recv_timeout(RELEASE_TIMEOUT).is_ok()
+        };
+        let sent = sent_rx.recv_timeout(RELEASE_TIMEOUT).ok();
+        if sent.is_some() {
+            sender.join().expect("the sender thread does not panic");
+        }
+        if receiver_returned {
+            #[cfg(feature = "tokio")]
+            runtime
+                .block_on(receiver)
+                .expect("the receiver task does not panic");
+            #[cfg(not(feature = "tokio"))]
+            receiver.join().expect("the receiver thread does not panic");
+        }
+        drop(device);
+        Concurrency {
+            received,
+            receiver_returned,
+            sent,
+        }
+        .assert_ok("packet_stream + send_async");
     }
 }
