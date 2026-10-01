@@ -3,13 +3,9 @@
 Tunnel Lattice tracks all roadmap work in the YouTrack project `TL`
 (https://hush.youtrack.cloud/projects/TL), via the `youtrack` MCP tools
 (`mcp__youtrack__*`). This replaces the former file-based `.ai/<task-name>/`
-workflow (`plan.md`, `AUDIT.md`, `adr/`), which has been retired.
-
-This project's YouTrack `TL` project does not exist yet — the user will
-create it later. This file records the intended convention (mirroring
-`net-lattice`'s own `NL` project in the sibling Lattice ecosystem) to follow
-once it does; do not attempt to call `mcp__youtrack__*` tools against `TL`
-until the user confirms the project exists.
+workflow (`plan.md`, `AUDIT.md`, `adr/`), which has been retired. The
+convention mirrors `net-lattice`'s own `NL` project in the sibling Lattice
+ecosystem.
 
 ## Issue hierarchy
 
@@ -230,9 +226,8 @@ ADR before drafting a new one.
 
 ## Boards
 
-No Agile board exists on `TL` yet — the project itself does not exist yet
-(see the note at the top of this file). Once the user creates it, expect two
-boards mirroring `net-lattice`'s `NL` project: one with swimlanes by `Epic`
+Expect two Agile boards on `TL`, mirroring `net-lattice`'s `NL` project:
+one with swimlanes by `Epic`
 (stage-level progress) and one with swimlanes by nearest parent issue
 regardless of Type (day-to-day Task breakdown per Story). Boards are
 UI-configured (columns/swimlanes/filters); agents cannot create or

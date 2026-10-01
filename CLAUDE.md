@@ -12,12 +12,9 @@ files directly. Read before making changes:
    in `.claude/agents/` (`researcher.md`, `architect.md`, `implementer.md`,
    `reviewer.md`).
 4. The active work item in the YouTrack `TL` project (Tunnel Lattice) via
-   the `mcp__youtrack__*` tools, once it exists — find the relevant Epic
-   (roadmap stage), its User Story/Task children, and any linked ADR
-   Articles under `TL-A-1` before editing anything. **The `TL` project does
-   not exist yet** (see `@.claude/rules/youtrack.md`'s opening note); until
-   the user confirms it does, work from `index.md`/`ARCHITECTURE.md` and the
-   user's own instructions instead of a YouTrack issue.
+   the `mcp__youtrack__*` tools — find the relevant Epic (roadmap stage),
+   its User Story/Task children, and any linked ADR Articles under `TL-A-1`
+   before editing anything.
 
 ## Role pipeline
 
@@ -38,7 +35,7 @@ YouTrack Task and record the result as a comment on it (`add_issue_comment`);
 advance its `Stage` field to `Done` only after reviewer findings and
 verification evidence are resolved. For small, tightly-scoped work it's fine
 to fold a role into your own turn instead of spawning a subagent, but still
-post the evidence comment as if that role had run — once `TL` exists.
+post the evidence comment as if that role had run.
 
 These rules apply to you directly too, not just inside a subagent. Ported
 into `.claude/rules/` (native Claude Code auto-loaded imports below) so they
