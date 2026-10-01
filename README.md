@@ -287,7 +287,10 @@ Tunnel Lattice layer adds and what it does not have yet.
 | Item | Purpose |
 |------|---------|
 | `Tunnel::connect()` | Connect to the default backend |
+| `Tunnel::new(backend)` | Use any backend, including your own or a test double |
+| `Tunnel::capabilities` | What the host supports before opening a device |
 | `Tunnel::open(DeviceConfig)` | Create a TUN/TAP device and return a `Handle` |
+| `Handle::id` / `kind` | The identity and kind captured at open (no native call) |
 | `Handle::recv` / `send` | Blocking packet transfer |
 | `Handle::snapshot` | Current name, MTU, and administrative state |
 | `Handle::apply(DeviceConfigPatch)` | Change MTU or up/down |

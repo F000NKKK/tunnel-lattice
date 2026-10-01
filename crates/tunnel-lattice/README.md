@@ -36,6 +36,12 @@ configuration once a device exists.
 
 - ✅ `Tunnel::connect()`, a stateless connection to the default
   `tun-rs`-backed backend (the `tun-rs` feature, enabled by default);
+- ✅ `Tunnel::new(backend)`, wrapping any backend that implements the
+  `tunnel-lattice-platform` traits, including your own or a test double,
+  and `Tunnel::capabilities()`, what the host supports before a device is
+  opened;
+- ✅ `Handle::id`/`kind`, the identity and kind captured at open (no
+  native call; read the current name with `snapshot()`);
 - ✅ `Tunnel::open(DeviceConfig)`, creating a new TUN or TAP device and
   returning a `Handle` to it;
 - ✅ `Handle::recv`/`send`, blocking packet transfer on an open device;

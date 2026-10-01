@@ -73,6 +73,16 @@ public API:
   selectable *alongside* `tun-rs` rather than only ever replacing it whole —
   a caller could depend on `tunnel-lattice` with `default-features = false,
   features = ["linux-native"]` once that exists;
+- any backend, including one written outside this workspace or a test
+  double, is injected with `Tunnel::new(backend)`; the `tun-rs` feature
+  only adds `Tunnel::connect()` as shorthand for
+  `Tunnel::new(TunRsBackend::new())`. `Tunnel::capabilities()` reports what
+  the host supports before any device is opened (for example whether a TAP
+  driver was found), but `open` stays authoritative. `Handle::id()` and
+  `Handle::kind()` make no native call: the identity is captured at open
+  (`DeviceObserver::id`) and need not equal the interface's current OS
+  index, which is why interop with `net-lattice` resolves the interface by
+  name;
 - when a per-OS backend eventually covers every platform `tun-rs` covers
   today, dropping the `tun-rs` feature (and the dependency itself) becomes a
   backend-crate-only change: nothing in `tunnel-lattice-model` or

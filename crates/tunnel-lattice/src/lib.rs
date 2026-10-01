@@ -47,17 +47,19 @@
 #![warn(missing_docs)]
 
 #[cfg(feature = "async")]
-pub use tunnel_lattice_async::{PacketBuf, PacketPool};
-pub use tunnel_lattice_core::{Error, Result};
+pub use tunnel_lattice_async::{PacketBuf, PacketPool, PacketStream};
+#[cfg(feature = "tun-rs")]
+pub use tunnel_lattice_backend_tunrs::{TunRsBackend, TunRsDevice};
+pub use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 pub use tunnel_lattice_model::{
     AdminState, DesiredAdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
 };
 #[cfg(feature = "async")]
-use tunnel_lattice_platform::AsyncPacketIo;
+pub use tunnel_lattice_platform::AsyncPacketIo;
 pub use tunnel_lattice_platform::{
-    Capability, CapabilityProvider, MultiQueueProvider, PersistentDevice,
+    Capability, CapabilityProvider, DeviceMutator, DeviceObserver, DeviceProvider,
+    MultiQueueProvider, PacketIo, PersistentDevice,
 };
-use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
 
 /// An open device handle bound to this facade's concrete model types.
 ///
@@ -91,6 +93,51 @@ pub struct Tunnel<B> {
     backend: B,
 }
 
+impl<B> Tunnel<B> {
+    /// Wraps any backend, for example one implemented outside this
+    /// workspace or a test double.
+    ///
+    /// `open` is available once the backend implements [`DeviceProvider`]
+    /// with this crate's [`DeviceConfig`] and a device type satisfying
+    /// [`ConnectedDevice`]; other methods need only their own bound:
+    ///
+    /// ```
+    /// use tunnel_lattice::{Capability, CapabilityProvider, Tunnel};
+    ///
+    /// /// A backend that reports no capabilities.
+    /// struct Minimal;
+    ///
+    /// impl CapabilityProvider for Minimal {
+    ///     fn capabilities(&self) -> Capability {
+    ///         Capability::empty()
+    ///     }
+    /// }
+    ///
+    /// let tunnel = Tunnel::new(Minimal);
+    /// assert!(tunnel.capabilities().is_empty());
+    /// ```
+    pub const fn new(backend: B) -> Self {
+        Self { backend }
+    }
+}
+
+impl<B> Tunnel<B>
+where
+    B: CapabilityProvider,
+{
+    /// Returns the capabilities the backend reports for this host before
+    /// any device is opened.
+    ///
+    /// A capability that depends on the host (for example a driver that
+    /// may not be installed) is reported only if the backend detected it.
+    /// `open` stays authoritative: it is never refused in advance because
+    /// of this answer. A [`Handle`]'s own [`Handle::capabilities`] can add
+    /// flags that depend on the opened device.
+    pub fn capabilities(&self) -> Capability {
+        self.backend.capabilities()
+    }
+}
+
 impl<B> Tunnel<B>
 where
     B: DeviceProvider<DeviceConfig = DeviceConfig>,
@@ -98,24 +145,25 @@ where
 {
     /// Opens a new device matching `config`.
     pub fn open(&self, config: DeviceConfig) -> Result<Handle<B::Device>> {
+        let kind = config.kind;
         Ok(Handle {
             device: std::sync::Arc::new(self.backend.open(config)?),
+            kind,
         })
     }
 }
 
 #[cfg(feature = "tun-rs")]
-impl Tunnel<tunnel_lattice_backend_tunrs::TunRsBackend> {
-    /// Connects the default `tun-rs`-backed backend.
+impl Tunnel<TunRsBackend> {
+    /// Connects the default `tun-rs`-backed backend; the same as
+    /// `Tunnel::new(TunRsBackend::new())`.
     ///
     /// Stateless and infallible: `tun-rs` has no persistent connection step
     /// analogous to `net_lattice::Lattice::connect`'s Netlink/WFP/
     /// route-socket handshake — the privileged step is opening a device,
     /// not connecting the backend.
     pub fn connect() -> Self {
-        Self {
-            backend: tunnel_lattice_backend_tunrs::TunRsBackend::new(),
-        }
+        Self::new(TunRsBackend::new())
     }
 }
 
@@ -163,6 +211,7 @@ impl Tunnel<tunnel_lattice_backend_tunrs::TunRsBackend> {
 /// `async-io`/`tokio` features).
 pub struct Handle<D> {
     device: std::sync::Arc<D>,
+    kind: DeviceKind,
 }
 
 impl<D> Clone for Handle<D> {
@@ -172,6 +221,7 @@ impl<D> Clone for Handle<D> {
     fn clone(&self) -> Self {
         Handle {
             device: std::sync::Arc::clone(&self.device),
+            kind: self.kind,
         }
     }
 }
@@ -180,6 +230,26 @@ impl<D> Handle<D>
 where
     D: ConnectedDevice,
 {
+    /// Returns this handle's device identity, captured when the device was
+    /// opened. Makes no native call.
+    ///
+    /// Equal to `snapshot()?.id`. It is not guaranteed to equal the
+    /// interface's current OS index (see [`DeviceId`]); to find the same
+    /// interface through `net-lattice`, resolve it by `snapshot()?.name`.
+    ///
+    /// There is deliberately no `name()` shortcut: an interface can be
+    /// renamed outside this process, so read the current name with
+    /// `snapshot()?.name`.
+    pub fn id(&self) -> DeviceId {
+        self.device.id()
+    }
+
+    /// Returns whether this device is TUN or TAP, as requested at open.
+    /// Makes no native call.
+    pub fn kind(&self) -> DeviceKind {
+        self.kind
+    }
+
     /// Reads one packet into `buf`, returning the number of bytes written.
     pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
         self.device.recv(buf)
@@ -230,6 +300,7 @@ where
     pub fn additional_queue(&self) -> Result<Handle<D>> {
         Ok(Handle {
             device: std::sync::Arc::new(self.device.additional_queue()?),
+            kind: self.kind,
         })
     }
 }
@@ -350,6 +421,101 @@ where
     }
 }
 
+/// Mock-based tests of backend injection and handle identity (no privilege,
+/// no real device).
+#[cfg(test)]
+mod facade_tests {
+    use super::*;
+
+    /// A backend whose devices get the identity `7`.
+    struct MockBackend;
+
+    impl CapabilityProvider for MockBackend {
+        fn capabilities(&self) -> Capability {
+            Capability::PERSISTENT_DEVICES
+        }
+    }
+
+    impl DeviceProvider for MockBackend {
+        type DeviceConfig = DeviceConfig;
+        type Device = MockDevice;
+
+        fn open(&self, config: DeviceConfig) -> Result<MockDevice> {
+            Ok(MockDevice {
+                id: DeviceId::new(7),
+                kind: config.kind,
+            })
+        }
+    }
+
+    struct MockDevice {
+        id: DeviceId,
+        kind: DeviceKind,
+    }
+
+    impl PacketIo for MockDevice {
+        fn recv(&self, _buf: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    impl DeviceObserver for MockDevice {
+        type Device = Device;
+
+        fn snapshot(&self) -> Result<Device> {
+            Ok(Device::new(
+                self.id,
+                "mock0".to_owned(),
+                self.kind,
+                1500,
+                AdminState::Up,
+            ))
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    impl DeviceMutator for MockDevice {
+        type DeviceConfigPatch = DeviceConfigPatch;
+
+        fn apply(&self, _patch: DeviceConfigPatch) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapabilityProvider for MockDevice {
+        fn capabilities(&self) -> Capability {
+            Capability::empty()
+        }
+    }
+
+    #[test]
+    fn tunnel_new_reports_the_injected_backends_capabilities() {
+        let tunnel = Tunnel::new(MockBackend);
+        assert_eq!(tunnel.capabilities(), Capability::PERSISTENT_DEVICES);
+    }
+
+    #[test]
+    fn handle_identity_matches_the_snapshot_and_the_requested_kind() {
+        let tunnel = Tunnel::new(MockBackend);
+        for kind in [DeviceKind::Tun, DeviceKind::Tap] {
+            let handle = tunnel.open(DeviceConfig::new(kind)).expect("open");
+            assert_eq!(handle.kind(), kind);
+            let snapshot = handle.snapshot().expect("snapshot");
+            assert_eq!(handle.id(), snapshot.id);
+            assert_eq!(handle.kind(), snapshot.kind);
+            let clone = handle.clone();
+            assert_eq!((clone.id(), clone.kind()), (handle.id(), handle.kind()));
+        }
+    }
+}
+
 /// Mock-based tests of the facade's stream constructors (no privilege, no
 /// real device).
 #[cfg(all(test, feature = "async"))]
@@ -375,6 +541,7 @@ mod stream_tests {
                     native,
                     packets: std::sync::Mutex::new(vec![b"pkt"]),
                 }),
+                kind: DeviceKind::Tun,
             }
         }
 

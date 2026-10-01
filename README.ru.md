@@ -289,7 +289,10 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 | Элемент | Назначение |
 |---------|------------|
 | `Tunnel::connect()` | Подключение к бэкенду по умолчанию |
+| `Tunnel::new(backend)` | Любой бэкенд, включая собственный или тестовый двойник |
+| `Tunnel::capabilities` | Что поддерживает хост до открытия устройства |
 | `Tunnel::open(DeviceConfig)` | Создать устройство TUN/TAP и вернуть `Handle` |
+| `Handle::id` / `kind` | Идентификатор и тип, зафиксированные при открытии (без нативного вызова) |
 | `Handle::recv` / `send` | Блокирующая передача пакетов |
 | `Handle::snapshot` | Текущие имя, MTU и административное состояние |
 | `Handle::apply(DeviceConfigPatch)` | Изменить MTU или up/down |

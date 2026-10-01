@@ -181,6 +181,8 @@ impl TunRsBackend {
 /// these errors (every error except [`Error::BufferTooSmall`] ends it).
 pub struct TunRsDevice {
     kind: DeviceKind,
+    /// The interface index read once at open; see [`DeviceObserver::id`].
+    id: DeviceId,
     /// The error-aware receive registration (see above). Declared before
     /// `handle` so it drops, and deregisters, first.
     #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -343,9 +345,13 @@ impl DeviceProvider for TunRsBackend {
                 open_contract::host_name_exists,
             )
         })?;
+        // On failure `handle` drops: a new device is torn down, an attached
+        // persistent one is detached.
+        let id = read_device_id(&handle)?;
 
         Ok(TunRsDevice {
             kind: config.kind,
+            id,
             // On failure `handle` drops: a new device is torn down, an
             // attached persistent one is detached.
             #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -359,6 +365,16 @@ impl DeviceProvider for TunRsBackend {
             },
             handle,
         })
+    }
+}
+
+/// Reads the interface index that becomes the device's identity. On Linux
+/// and macOS `tun-rs` returns `if_nametoindex`, where `0` means the lookup
+/// failed, so `0` is an error rather than an identity.
+fn read_device_id(handle: &tun_rs::DeviceImpl) -> Result<DeviceId> {
+    match handle.if_index().map_err(io_error)? {
+        0 => Err(Error::Platform(PlatformErrorCode::Unknown)),
+        index => Ok(DeviceId::new(u64::from(index))),
     }
 }
 
@@ -517,8 +533,14 @@ impl AsyncPacketIo for TunRsDevice {
 impl DeviceObserver for TunRsDevice {
     type Device = Device;
 
+    fn id(&self) -> DeviceId {
+        self.id
+    }
+
+    /// The returned record's `id` is the identity captured at open
+    /// ([`DeviceObserver::id`]), not a fresh index read.
     fn snapshot(&self) -> Result<Device> {
-        let id = DeviceId::new(u64::from(self.handle.if_index().map_err(io_error)?));
+        let id = self.id;
         let name = self.handle.name().map_err(io_error)?;
         let mtu = u32::from(self.handle.mtu().map_err(io_error)?);
         // `is_running` (IFF_UP | IFF_RUNNING) is a Linux-only read on
@@ -578,6 +600,7 @@ impl MultiQueueProvider for TunRsDevice {
         let handle = self.handle.try_clone().map_err(io_error)?;
         Ok(TunRsDevice {
             kind: self.kind,
+            id: self.id,
             #[cfg(all(target_os = "linux", feature = "tokio"))]
             reader: tokio_linux::ErrorAwareReader::new(&*handle).map_err(io_error)?,
             handle,
@@ -950,6 +973,8 @@ mod privileged_tests {
         assert_eq!(snapshot.kind, DeviceKind::Tun);
         assert_eq!(snapshot.mtu, 1400);
         assert!(!snapshot.name.is_empty());
+        assert_ne!(device.id().value(), 0, "an OS interface index is never 0");
+        assert_eq!(snapshot.id, device.id());
     }
 
     #[test]

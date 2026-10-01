@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking: `DeviceObserver` gains a required `id()` method, and the
+  facade can wrap any backend.** `id()` returns the device identity
+  captured when the device was opened, without a native call; the record
+  returned by `snapshot()` must carry the same identity. A backend
+  implemented outside this workspace must add the method.
+  - `tunnel-lattice-backend-tunrs` reads the interface index once at
+    `open` and keeps it. `snapshot().id` no longer re-reads the index, so
+    it stays stable if Windows re-indexes the adapter after a disable and
+    re-enable. `open` now fails with `Error::Platform` if the OS reports
+    index 0, and the new device is torn down. The identity is not
+    guaranteed to equal the interface's current OS index; resolve an
+    interface by name to use it with `net-lattice`.
+  - Added `Tunnel::new(backend)` to wrap any backend, including one
+    written outside this workspace or a test double. `Tunnel::connect()` is
+    now shorthand for `Tunnel::new(TunRsBackend::new())`.
+  - Added `Tunnel::capabilities()`, available when the backend implements
+    `CapabilityProvider`. It reports what the host supports before any
+    device is opened; `open` is never refused because of it.
+  - Added `Handle::id()` and `Handle::kind()`, both without a native call.
+    There is deliberately no `Handle::name()`: an interface can be renamed
+    outside this process, so read the current name with `snapshot()`.
+  - The facade now re-exports `PlatformErrorCode`, `PacketIo`,
+    `DeviceProvider`, `DeviceObserver`, `DeviceMutator`, `TunRsBackend` and
+    `TunRsDevice` (the last two with the `tun-rs` feature), and
+    `AsyncPacketIo` and `PacketStream` with an async feature, so a custom
+    backend needs no direct dependency on the inner crates.
+
 - **Breaking: `PacketStream` yields `Result<PacketBuf>` instead of
   `Result<Vec<u8>>`, and the stream constructors become fallible.** Each
   packet is now received straight into a slot of a `PacketPool` and handed

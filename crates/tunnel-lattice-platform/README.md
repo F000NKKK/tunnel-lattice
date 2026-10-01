@@ -43,7 +43,8 @@ public API. The workspace
   `tunnel_lattice_model` types directly).
 - ✅ **`PacketIo`**: synchronous packet transfer on an open device handle.
 - ✅ **`DeviceObserver`**: reads an open device's current name, MTU, and
-  administrative state back.
+  administrative state back, and returns the device identity captured at
+  open without a native call.
 - ✅ **`DeviceMutator: DeviceObserver`**: changes an open device's MTU or
   administrative state, gated by `Capability::DEVICE_MUTATION`.
 - ✅ **`PersistentDevice`**: marks an open device to survive process exit,

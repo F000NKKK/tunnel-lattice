@@ -7,6 +7,13 @@ use tunnel_lattice_core::{Error, Id, Result};
 /// after the device is created, a `tun-rs` internal device index, ...) to
 /// `u64` — `DeviceId::new(u64::from(native_index))`. No backend derives a
 /// `DeviceId` from a hash.
+///
+/// A `DeviceId` identifies an open handle's device as captured when it was
+/// opened. It is not guaranteed to equal the interface's current OS index:
+/// Windows can re-index an adapter after it is disabled and re-enabled, and
+/// moving a Linux device to another network namespace can re-index it. To
+/// find the same interface through another crate (for example
+/// `net-lattice`), resolve it by `Device::name` instead.
 pub type DeviceId = Id<Device>;
 
 /// Whether a device presents Ethernet-framed (TAP) or raw IP (TUN) packets.
