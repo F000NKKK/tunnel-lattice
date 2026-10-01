@@ -1512,9 +1512,11 @@ mod privileged_tests {
             .recv_buffer_len();
         let device = Arc::new(device);
         #[cfg(feature = "async")]
-        let mut stream = tunnel_lattice_async::from_async_device(Arc::clone(&device), buf_len);
+        let mut stream = tunnel_lattice_async::from_async_device(Arc::clone(&device), buf_len)
+            .expect("a valid buf_len");
         #[cfg(not(feature = "async"))]
-        let mut stream = tunnel_lattice_async::from_device(Arc::clone(&device), buf_len);
+        let mut stream = tunnel_lattice_async::from_device(Arc::clone(&device), buf_len)
+            .expect("a valid buf_len");
 
         #[cfg(feature = "tokio")]
         let runtime = tokio::runtime::Handle::current();

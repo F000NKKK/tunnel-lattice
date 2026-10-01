@@ -38,3 +38,18 @@ or MTU/administrative-state mutation.
 
 Out of scope: `tun-rs` itself (report upstream), and any code path only
 reachable with attacker-controlled `Cargo.toml`/build configuration.
+
+## Packet buffer reuse
+
+`tunnel-lattice-async`'s `PacketStream` receives packets into the slots of a
+`PacketPool` and reuses those slots without re-zeroing them. A `PacketBuf`
+only exposes the bytes the device's `recv` reported, so this is safe as long
+as the backend honors `recv`'s contract that every reported byte was
+written. A backend that reports more bytes than it wrote could expose stale
+bytes from an earlier packet, possibly one received by another stream
+sharing the same pool. That is an information leak, not undefined
+behaviour, and `tunnel-lattice-backend-tunrs` conforms. If streams for
+different trust domains must not see each other's data, give each stream
+its own pool (the default for `packet_stream` and the `buf_len`
+constructors). A backend that violates this contract is in scope for a
+report.

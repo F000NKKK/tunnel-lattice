@@ -20,7 +20,9 @@ application-facing Tunnel Lattice crate.
   `tunnel-lattice-backend-tunrs` — see "Persistent devices and multi-queue"
   below);
 - with the `async-io` or `tokio` feature (mutually exclusive):
-  `Handle::packet_stream`, a `futures::Stream` of received packets.
+  `Handle::packet_stream` and `Handle::packet_stream_with_pool`, a
+  `futures::Stream` of received packets, each a `PacketBuf` view into a
+  `PacketPool` slot (both re-exported here).
 
 This crate does not assign IP addresses to the interfaces it creates — see
 `net-lattice` in the sibling Lattice ecosystem for OS network configuration
@@ -64,8 +66,9 @@ current MTU, except for a double-tagged (QinQ) TAP frame.
   be added alongside it rather than replacing it — see the workspace
   `ARCHITECTURE.md`, "Backend replacement plan."
 - `async-io` / `tokio` (mutually exclusive; enabling both is a compile
-  error from `tun-rs`) — either adds `Handle::packet_stream`, a
-  `futures::Stream` of received packets. `async-io` selects `tun-rs`'s
+  error from `tun-rs`) — either adds `Handle::packet_stream` and
+  `Handle::packet_stream_with_pool`, a `futures::Stream` of received
+  packets. `async-io` selects `tun-rs`'s
   `async-io`/`blocking`-based backend (no tokio dependency); `tokio` selects
   its tokio-based one. Uses a backend's native async path (no worker
   thread; dropping the stream genuinely cancels the in-flight `recv`) when
@@ -74,13 +77,20 @@ current MTU, except for a double-tagged (QinQ) TAP frame.
   reachable at all — otherwise falls back to `tunnel-lattice-async`'s
   thread-based adapter, whose shutdown is best-effort only. Its `buf_len`
   argument is the per-packet buffer size; pass
-  `handle.snapshot()?.recv_buffer_len()`. An oversize packet yields
-  `Err(Error::BufferTooSmall)` and the stream keeps receiving; every other
-  error (`Err(Error::Disconnected)` for a deleted device, or a recoverable
-  one such as `Err(Error::InvalidState)` for a disabled interface) is
-  yielded once and ends the stream, so call `packet_stream` again for a new
-  stream after recovering. No async runtime dependency is imposed when
-  neither feature is enabled.
+  `handle.snapshot()?.recv_buffer_len()`. `packet_stream` returns
+  `Err(Error::InvalidState)` only for a rejected `buf_len` (zero, or too
+  large for a pool slot); `packet_stream_with_pool` takes a `PacketPool`
+  you built instead and cannot fail. Each item is exactly one packet (one
+  IP packet for TUN, one Ethernet frame for TAP) received straight into a
+  pool slot, with no allocation or copy per packet; dropping the
+  `PacketBuf` returns the slot, and a consumer holding every slot pauses
+  the stream until it drops one. Call `to_vec()` for an owned copy. An
+  oversize packet yields `Err(Error::BufferTooSmall)` and the stream keeps
+  receiving; every other error (`Err(Error::Disconnected)` for a deleted
+  device, or a recoverable one such as `Err(Error::InvalidState)` for a
+  disabled interface) is yielded once and ends the stream, so call
+  `packet_stream` again for a new stream after recovering. No async
+  runtime dependency is imposed when neither feature is enabled.
 
   **With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
   multi-threaded Tokio runtime entered on the calling thread**

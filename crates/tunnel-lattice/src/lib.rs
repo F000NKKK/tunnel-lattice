@@ -33,7 +33,9 @@
 //!   the workspace `ARCHITECTURE.md`, "Backend replacement plan."
 //! - `async-io`/`tokio`: mutually exclusive, matching `tun-rs`'s own two
 //!   async backends (enabling both is a compile error). Either one adds
-//!   `Handle::packet_stream`, a `futures::Stream` of received packets. Uses
+//!   `Handle::packet_stream` and `Handle::packet_stream_with_pool`, a
+//!   `futures::Stream` of received packets, each a `PacketBuf` view into a
+//!   `PacketPool` slot (both re-exported under these features). Uses
 //!   a backend's native async I/O path when it reports
 //!   `Capability::NATIVE_ASYNC`; otherwise falls back to
 //!   `tunnel-lattice-async`'s thread-based adapter. No async runtime is
@@ -44,6 +46,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "async")]
+pub use tunnel_lattice_async::{PacketBuf, PacketPool};
 pub use tunnel_lattice_core::{Error, Result};
 pub use tunnel_lattice_model::{
     AdminState, DesiredAdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
@@ -237,6 +241,13 @@ where
 {
     /// Returns a `futures::Stream` of received packets.
     ///
+    /// Each `Ok` item is a [`PacketBuf`] holding exactly one packet as
+    /// [`PacketIo::recv`] frames it (one raw IP packet for TUN, one Ethernet
+    /// frame for TAP), received straight into a slot of a [`PacketPool`]
+    /// built with `PacketPool::with_buf_len(buf_len)`. Dropping the item
+    /// returns its slot; while the consumer holds every slot, the stream
+    /// waits instead of receiving. Use `to_vec()` for an owned copy.
+    ///
     /// `buf_len` is the per-packet receive buffer size; use
     /// `self.snapshot()?.recv_buffer_len()` ([`Device::recv_buffer_len`]),
     /// which fits one packet at the device's current MTU, Ethernet framing
@@ -252,13 +263,19 @@ where
     /// `DesiredAdminState::Up`), call `packet_stream` again for a new
     /// stream.
     ///
+    /// The stream adapter never yields `InvalidState` for its own reasons;
+    /// a rejected `buf_len` is reported only by this method's own `Err`.
+    /// With the tun-rs backend, an `InvalidState` item means the Windows
+    /// (Wintun) interface is currently disabled, which is recoverable; other
+    /// backends define their own meaning.
+    ///
     /// ```no_run
     /// # #[cfg(any(feature = "async-io", feature = "tokio"))]
     /// # fn example() -> tunnel_lattice::Result<()> {
     /// use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
     ///
     /// let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tap))?;
-    /// let stream = device.packet_stream(device.snapshot()?.recv_buffer_len());
+    /// let stream = device.packet_stream(device.snapshot()?.recv_buffer_len())?;
     /// # let _ = stream;
     /// # Ok(())
     /// # }
@@ -277,15 +294,157 @@ where
     /// makes a backend build its async-capable handle in the first place),
     /// so the fallback path exists for a hypothetical future backend with
     /// no native async support, not for anything shipped today.
-    pub fn packet_stream(&self, buf_len: usize) -> tunnel_lattice_async::PacketStream {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidState`] only if `buf_len` is rejected (zero, or too
+    /// large for a pool slot; see [`PacketPool::new`]). Nothing is allocated
+    /// and the device is not touched in that case.
+    ///
+    /// # Panics
+    ///
+    /// On the thread-bridge branch (a device without
+    /// `Capability::NATIVE_ASYNC`), if the OS cannot spawn the worker thread.
+    ///
+    /// # Aborts
+    ///
+    /// If the pool's slab allocation fails, as [`PacketPool::new`] does.
+    pub fn packet_stream(&self, buf_len: usize) -> Result<tunnel_lattice_async::PacketStream> {
+        Ok(self.packet_stream_with_pool(PacketPool::with_buf_len(buf_len)?))
+    }
+
+    /// Like `packet_stream`, but receives into `pool`, which may be shared
+    /// with other streams. Every item's length is at most `pool.buf_len()`.
+    ///
+    /// Streams that share a pool share its slots: a consumer that holds
+    /// many items can starve the other streams on the same pool.
+    ///
+    /// ```no_run
+    /// # #[cfg(any(feature = "async-io", feature = "tokio"))]
+    /// # fn example() -> tunnel_lattice::Result<()> {
+    /// use tunnel_lattice::{DeviceConfig, DeviceKind, PacketPool, Tunnel};
+    ///
+    /// let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun))?;
+    /// let pool = PacketPool::new(32, device.snapshot()?.recv_buffer_len())?;
+    /// let stream = device.packet_stream_with_pool(pool);
+    /// # let _ = stream;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// On the thread-bridge branch (a device without
+    /// `Capability::NATIVE_ASYNC`), if the OS cannot spawn the worker thread.
+    pub fn packet_stream_with_pool(&self, pool: PacketPool) -> tunnel_lattice_async::PacketStream {
+        let device = std::sync::Arc::clone(&self.device);
         if self
             .device
             .capabilities()
             .contains(Capability::NATIVE_ASYNC)
         {
-            tunnel_lattice_async::from_async_device(std::sync::Arc::clone(&self.device), buf_len)
+            tunnel_lattice_async::from_async_device_with_pool(device, pool)
         } else {
-            tunnel_lattice_async::from_device(std::sync::Arc::clone(&self.device), buf_len)
+            tunnel_lattice_async::from_device_with_pool(device, pool)
+        }
+    }
+}
+
+/// Mock-based tests of the facade's stream constructors (no privilege, no
+/// real device).
+#[cfg(all(test, feature = "async"))]
+mod stream_tests {
+    use std::future::Future;
+    use std::sync::Arc;
+
+    use futures::StreamExt;
+
+    use super::*;
+
+    /// A device with one packet, then `Disconnected`, reporting
+    /// `NATIVE_ASYNC` or not.
+    struct Mock {
+        native: bool,
+        packets: std::sync::Mutex<Vec<&'static [u8]>>,
+    }
+
+    impl Mock {
+        fn handle(native: bool) -> Handle<Self> {
+            Handle {
+                device: Arc::new(Self {
+                    native,
+                    packets: std::sync::Mutex::new(vec![b"pkt"]),
+                }),
+            }
+        }
+
+        fn next(&self, buf: &mut [u8]) -> Result<usize> {
+            let packet = self
+                .packets
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or(Error::Disconnected)?;
+            buf[..packet.len()].copy_from_slice(packet);
+            Ok(packet.len())
+        }
+    }
+
+    impl PacketIo for Mock {
+        fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            self.next(buf)
+        }
+
+        fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    impl AsyncPacketIo for Mock {
+        fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send {
+            let result = self.next(buf);
+            async move { result }
+        }
+
+        async fn send(&self, buf: &[u8]) -> Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    impl CapabilityProvider for Mock {
+        fn capabilities(&self) -> Capability {
+            if self.native {
+                Capability::NATIVE_ASYNC
+            } else {
+                Capability::empty()
+            }
+        }
+    }
+
+    #[test]
+    fn packet_stream_rejects_a_zero_buf_len_on_both_branches() {
+        for native in [true, false] {
+            let handle = Mock::handle(native);
+            assert!(matches!(handle.packet_stream(0), Err(Error::InvalidState)));
+            assert_eq!(Arc::strong_count(&handle.device), 1, "native: {native}");
+        }
+    }
+
+    #[test]
+    fn packet_stream_yields_pooled_packets_on_both_branches() {
+        for native in [true, false] {
+            let handle = Mock::handle(native);
+            let pool = PacketPool::new(2, 8).unwrap();
+            let mut stream = handle.packet_stream_with_pool(pool.clone());
+            let first = futures::executor::block_on(stream.next()).unwrap().unwrap();
+            assert_eq!(first, *b"pkt", "native: {native}");
+            assert_eq!(pool.available(), 1);
+            drop(first);
+            assert!(matches!(
+                futures::executor::block_on(stream.next()),
+                Some(Err(Error::Disconnected))
+            ));
+            assert!(futures::executor::block_on(stream.next()).is_none());
         }
     }
 }
@@ -331,7 +490,7 @@ mod privileged_tests {
 
         let buf_len = device.snapshot().expect("snapshot").recv_buffer_len();
         assert_eq!(buf_len, 1400, "a TUN buffer is exactly the MTU");
-        let mut stream = device.packet_stream(buf_len);
+        let mut stream = device.packet_stream(buf_len).expect("a valid buf_len");
         // A freshly created Linux TUN device is not actually silent: the
         // kernel sends IPv6 neighbor-discovery traffic (router
         // solicitation) onto it almost immediately, confirmed by an

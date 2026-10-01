@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking: `PacketStream` yields `Result<PacketBuf>` instead of
+  `Result<Vec<u8>>`, and the stream constructors become fallible.** Each
+  packet is now received straight into a slot of a `PacketPool` and handed
+  out as a `PacketBuf` view (16 bytes on 64-bit targets) that dereferences
+  to `[u8]` and returns its slot when dropped, so a steady stream makes no
+  heap allocation and no copy per packet in `tunnel-lattice-async`, on both
+  paths. Previously the native path allocated a zeroed `buf_len`-byte
+  buffer per packet, and the thread bridge copied every packet into a new
+  `Vec` and an unbounded-channel node. Code that keeps the bytes past the
+  item's lifetime must call `to_vec()`. Each `Ok` item is exactly one
+  packet (one IP packet for TUN, one Ethernet frame for TAP), at most the
+  pool's `buf_len` long.
+  - `tunnel_lattice_async::from_async_device` and `from_device`, and
+    `tunnel_lattice::Handle::packet_stream`, now return
+    `Result<PacketStream>`. They build the pool with
+    `PacketPool::with_buf_len(buf_len)` and return `Err(Error::InvalidState)`
+    only if that rejects `buf_len` (zero, or too large for a slot), before
+    allocating anything and without touching the device. A zero `buf_len`
+    previously produced a stream that reported every packet as
+    `BufferTooSmall`. The stream itself never yields `InvalidState` for its
+    own reasons. A failed slab allocation aborts, as for a `Vec`, and the
+    thread bridge still panics if the OS cannot spawn its worker thread.
+  - **Back-pressure:** a stream receives only while its pool has a free
+    slot. A consumer that holds every item now pauses its stream (it
+    returns `Pending` and stops calling `recv`) until it drops one. The
+    thread bridge's queue is bounded by the pool's slot count instead of
+    unbounded, and a worker waiting for a slot or for room in the queue now
+    exits promptly when the stream is dropped.
+  - A thread-bridge worker that panics (for example inside the device's
+    `recv`) ends the stream with `None`. A panicking waker called from
+    another thread never ends a stream and never aborts the process.
+- **Added `from_async_device_with_pool` and `from_device_with_pool` to
+  `tunnel-lattice-async`, and `Handle::packet_stream_with_pool` plus
+  re-exports of `PacketBuf` and `PacketPool` to `tunnel-lattice` (async
+  features; additive):** the same streams over a `PacketPool` the caller
+  built, for example to choose the slot count or to share one pool between
+  several streams (which then share its slots, with no fairness between
+  them). They cannot fail.
 - **Breaking (behavioral): `PacketStream` now ends after any error except
   `Error::BufferTooSmall`.** Both `tunnel-lattice-async` variants
   (`from_async_device` and the `from_device` thread bridge), and so
@@ -15,10 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the stream kept polling, so a device whose `recv` failed
   immediately and repeatedly (a deleted Linux device, a destroyed macOS TAP
   interface, a disabled Wintun adapter) produced an endless stream of error
-  items, and the thread bridge's worker kept filling its unbounded channel
-  with them. The worker now stops calling `recv` and exits right after
-  forwarding the error. Callers that relied on a stream surviving an error
-  must create a new stream (`Handle::packet_stream` again) after recovering,
+  items, and the thread bridge's worker kept queueing them. The worker now
+  stops calling `recv` and exits right after forwarding the error. Callers
+  that relied on a stream surviving an error must create a new stream
+  (`Handle::packet_stream` again) after recovering,
   for example after applying `DesiredAdminState::Up` to a disabled
   interface. Polling an ended native stream again now returns `None`
   instead of panicking.
@@ -66,12 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Added packet-path benchmarks and an allocation-count test to
   `tunnel-lattice-async` (development only, no API change):** `cargo bench
   -p tunnel-lattice-async` measures the synchronous caller-buffer receive
-  loop and the current `Vec`-per-packet stream paths over in-memory mock
-  devices, and `tests/alloc_count.rs` pins today's per-packet heap cost
-  (one allocation per packet on the native stream, two on the thread
-  bridge) so later buffer changes can be compared against it. `criterion`
-  is a dev-dependency only. CI builds the benches on every OS without
-  running them.
+  loop, both pooled `PacketStream` paths (also with the consumer holding
+  packets, and over a mixed-size packet load), and a frozen copy of the
+  earlier `Vec`-per-packet streams, over in-memory mock devices. `--bench
+  pool` measures pool construction and first use, the pool's own
+  per-packet overhead, and contention on a shared pool.
+  `tests/alloc_count.rs` pins zero heap allocations per packet on both
+  paths (including a native stream whose every receive waits for a free
+  slot) and bounds the memory a stream owns. `criterion` is a
+  dev-dependency only. CI builds the benches on every OS without running
+  them.
 - **Added `PacketPool` and `PacketBuf` to `tunnel-lattice-async`
   (additive):** `PacketPool::new(slots, buf_len)` and
   `PacketPool::with_buf_len(buf_len)` build a fixed-capacity pool of
@@ -83,11 +125,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slab allocation aborts the process, as it does for a `Vec`. `PacketBuf` is
   a 16-byte (on 64-bit targets) view of one packet inside a slot. It
   dereferences to `[u8]`, supports `advance`/`truncate`, and returns its
-  slot to the pool on drop. Slots are reused without being re-zeroed.
-  `PacketStream` still yields `Vec<u8>` items in this change, and the pool
-  has no public acquire method. `cargo bench -p tunnel-lattice-async
-  --bench pool` measures pool construction, and CI gains a non-blocking
-  Miri job for the pool's unsafe code.
+  slot to the pool on drop. Slots are reused without being re-zeroed (see
+  `SECURITY.md`). Only the streams hand out `PacketBuf`s; the pool has no
+  public acquire method. CI gains a non-blocking Miri job for the pool's
+  unsafe code.
+  The receive and release paths are lock-free in the common case: each
+  slot has an atomic ownership flag, the pool keeps its own reference count
+  paid in batches, and the pool lock is taken only while a stream waits
+  for a free slot.
 - **Documented the `recv` contract on `PacketIo` and `AsyncPacketIo`
   (rustdoc only, no signature change):** on `Ok(n)` an implementation must
   have written `buf[..n]`, and `n <= buf.len()`.

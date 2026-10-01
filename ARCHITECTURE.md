@@ -154,7 +154,7 @@ Every other error is yielded once and then ends the stream — `Disconnected`
 and recoverable errors alike. A device whose `recv` fails immediately and
 repeatedly (a deleted Linux device, a destroyed macOS `feth`, a disabled
 Wintun adapter) would otherwise turn the stream into a busy loop of error
-items and, on the thread bridge, fill its unbounded channel; a back-off or
+items and, on the thread bridge, keep its worker thread spinning; a back-off or
 an error-count cap would need a timer (the crate is runtime-agnostic) or
 an arbitrary limit. The caller creates a new stream with
 `Handle::packet_stream` after recovering. Transient conditions never reach
@@ -312,8 +312,72 @@ every backend `tunnel-lattice` ships as of this crate implements
 `AsyncPacketIo` whenever `packet_stream` is reachable in the first place, so
 `from_device` is not on the path any shipped build actually takes).
 `Handle::packet_stream`'s bound was tightened accordingly to require
-`AsyncPacketIo` (previously only `PacketIo`) — a pre-1.0 additive-in-effect
-change (see `versioning.md`) recorded in its own ADR.
+`AsyncPacketIo` (previously only `PacketIo`), a pre-1.0 change that was
+additive in effect for every shipped backend.
+
+### Packet buffers
+
+`PacketStream` yields `Result<PacketBuf>`. Each stream receives into a
+`PacketPool`: one zeroed slab allocated once and carved into equally sized
+slots (`buf_len + 1` rounded up to 64 bytes, so slots never share a cache
+line), with one atomic ownership flag per slot. A receive claims one free
+slot, passes exactly `buf_len` bytes of it to the device's `recv`, and
+turns the result into a `PacketBuf`: a counted reference to the pool plus a
+32-bit offset and length, 16 bytes on 64-bit targets. Dropping the
+`PacketBuf` frees the slot with a plain store to its flag. A steady stream
+therefore allocates nothing, copies nothing, and takes no lock per packet
+at this layer, on both paths. Each stream claims slots through its own
+acquirer, which pays for pool references in batches; a stream that owns the
+only handle of its pool (always the case for `from_async_device` and
+`from_device`) claims without even a compare-and-swap, while streams that
+share a pool through `*_with_pool` claim with one. Before this design the
+native path allocated a zeroed buffer per packet and the thread bridge
+copied every packet into a new `Vec` plus an unbounded-channel node.
+
+- **One item is one packet.** Every `Ok` item is exactly what `recv`
+  returned: one IP packet (TUN) or one Ethernet frame (TAP), never a
+  fragment, an aggregate, or a buffer with a prefix header, and never
+  longer than the pool's `buf_len`. A length past the slot is reported as
+  `BufferTooSmall` by one shared mapping on both paths, which also decides
+  nothing else; one private predicate decides which errors end a stream.
+- **Back-pressure instead of growth.** A stream receives only while its
+  pool has a free slot, so the memory it owns is bounded by the pool (plus,
+  on the thread bridge, a `sync_channel` with one entry per slot, created
+  once). Holding every item stalls the stream instead of growing a queue;
+  exhaustion is a wait, never an error, and needs no timer. Streams built
+  with `*_with_pool` may share one pool and then share its slots, with no
+  fairness between them.
+- **Waking.** A native stream that finds no free slot registers its waker
+  under the pool mutex, one entry per pending receive, then flags itself in
+  the pool's reference count and checks the slots once more. A release
+  takes the locked slow path, and wakes it, only when a waiter has flagged
+  itself; otherwise releasing is lock-free. A thread-bridge worker instead
+  parks on a condvar, which a release notifies only when a worker is
+  actually parked. No waker is cloned, woken, or dropped while a lock is
+  held, and every wake that runs outside the consumer's own `poll_next` (in
+  a release, on the worker thread, or in a destructor) is wrapped in
+  `catch_unwind`, so a panicking waker can neither abort the process during
+  unwinding nor end another stream.
+- **Thread-bridge shutdown.** Dropping the stream sets the worker's stop
+  flag under the pool mutex and wakes every parked worker, then drops the
+  channel receiver (which discards and releases queued items). A worker
+  waiting for a slot or for room in the channel exits promptly; one inside
+  a blocking `recv` still exits only when that call returns. Whatever way
+  the worker ends, including a panic in `recv`, it disconnects the channel
+  and wakes the consumer, so the stream ends with `None`.
+- **Unsafe code.** All of it, with every invariant it depends on, lives in
+  the pool module: the slab allocation, the pointer arithmetic, the slices
+  over one slot or one view, and the pool's own reference count (a release
+  that has to wake a waiter keeps its reference until the wake is done, so
+  the pool can never be freed under it). Every function there that creates or
+  reshapes a view checks that it stays inside its slot, so code outside
+  that module cannot break soundness. Its tests also run under Miri in CI.
+- **Slots are not re-zeroed** between packets. `PacketBuf` exposes only the
+  bytes `recv` reported; a backend that reports bytes it did not write could
+  expose an earlier packet's bytes (see `SECURITY.md`).
+
+Batched receive and send, and Linux GSO/GRO offload, are planned for a
+later release. They must keep one packet per item.
 
 Neither crate depends on Tokio, async-std, or smol directly by default —
 `tunnel-lattice`'s `async-io`/`tokio` features (mutually exclusive; enabling
