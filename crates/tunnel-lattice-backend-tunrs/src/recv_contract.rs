@@ -24,19 +24,22 @@
 //! | Windows (send) | code-less `WriteZero` (Wintun `ERROR_HANDLE_EOF`: the adapter is terminating) | [`Error::Disconnected`] |
 //! | Windows | code-less `Other`, message exactly `"The interface has been disabled"` (Wintun session ended by `apply(Down)`; `apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | Linux (send) | raw `EIO` (5): the device is administratively down (`apply(Up)` recovers it) | [`Error::InvalidState`] |
+//! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`): the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
 //!
 //! `WriteZero` and `EIO` are remapped on `send` only, so the same signal
-//! from any other operation keeps its generic meaning.
+//! from any other operation keeps its generic meaning. The Windows 995 rule
+//! takes the [`DeviceKind`] as well: it applies to a TAP handle only, on
+//! both directions, and a Wintun (TUN) 995 keeps its generic meaning.
 //!
-//! [`Error::InvalidState`] from `recv`/`send` always means the device
-//! exists but is down or disabled in a way that applying
-//! `DesiredAdminState::Up` on the same handle recovers. A down Linux
-//! device does not fail `recv` at all: the read waits until the device is
-//! up and traffic arrives. A Windows TAP `recv` that fails with raw 995
-//! (`ERROR_OPERATION_ABORTED`) is not remapped: the same code comes from
-//! an adapter disabled outside this API (which `apply` cannot undo) and
-//! from a cancelled read on a healthy adapter.
+//! [`Error::InvalidState`] from `recv`/`send` means the device exists but
+//! is down or disabled. When this API made it so (`apply` with
+//! `DesiredAdminState::Down`), applying `DesiredAdminState::Up` on the same
+//! handle recovers it. A down Linux device does not fail `recv` at all:
+//! the read waits until the device is up and traffic arrives. A Windows TAP
+//! adapter disabled outside this API (`Disable-NetAdapter`) also fails with
+//! raw 995 and so also reads as [`Error::InvalidState`], but only
+//! re-enabling the adapter outside this API recovers that one.
 //!
 //! Linux TUN/TAP and macOS utun truncate an oversize packet silently, so on
 //! unix the backend reads into `[buf, 1-byte sentinel]` with `readv`: a
@@ -53,6 +56,7 @@ use std::future::Future;
 use std::io;
 
 use tunnel_lattice_core::{Error, Result};
+use tunnel_lattice_model::DeviceKind;
 
 use crate::io_error;
 use crate::open_contract::HostOs;
@@ -92,6 +96,11 @@ const EFAULT: i32 = 14;
 /// Mapped on Linux `send` only; see [`send_error`].
 const EIO: i32 = 5;
 
+/// Windows `ERROR_OPERATION_ABORTED` (asserted against `windows-sys` by the
+/// unit tests on Windows). Mapped for a TAP handle only; see
+/// [`lifecycle_error`].
+const ERROR_OPERATION_ABORTED: i32 = 995;
+
 /// What a `recv`/`send` loop does with one native attempt's result.
 #[derive(Debug)]
 pub(crate) enum Step {
@@ -116,29 +125,35 @@ pub(crate) fn is_transient(os: HostOs, err: &io::Error) -> bool {
     eintr || feth_empty_read
 }
 
-/// Maps one native `recv` attempt that read into a `buf_len`-byte buffer.
-pub(crate) fn recv_step(os: HostOs, buf_len: usize, result: io::Result<usize>) -> Step {
+/// Maps one native `recv` attempt on a `kind` handle that read into a
+/// `buf_len`-byte buffer.
+pub(crate) fn recv_step(
+    os: HostOs,
+    kind: DeviceKind,
+    buf_len: usize,
+    result: io::Result<usize>,
+) -> Step {
     match result {
         Ok(n) if n > buf_len => Step::Done(Err(Error::BufferTooSmall)),
         Ok(n) => Step::Done(Ok(n)),
         Err(err) if is_transient(os, &err) => Step::Retry,
-        Err(err) => Step::Done(Err(recv_error(os, err))),
+        Err(err) => Step::Done(Err(recv_error(os, kind, err))),
     }
 }
 
-/// Maps one native `send` attempt.
-pub(crate) fn send_step(os: HostOs, result: io::Result<usize>) -> Step {
+/// Maps one native `send` attempt on a `kind` handle.
+pub(crate) fn send_step(os: HostOs, kind: DeviceKind, result: io::Result<usize>) -> Step {
     match result {
         Ok(n) => Step::Done(Ok(n)),
         Err(err) if is_transient(os, &err) => Step::Retry,
-        Err(err) => Step::Done(Err(send_error(os, err))),
+        Err(err) => Step::Done(Err(send_error(os, kind, err))),
     }
 }
 
 /// Maps a non-transient `recv` error: the too-small-buffer signals first,
 /// then the Linux receive-only `EFAULT` rule, then the device-lifecycle
 /// rules, then [`io_error`].
-fn recv_error(os: HostOs, err: io::Error) -> Error {
+fn recv_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
     let too_small = err.raw_os_error().is_none()
         && match os {
             HostOs::Macos => err.kind() == io::ErrorKind::InvalidData,
@@ -162,13 +177,13 @@ fn recv_error(os: HostOs, err: io::Error) -> Error {
     if os == HostOs::Linux && err.raw_os_error() == Some(EFAULT) {
         return Error::Disconnected;
     }
-    lifecycle_error(os, &err).unwrap_or_else(|| io_error(err))
+    lifecycle_error(os, kind, &err).unwrap_or_else(|| io_error(err))
 }
 
 /// Maps a non-transient `send` error: Wintun's send-side end-of-life
 /// signal, then the Linux send-only `EIO` rule, then the device-lifecycle
 /// rules shared with `recv`, then [`io_error`].
-fn send_error(os: HostOs, err: io::Error) -> Error {
+fn send_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
     // `tun-rs` reports Wintun `ERROR_HANDLE_EOF` as `WriteZero` on send
     // (and as `UnexpectedEof`, already `Disconnected`, on receive).
     let wintun_send_eof = os == HostOs::Windows
@@ -190,16 +205,29 @@ fn send_error(os: HostOs, err: io::Error) -> Error {
     if os == HostOs::Linux && err.raw_os_error() == Some(EIO) {
         return Error::InvalidState;
     }
-    lifecycle_error(os, &err).unwrap_or_else(|| io_error(err))
+    lifecycle_error(os, kind, &err).unwrap_or_else(|| io_error(err))
 }
 
-/// The device-lifecycle rules shared by `recv` and `send` (see the module
-/// table), or `None` for an error [`io_error`] maps.
-fn lifecycle_error(os: HostOs, err: &io::Error) -> Option<Error> {
+/// The device-lifecycle rules shared by `recv` and `send` on a `kind`
+/// handle (see the module table), or `None` for an error [`io_error`]
+/// maps.
+fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Error> {
     let unix = matches!(os, HostOs::Linux | HostOs::Macos);
+    // tap-windows completes every pending and new read and write with
+    // `ERROR_OPERATION_ABORTED` while the adapter's media is disconnected:
+    // `apply(Down)` (`tun-rs` `set_status(false)`, the
+    // `TAP_IOCTL_SET_MEDIA_STATUS` ioctl) does that, and
+    // `apply(Up)` on the same handle makes both directions work again
+    // (checked by the Windows privileged tests on every feature set). An
+    // adapter disabled outside this API fails the same way, so it reads as
+    // `InvalidState` too. Wintun never reports this code for a disabled
+    // adapter (it uses `WINDOWS_TUN_DISABLED_MESSAGE`), so the rule is
+    // limited to TAP.
+    let tap_media_down = os == HostOs::Windows && kind == DeviceKind::Tap;
     match err.raw_os_error() {
         Some(ENXIO) if unix => Some(Error::Disconnected),
         Some(EBADFD) if os == HostOs::Linux => Some(Error::Disconnected),
+        Some(ERROR_OPERATION_ABORTED) if tap_media_down => Some(Error::InvalidState),
         Some(_) => None,
         None => (os == HostOs::Windows
             && err.kind() == io::ErrorKind::Other
@@ -216,12 +244,13 @@ fn lifecycle_error(os: HostOs, err: &io::Error) -> Option<Error> {
 )]
 pub(crate) fn recv_blocking(
     os: HostOs,
+    kind: DeviceKind,
     buf: &mut [u8],
     mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
 ) -> Result<usize> {
     let buf_len = buf.len();
     loop {
-        if let Step::Done(result) = recv_step(os, buf_len, read(buf)) {
+        if let Step::Done(result) = recv_step(os, kind, buf_len, read(buf)) {
             return result;
         }
     }
@@ -235,10 +264,11 @@ pub(crate) fn recv_blocking(
 )]
 pub(crate) fn send_blocking(
     os: HostOs,
+    kind: DeviceKind,
     mut write: impl FnMut() -> io::Result<usize>,
 ) -> Result<usize> {
     loop {
-        if let Step::Done(result) = send_step(os, write()) {
+        if let Step::Done(result) = send_step(os, kind, write()) {
             return result;
         }
     }
@@ -261,12 +291,13 @@ pub(crate) trait AsyncRecvSource {
 )]
 pub(crate) async fn recv_async<S: AsyncRecvSource + ?Sized>(
     os: HostOs,
+    kind: DeviceKind,
     source: &S,
     buf: &mut [u8],
 ) -> Result<usize> {
     let buf_len = buf.len();
     loop {
-        if let Step::Done(result) = recv_step(os, buf_len, source.recv_native(buf).await) {
+        if let Step::Done(result) = recv_step(os, kind, buf_len, source.recv_native(buf).await) {
             return result;
         }
     }
@@ -278,13 +309,13 @@ pub(crate) async fn recv_async<S: AsyncRecvSource + ?Sized>(
     all(not(feature = "async"), not(test)),
     expect(dead_code, reason = "only async builds hold an async handle")
 )]
-pub(crate) async fn send_async<F, Fut>(os: HostOs, mut write: F) -> Result<usize>
+pub(crate) async fn send_async<F, Fut>(os: HostOs, kind: DeviceKind, mut write: F) -> Result<usize>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = io::Result<usize>>,
 {
     loop {
-        if let Step::Done(result) = send_step(os, write().await) {
+        if let Step::Done(result) = send_step(os, kind, write().await) {
             return result;
         }
     }
@@ -319,8 +350,20 @@ mod tests {
         io::Error::new(io::ErrorKind::Interrupted, "cancel")
     }
 
+    /// The device kind every rule except the Windows TAP 995 rule ignores.
+    const TUN: DeviceKind = DeviceKind::Tun;
+
     fn recv_result(os: HostOs, buf_len: usize, result: io::Result<usize>) -> Option<Result<usize>> {
-        match recv_step(os, buf_len, result) {
+        recv_result_on(os, TUN, buf_len, result)
+    }
+
+    fn recv_result_on(
+        os: HostOs,
+        kind: DeviceKind,
+        buf_len: usize,
+        result: io::Result<usize>,
+    ) -> Option<Result<usize>> {
+        match recv_step(os, kind, buf_len, result) {
             Step::Retry => None,
             Step::Done(result) => Some(result),
         }
@@ -392,17 +435,66 @@ mod tests {
         }
     }
 
-    /// Windows raw 995 (`ERROR_OPERATION_ABORTED`) is not remapped on
-    /// either direction: it stays a platform error (a Windows TAP adapter
-    /// disabled outside this API, or a cancelled read on a healthy one).
     #[test]
-    fn raw_operation_aborted_stays_a_platform_error_on_windows() {
-        const ERROR_OPERATION_ABORTED: i32 = 995;
+    #[cfg(windows)]
+    fn error_operation_aborted_matches_windows_sys() {
+        assert_eq!(
+            ERROR_OPERATION_ABORTED as u32,
+            windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
+        );
+    }
+
+    /// Windows raw 995 (`ERROR_OPERATION_ABORTED`, a tap-windows adapter
+    /// whose media `apply(Down)` disconnected) is `InvalidState` on both
+    /// directions of a Windows TAP handle only. On a Windows TUN handle and
+    /// on every other host it stays a generic platform error.
+    #[test]
+    fn raw_operation_aborted_is_invalid_state_on_windows_tap_only() {
         let aborted = || io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED);
-        let recv = recv_err(HostOs::Windows, aborted());
-        assert!(matches!(recv, Err(Error::Platform(_))), "{recv:?}");
-        let send = send_result(HostOs::Windows, aborted());
-        assert!(matches!(send, Err(Error::Platform(_))), "{send:?}");
+        let tap = DeviceKind::Tap;
+        let recv = recv_err_on(HostOs::Windows, tap, aborted());
+        assert!(matches!(recv, Err(Error::InvalidState)), "{recv:?}");
+        let send = send_result_on(HostOs::Windows, tap, aborted());
+        assert!(matches!(send, Err(Error::InvalidState)), "{send:?}");
+        for os in ALL_OSES {
+            for kind in [DeviceKind::Tun, DeviceKind::Tap] {
+                if os == HostOs::Windows && kind == DeviceKind::Tap {
+                    continue;
+                }
+                let recv = recv_err_on(os, kind, aborted());
+                assert!(
+                    matches!(recv, Err(Error::Platform(_))),
+                    "{os:?} {kind:?} {recv:?}"
+                );
+                let send = send_result_on(os, kind, aborted());
+                assert!(
+                    matches!(send, Err(Error::Platform(_))),
+                    "{os:?} {kind:?} {send:?}"
+                );
+            }
+        }
+    }
+
+    /// The Windows TAP 995 rule ends the blocking and async loops after
+    /// one native call.
+    #[test]
+    fn windows_tap_media_down_ends_the_loops_after_one_call() {
+        let aborted = || io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED);
+        let script = Script::new(vec![Err(aborted()), Ok(3)], b"abc");
+        let mut buf = [0u8; 8];
+        let result = recv_blocking(HostOs::Windows, DeviceKind::Tap, &mut buf, |buf| {
+            script.read(buf)
+        });
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert_eq!(script.calls(), 1);
+
+        let script = Script::new(vec![Err(aborted()), Ok(5)], b"");
+        let result = ready(send_async(HostOs::Windows, DeviceKind::Tap, || {
+            let result = script.read(&mut []);
+            async move { result }
+        }));
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert_eq!(script.calls(), 1);
     }
 
     /// A read blocked across the Linux device deletion fails with raw
@@ -445,14 +537,22 @@ mod tests {
     }
 
     fn send_result(os: HostOs, err: io::Error) -> Result<usize> {
-        match send_step(os, Err(err)) {
-            Step::Retry => panic!("{os:?}: a lifecycle error must not be retried"),
+        send_result_on(os, TUN, err)
+    }
+
+    fn send_result_on(os: HostOs, kind: DeviceKind, err: io::Error) -> Result<usize> {
+        match send_step(os, kind, Err(err)) {
+            Step::Retry => panic!("{os:?} {kind:?}: a lifecycle error must not be retried"),
             Step::Done(result) => result,
         }
     }
 
     fn recv_err(os: HostOs, err: io::Error) -> Result<usize> {
-        recv_result(os, 64, Err(err)).expect("a lifecycle error must not be retried")
+        recv_err_on(os, TUN, err)
+    }
+
+    fn recv_err_on(os: HostOs, kind: DeviceKind, err: io::Error) -> Result<usize> {
+        recv_result_on(os, kind, 64, Err(err)).expect("a lifecycle error must not be retried")
     }
 
     /// The device-lifecycle table, on every host: raw `ENXIO` on Linux and
@@ -483,8 +583,10 @@ mod tests {
             (HostOs::Windows, ebadfd()),
             (HostOs::Other, ebadfd()),
         ] {
-            let mapped = lifecycle_error(os, &err);
-            assert!(mapped.is_none(), "{os:?} {err}: {mapped:?}");
+            for kind in [DeviceKind::Tun, DeviceKind::Tap] {
+                let mapped = lifecycle_error(os, kind, &err);
+                assert!(mapped.is_none(), "{os:?} {kind:?} {err}: {mapped:?}");
+            }
         }
     }
 
@@ -570,7 +672,7 @@ mod tests {
             b"abc",
         );
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Linux, &mut buf, |buf| script.read(buf));
+        let result = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf));
         assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
         assert_eq!(script.calls(), 1);
 
@@ -578,7 +680,7 @@ mod tests {
             vec![Err(wintun_disabled()), Ok(3)],
             b"abc",
         )));
-        let result = ready(recv_async(HostOs::Windows, &source, &mut buf));
+        let result = ready(recv_async(HostOs::Windows, TUN, &source, &mut buf));
         assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
         assert_eq!(source.0.lock().unwrap().calls(), 1);
 
@@ -586,12 +688,12 @@ mod tests {
             vec![Err(io::Error::from(io::ErrorKind::WriteZero)), Ok(5)],
             b"",
         );
-        let result = send_blocking(HostOs::Windows, || script.read(&mut []));
+        let result = send_blocking(HostOs::Windows, TUN, || script.read(&mut []));
         assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
         assert_eq!(script.calls(), 1);
 
         let script = Script::new(vec![Err(io::Error::from_raw_os_error(ENXIO)), Ok(5)], b"");
-        let result = ready(send_async(HostOs::Macos, || {
+        let result = ready(send_async(HostOs::Macos, TUN, || {
             let result = script.read(&mut []);
             async move { result }
         }));
@@ -604,7 +706,10 @@ mod tests {
         for os in [HostOs::Linux, HostOs::Macos] {
             assert!(is_transient(os, &eintr()), "{os:?}");
             assert!(recv_result(os, 64, Err(eintr())).is_none(), "{os:?}");
-            assert!(matches!(send_step(os, Err(eintr())), Step::Retry), "{os:?}");
+            assert!(
+                matches!(send_step(os, TUN, Err(eintr())), Step::Retry),
+                "{os:?}"
+            );
         }
         for os in [HostOs::Windows, HostOs::Other] {
             assert!(!is_transient(os, &eintr()), "{os:?}");
@@ -625,7 +730,7 @@ mod tests {
                 "{os:?}"
             );
             assert!(matches!(
-                send_step(os, Err(cancel())),
+                send_step(os, TUN, Err(cancel())),
                 Step::Done(Err(Error::Platform(PlatformErrorCode::Unknown)))
             ));
         }
@@ -714,7 +819,7 @@ mod tests {
             // On send, `InvalidInput` means an oversize packet to write,
             // not a receive buffer: it is not remapped.
             assert!(matches!(
-                send_step(HostOs::Windows, Err(err())),
+                send_step(HostOs::Windows, TUN, Err(err())),
                 Step::Done(Err(Error::Platform(PlatformErrorCode::Unknown)))
             ));
             for os in [HostOs::Linux, HostOs::Macos, HostOs::Other] {
@@ -795,7 +900,7 @@ mod tests {
     fn blocking_recv_retries_eintr_and_the_caller_sees_only_the_data() {
         let script = Script::new(vec![Err(eintr()), Ok(3)], b"abc");
         let mut buf = [0u8; 8];
-        let n = recv_blocking(HostOs::Linux, &mut buf, |buf| script.read(buf)).unwrap();
+        let n = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf)).unwrap();
         assert_eq!(&buf[..n], b"abc");
         assert_eq!(script.calls(), 2);
     }
@@ -807,7 +912,7 @@ mod tests {
             b"",
         );
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Macos, &mut buf, |buf| script.read(buf));
+        let result = recv_blocking(HostOs::Macos, TUN, &mut buf, |buf| script.read(buf));
         assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
         assert_eq!(script.calls(), 3);
     }
@@ -816,7 +921,7 @@ mod tests {
     fn blocking_recv_does_not_retry_code_less_interrupted() {
         let script = Script::new(vec![Err(cancel()), Ok(3)], b"abc");
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Macos, &mut buf, |buf| script.read(buf));
+        let result = recv_blocking(HostOs::Macos, TUN, &mut buf, |buf| script.read(buf));
         assert!(matches!(
             result,
             Err(Error::Platform(PlatformErrorCode::Unknown))
@@ -830,21 +935,21 @@ mod tests {
     fn blocking_recv_reports_an_oversize_packet_and_stays_usable() {
         let script = Script::new(vec![Ok(9), Ok(3)], b"abcdefghi");
         let mut buf = [0u8; 8];
-        let first = recv_blocking(HostOs::Linux, &mut buf, |buf| script.read(buf));
+        let first = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf));
         assert!(matches!(first, Err(Error::BufferTooSmall)));
-        let second = recv_blocking(HostOs::Linux, &mut buf, |buf| script.read(buf));
+        let second = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf));
         assert_eq!(second.unwrap(), 3);
     }
 
     #[test]
     fn blocking_send_retries_eintr_only() {
         let script = Script::new(vec![Err(eintr()), Ok(5)], b"");
-        let n = send_blocking(HostOs::Linux, || script.read(&mut [])).unwrap();
+        let n = send_blocking(HostOs::Linux, TUN, || script.read(&mut [])).unwrap();
         assert_eq!(n, 5);
         assert_eq!(script.calls(), 2);
 
         let script = Script::new(vec![Err(cancel()), Ok(5)], b"");
-        assert!(send_blocking(HostOs::Linux, || script.read(&mut [])).is_err());
+        assert!(send_blocking(HostOs::Linux, TUN, || script.read(&mut [])).is_err());
         assert_eq!(script.calls(), 1);
     }
 
@@ -855,7 +960,7 @@ mod tests {
             b"abc",
         )));
         let mut buf = [0u8; 8];
-        let n = ready(recv_async(HostOs::Macos, &source, &mut buf)).unwrap();
+        let n = ready(recv_async(HostOs::Macos, TUN, &source, &mut buf)).unwrap();
         assert_eq!(&buf[..n], b"abc");
         assert_eq!(source.0.lock().unwrap().calls(), 3);
     }
@@ -868,7 +973,7 @@ mod tests {
                 b"abc",
             )));
             let mut buf = [0u8; 8];
-            let result = ready(recv_async(HostOs::Linux, &source, &mut buf));
+            let result = ready(recv_async(HostOs::Linux, TUN, &source, &mut buf));
             assert_eq!(
                 matches!(result, Err(Error::Disconnected)),
                 expected_disconnected,
@@ -886,16 +991,16 @@ mod tests {
             b"abcdefghi",
         )));
         let mut buf = [0u8; 8];
-        let first = ready(recv_async(HostOs::Linux, &source, &mut buf));
+        let first = ready(recv_async(HostOs::Linux, TUN, &source, &mut buf));
         assert!(matches!(first, Err(Error::BufferTooSmall)));
-        let second = ready(recv_async(HostOs::Linux, &source, &mut buf));
+        let second = ready(recv_async(HostOs::Linux, TUN, &source, &mut buf));
         assert_eq!(second.unwrap(), 3);
     }
 
     #[test]
     fn async_send_retries_eintr() {
         let script = Script::new(vec![Err(eintr()), Ok(5)], b"");
-        let n = ready(send_async(HostOs::Macos, || {
+        let n = ready(send_async(HostOs::Macos, TUN, || {
             let result = script.read(&mut []);
             async move { result }
         }))

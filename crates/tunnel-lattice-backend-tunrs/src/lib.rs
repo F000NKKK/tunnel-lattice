@@ -84,8 +84,12 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// persistent device of the same kind and multi-queue setting with no queue
 /// attached, or any same-kind multi-queue device when `multi_queue` is
 /// requested (including one opened by another process); and on Windows, an
-/// existing Wintun adapter whose name matches a `Tun` request. A successful
-/// `open` does not report whether it attached or created. Re-attaching is
+/// existing Wintun adapter whose name matches a `Tun` request. While another
+/// handle holds that Wintun adapter's session, Wintun refuses a second
+/// session and `open` fails with `Platform(Windows(1247))`
+/// (`ERROR_ALREADY_INITIALIZED`); the other handle keeps working. A
+/// successful `open` does not report whether it attached or created.
+/// Re-attaching is
 /// how a later process reopens a device made persistent with
 /// `PersistentDevice::persist`; `PersistentDevice::unpersist` lets it go
 /// away with its last handle again.
@@ -199,6 +203,7 @@ impl TunRsBackend {
 /// | Windows TUN (`send`) | Wintun reports the adapter terminating (`tun-rs` returns `WriteZero`) | [`Error::Disconnected`] |
 /// | Windows TUN | `"The interface has been disabled"`: the adapter was disabled, for example by applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
 /// | Linux (`send`) | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
+/// | Windows TAP | `ERROR_OPERATION_ABORTED` (995): the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this API | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers the first case only |
 ///
 /// So on Linux, deleting the device (for example with `ip link del`) ends
 /// a pending or later `recv` with [`Error::Disconnected`] in every feature
@@ -207,15 +212,17 @@ impl TunRsBackend {
 /// A `PacketStream` from `tunnel-lattice-async` ends after any of
 /// these errors (every error except [`Error::BufferTooSmall`] ends it).
 ///
-/// [`Error::InvalidState`] from `recv` or `send` always means the device
-/// is down or disabled and applying `DesiredAdminState::Up` on the same
-/// handle recovers it. A down Linux device does not fail `recv`: the call
-/// waits until a packet arrives, the device comes up, or it is deleted.
-/// On Windows TAP, disabling the adapter (for example with
-/// `Disable-NetAdapter`) ends a waiting `recv` with
-/// `Platform(Windows(995))` (`ERROR_OPERATION_ABORTED`), which is not
-/// remapped: a healthy adapter can report it too, and applying
-/// `DesiredAdminState::Up` does not undo `Disable-NetAdapter`.
+/// [`Error::InvalidState`] from `recv` or `send` means the device exists
+/// but is down or disabled. When applying `DesiredAdminState::Down` made it
+/// so, applying `DesiredAdminState::Up` on the same handle recovers it. A
+/// down Linux device does not fail `recv`: the call waits until a packet
+/// arrives, the device comes up, or it is deleted. On Windows TAP, after
+/// applying `DesiredAdminState::Down`, `send` and `recv` fail at once with
+/// [`Error::InvalidState`] until `DesiredAdminState::Up` is applied.
+/// Disabling the TAP adapter
+/// outside this API (for example with `Disable-NetAdapter`) fails them with
+/// the same native code and so the same error, but only re-enabling the
+/// adapter the same way recovers it.
 ///
 /// `snapshot` reads the administrative state on every call, on Linux,
 /// macOS, and Windows; its documentation in the `DeviceObserver`
@@ -484,7 +491,7 @@ impl TunRsDevice {
         }
         #[cfg(not(feature = "async"))]
         {
-            recv_contract::recv_blocking(open_contract::HOST_OS, buf, |buf| {
+            recv_contract::recv_blocking(open_contract::HOST_OS, self.kind, buf, |buf| {
                 sentinel_recv(&self.handle, buf)
             })
         }
@@ -502,7 +509,9 @@ impl TunRsDevice {
         }
         #[cfg(not(feature = "async"))]
         {
-            recv_contract::send_blocking(open_contract::HOST_OS, || self.handle.send(buf))
+            recv_contract::send_blocking(open_contract::HOST_OS, self.kind, || {
+                self.handle.send(buf)
+            })
         }
     }
 
@@ -519,19 +528,20 @@ impl TunRsDevice {
                 handle: &self.handle,
                 wait,
             };
-            return recv_contract::recv_async(open_contract::HOST_OS, &source, buf).await;
+            return recv_contract::recv_async(open_contract::HOST_OS, self.kind, &source, buf)
+                .await;
         }
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         let source = &self.reader;
         #[cfg(not(all(target_os = "linux", feature = "tokio")))]
         let source = &self.handle;
-        recv_contract::recv_async(open_contract::HOST_OS, source, buf).await
+        recv_contract::recv_async(open_contract::HOST_OS, self.kind, source, buf).await
     }
 
     /// Async send, retrying transient errors.
     #[cfg(feature = "async")]
     async fn async_send(&self, buf: &[u8]) -> Result<usize> {
-        recv_contract::send_async(open_contract::HOST_OS, || self.handle.send(buf)).await
+        recv_contract::send_async(open_contract::HOST_OS, self.kind, || self.handle.send(buf)).await
     }
 }
 
@@ -2830,9 +2840,9 @@ mod privileged_tests {
     /// Disabling a Windows TAP adapter with `Disable-NetAdapter` (what
     /// [`release_waiting_recv`] does for a failing oversize test) makes a
     /// `recv` waiting on it return within 30 s with exactly
-    /// `Platform(Windows(995))` (`ERROR_OPERATION_ABORTED`, deliberately
-    /// not remapped: a healthy adapter can report it too, and `apply(Up)`
-    /// does not undo `Disable-NetAdapter`), so the waiting thread lets go of
+    /// `InvalidState` (native `ERROR_OPERATION_ABORTED`, the same code a
+    /// media disconnect by `apply(Down)` gives, although `apply(Up)` does
+    /// not undo `Disable-NetAdapter`), so the waiting thread lets go of
     /// the device and the adapter is removed when the device drops (the CI
     /// leak check confirms nothing is left). Frames that arrive first are
     /// skipped. The test prints the time from the start of the
@@ -2897,7 +2907,7 @@ mod privileged_tests {
         };
         receiver.join().expect("the receiver thread does not panic");
         assert!(
-            matches!(err, Error::Platform(PlatformErrorCode::Windows(995))),
+            matches!(err, Error::InvalidState),
             "recv on a disabled TAP adapter: {err:?}"
         );
         assert_eq!(
@@ -3981,18 +3991,18 @@ mod privileged_tests {
     /// A Windows device's administrative state, read from its operational
     /// status, follows `apply` within 5 s: `Up` after open, `Down` after
     /// applying `Down`, `Up` again after applying `Up`, after which `send`
-    /// is accepted again on the same handle. While it is down:
+    /// is accepted again on the same handle. While it is down, `send`
+    /// reports `InvalidState`: on TUN the Wintun session ended; on TAP the
+    /// media is disconnected and the native call fails with
+    /// `ERROR_OPERATION_ABORTED`. On TAP a `recv` started while down also
+    /// reports `InvalidState` (within 2 s; it fails at once), and a `recv`
+    /// started after `Up` waits again instead of failing (frames are
+    /// skipped; checked for 2 s).
     ///
-    /// - TUN: `send` reports `InvalidState` (the Wintun session ended);
-    /// - TAP: `send` still accepts the frame, and a `recv` waiting on a
-    ///   helper thread does not fail within 2 s (frames are skipped). The
-    ///   media-disconnected adapter does not report
-    ///   `ERROR_OPERATION_ABORTED`; only disabling the adapter does (see
-    ///   `windows_tap_recv_returns_once_the_adapter_is_disabled`).
-    ///
-    /// Every `send` runs on a helper thread bounded to 5 s. The helpers are
-    /// released ([`BlockingCall`]) before the device drops, which removes
-    /// the adapter. The test prints each state with the time it took.
+    /// Every call runs on a helper thread with a bounded wait. The helpers
+    /// are released ([`BlockingCall`]) before the device drops, which
+    /// removes the adapter. The test prints each state with the time it
+    /// took.
     #[cfg(target_os = "windows")]
     fn assert_admin_state_follows_apply_on_windows(kind: DeviceKind) {
         use std::sync::Arc;
@@ -4029,6 +4039,16 @@ mod privileged_tests {
                 PacketIo::send(device, &packet)
             })
         };
+        let bounded_recv = || {
+            let buf_len = snapshot.recv_buffer_len();
+            BlockingCall::spawn(&device, &name, move |device| {
+                let mut buf = vec![0u8; buf_len];
+                // Skips frames until the first error.
+                loop {
+                    PacketIo::recv(device, &mut buf)?;
+                }
+            })
+        };
 
         let (state, waited) = poll_admin_state(&device, AdminState::Up);
         eprintln!("{kind:?} {state:?} {waited:?} after open");
@@ -4042,25 +4062,18 @@ mod privileged_tests {
         let send_while_down = bounded_send();
         let sent = send_while_down.wait(Duration::from_secs(5));
         eprintln!("{kind:?} send while down: {sent:?}");
-        let recv_while_down = (kind == DeviceKind::Tap).then(|| {
-            let buf_len = snapshot.recv_buffer_len();
-            BlockingCall::spawn(&device, &name, move |device| {
-                let mut buf = vec![0u8; buf_len];
-                // Skips frames until the first error.
-                loop {
-                    PacketIo::recv(device, &mut buf)?;
-                }
-            })
-        });
-        match &recv_while_down {
-            None => assert!(
-                matches!(sent, Some(Err(Error::InvalidState))),
-                "{kind:?} send while down: {sent:?}"
-            ),
-            Some(recv) => {
-                let received = recv.wait(Duration::from_secs(2));
-                eprintln!("{kind:?} recv while down, after 2 s: {received:?}");
-            }
+        assert!(
+            matches!(sent, Some(Err(Error::InvalidState))),
+            "{kind:?} send while down: {sent:?}"
+        );
+        if kind == DeviceKind::Tap {
+            let recv_while_down = bounded_recv();
+            let received = recv_while_down.wait(Duration::from_secs(2));
+            eprintln!("{kind:?} recv while down: {received:?}");
+            assert!(
+                matches!(received, Some(Err(Error::InvalidState))),
+                "{kind:?} recv while down: {received:?}"
+            );
         }
 
         set_admin(DesiredAdminState::Up);
@@ -4070,24 +4083,19 @@ mod privileged_tests {
         let send_after_up = bounded_send();
         let sent = send_after_up.wait(Duration::from_secs(5));
         eprintln!("{kind:?} send after up again: {sent:?}");
-        let recv_after_up = (kind == DeviceKind::Tap).then(|| {
-            let buf_len = snapshot.recv_buffer_len();
-            BlockingCall::spawn(&device, &name, move |device| {
-                let mut buf = vec![0u8; buf_len];
-                // Skips frames until the first error.
-                loop {
-                    PacketIo::recv(device, &mut buf)?;
-                }
-            })
-        });
-        if let Some(recv) = &recv_after_up {
-            let received = recv.wait(Duration::from_secs(2));
-            eprintln!("{kind:?} recv after up again, after 2 s: {received:?}");
-        }
         assert!(
             matches!(sent, Some(Ok(n)) if n == len),
             "{kind:?} send after up again: {sent:?}"
         );
+        if kind == DeviceKind::Tap {
+            let recv_after_up = bounded_recv();
+            let received = recv_after_up.wait(Duration::from_secs(2));
+            eprintln!("{kind:?} recv after up again, after 2 s: {received:?}");
+            assert!(
+                received.is_none(),
+                "{kind:?} recv after up again waits: {received:?}"
+            );
+        }
     }
 
     #[test]
@@ -4227,9 +4235,11 @@ mod privileged_tests {
     }
 
     /// Opening the name of a Wintun adapter whose session another handle
-    /// still holds: the test prints the outcome. The existing handle is
-    /// untouched either way and still sends; if the open succeeds, both
-    /// handles survive each other's drop.
+    /// still holds fails with exactly `Platform(Windows(1247))`
+    /// (`ERROR_ALREADY_INITIALIZED`, Wintun refusing a second session), and
+    /// the existing handle is untouched: it still sends and reports its
+    /// name. Should the open ever succeed, the second handle is dropped
+    /// first and the adapter must survive that drop.
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Administrator and wintun.dll to open a TUN device"]
@@ -4247,20 +4257,19 @@ mod privileged_tests {
             .expect("create the Wintun adapter");
 
         let second = backend.open(config);
-        match &second {
-            Ok(device) => eprintln!(
-                "second concurrent Wintun session: open succeeded (index {})",
-                device.id().value()
-            ),
-            Err(err) => eprintln!("second concurrent Wintun session: open failed with {err:?}"),
-        }
-        if let Ok(second) = second {
-            drop(second);
-            assert!(
-                windows_adapter_exists(&name),
-                "dropping the second handle deleted the adapter"
-            );
-        }
+        let refused = match second {
+            Ok(device) => {
+                let index = device.id().value();
+                drop(device);
+                assert!(
+                    windows_adapter_exists(&name),
+                    "dropping the second handle deleted the adapter"
+                );
+                format!("open succeeded (index {index})")
+            }
+            Err(Error::Platform(PlatformErrorCode::Windows(1247))) => String::new(),
+            Err(err) => format!("open failed with {err:?}"),
+        };
 
         let packet = ipv4_udp_packet();
         let sent = PacketIo::send(&first, &packet);
@@ -4269,5 +4278,9 @@ mod privileged_tests {
             "the first handle's send after the second open: {sent:?}"
         );
         assert_eq!(first.snapshot().expect("snapshot the first").name, name);
+        assert!(
+            refused.is_empty(),
+            "a second concurrent Wintun session: {refused}, expected Platform(Windows(1247))"
+        );
     }
 }
