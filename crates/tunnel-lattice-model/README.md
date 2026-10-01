@@ -4,8 +4,8 @@
 
 ### OS-Independent TUN/TAP Domain Types for Tunnel Lattice
 
-[![crates.io](https://img.shields.io/crates/v/tunnel-lattice-model.svg)](https://crates.io/crates/tunnel-lattice-model)
-[![docs.rs](https://img.shields.io/docsrs/tunnel-lattice-model)](https://docs.rs/tunnel-lattice-model)
+[![crates.io](https://img.shields.io/crates/v/tunnel-lattice-model.svg?cacheSeconds=86400)](https://crates.io/crates/tunnel-lattice-model)
+[![docs.rs](https://img.shields.io/docsrs/tunnel-lattice-model?cacheSeconds=86400)](https://docs.rs/tunnel-lattice-model)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/tunnel-lattice)
 
