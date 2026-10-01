@@ -1,0 +1,194 @@
+name: Forwarder benchmark
+
+# The iperf3 forwarder benchmark (bench/forwarder, scripts/bench-forward.sh):
+# raw tun-rs baselines and tunnel-lattice forwarding between two TUN devices,
+# measured the same way in the same run.
+#
+# - `check` (every push/PR touching the harness or the crates it builds
+#   against, and every manual run) keeps the standalone bench/forwarder
+#   workspace building, linted and tested. It is not part of the root
+#   workspace, so ci.yml's `--workspace` jobs do not cover it.
+# - `bench` runs only on a manual `workflow_dispatch`: it needs root for the
+#   TUN devices and the network namespace, takes about a quarter of an hour,
+#   and its numbers are only meaningful as a recorded artifact.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bench/**"
+      - "scripts/bench-forward.sh"
+      - "crates/**"
+      - "Cargo.toml"
+      - ".github/workflows/bench-forward.yml"
+  pull_request:
+    paths:
+      - "bench/**"
+      - "scripts/bench-forward.sh"
+      - "crates/**"
+      - "Cargo.toml"
+      - ".github/workflows/bench-forward.yml"
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "Repetitions per variant (odd numbers give a true median)"
+        required: true
+        default: "5"
+      duration:
+        description: "iperf3 duration per run, seconds"
+        required: true
+        default: "10"
+      variants:
+        description: "Comma-separated variant ids from bench/forwarder/variants.tsv, or 'all'"
+        required: true
+        default: "all"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (bench/forwarder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: bench-forward-check
+          workspaces: bench/forwarder
+
+      - name: cargo fmt --check
+        run: cargo fmt --check --manifest-path bench/forwarder/Cargo.toml
+
+      # One build set per invocation: the facade's blocking path differs
+      # once an async feature is on, and tun-rs refuses two async runtimes
+      # in one build (src/lib.rs has a compile_error! for more than one).
+      - name: cargo clippy -- -D warnings (sync, tokio, async-io)
+        run: |
+          for set in sync tokio async-io; do
+            cargo clippy --manifest-path bench/forwarder/Cargo.toml \
+              --no-default-features --features "$set" --all-targets -- -D warnings
+          done
+
+      # Report parsing/aggregation tests on fixtures: no privilege, no
+      # device.
+      - name: cargo test
+        run: cargo test --manifest-path bench/forwarder/Cargo.toml --no-default-features --features sync
+
+      # The forwarders are Linux-only; elsewhere they compile to a stub.
+      # `check` needs no linker for the foreign targets.
+      - name: cargo check (Windows and macOS targets)
+        run: |
+          for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
+            for set in sync tokio async-io; do
+              cargo check --manifest-path bench/forwarder/Cargo.toml \
+                --no-default-features --features "$set" --all-targets --target "$target"
+            done
+          done
+
+      - name: bash -n and shellcheck scripts/bench-forward.sh
+        run: |
+          bash -n scripts/bench-forward.sh
+          shellcheck scripts/bench-forward.sh
+
+  bench:
+    name: bench (iperf3, Linux, sudo)
+    if: github.event_name == 'workflow_dispatch'
+    # Pinned rather than -latest so the kernel and image stay comparable
+    # between recorded runs (both are recorded in the results).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: bench-forward
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Registry/git sources only: the release builds use
+      # `-C target-cpu=native`, so cached build output from another runner
+      # CPU would not be valid.
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: bench-forward
+          workspaces: bench/forwarder
+          cache-targets: "false"
+
+      # DEBIAN_FRONTEND avoids the package's "start as a daemon?" prompt.
+      - name: Install iperf3
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3
+          iperf3 --version
+
+      # Unprivileged: cargo never runs as root.
+      - name: Build the forwarders
+        run: scripts/bench-forward.sh build
+
+      # Root only for the TUN devices, the namespace and the routes; runs
+      # prebuilt binaries. sudo resets the environment, so the runner
+      # identity recorded in the results is passed explicitly.
+      - name: Run the benchmark (sudo)
+        env:
+          REPS: ${{ inputs.reps }}
+          DURATION: ${{ inputs.duration }}
+          VARIANTS: ${{ inputs.variants }}
+        run: |
+          sudo env "GITHUB_ACTIONS=$GITHUB_ACTIONS" "ImageOS=${ImageOS:-}" "ImageVersion=${ImageVersion:-}" \
+            scripts/bench-forward.sh run --reps "$REPS" --duration "$DURATION" \
+            --variants "$VARIANTS" --out "$RUNNER_TEMP/bench-forward"
+
+      - name: Take ownership of the results
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -d "$RUNNER_TEMP/bench-forward" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bench-forward"
+          fi
+
+      # Marks variants with failed runs instead of refusing them, so a
+      # partial run still shows what happened; the last step below fails
+      # the job in that case.
+      - name: Results table (job summary)
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/bench-forward/env.json" ]; then
+            scripts/bench-forward.sh report "$RUNNER_TEMP/bench-forward" --allow-incomplete >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The script removes everything it created on every exit path; fail
+      # the job if anything is left anyway.
+      - name: No TUN device or namespace left behind
+        if: ${{ !cancelled() }}
+        run: |
+          leftover=""
+          for iface in tun11 tun22; do
+            if ip link show "$iface" >/dev/null 2>&1; then leftover="$leftover $iface"; fi
+          done
+          if [ -e /run/netns/ns1 ]; then leftover="$leftover netns:ns1"; fi
+          if [ -n "$leftover" ]; then
+            echo "::error::left behind by the benchmark:$leftover"
+            exit 1
+          fi
+
+      - name: Upload results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-forward-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench-forward
+          if-no-files-found: error
+
+      # A table with failed runs must never be published as a result.
+      - name: Require complete results
+        run: scripts/bench-forward.sh report "$RUNNER_TEMP/bench-forward" > /dev/null
