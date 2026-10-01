@@ -372,7 +372,11 @@ impl DeviceProvider for TunRsBackend {
 /// and macOS `tun-rs` returns `if_nametoindex`, where `0` means the lookup
 /// failed, so `0` is an error rather than an identity.
 fn read_device_id(handle: &tun_rs::DeviceImpl) -> Result<DeviceId> {
-    match handle.if_index().map_err(io_error)? {
+    device_id_from_index(handle.if_index())
+}
+
+fn device_id_from_index(index: std::io::Result<u32>) -> Result<DeviceId> {
+    match index.map_err(io_error)? {
         0 => Err(Error::Platform(PlatformErrorCode::Unknown)),
         index => Ok(DeviceId::new(u64::from(index))),
     }
@@ -881,6 +885,22 @@ mod io_error_tests {
 
     fn map_kind(kind: io::ErrorKind) -> Error {
         io_error(io::Error::new(kind, "synthetic"))
+    }
+
+    #[test]
+    fn a_zero_interface_index_is_not_an_identity() {
+        assert!(matches!(
+            device_id_from_index(Ok(0)),
+            Err(Error::Platform(PlatformErrorCode::Unknown))
+        ));
+        assert!(matches!(
+            device_id_from_index(Err(io::Error::from(io::ErrorKind::PermissionDenied))),
+            Err(Error::PermissionDenied)
+        ));
+        assert_eq!(
+            device_id_from_index(Ok(12)).expect("a real index"),
+            DeviceId::new(12)
+        );
     }
 
     #[test]
@@ -1395,6 +1415,7 @@ mod privileged_tests {
         let name = device.snapshot().expect("snapshot original queue").name;
         let queue_name = queue.snapshot().expect("snapshot cloned queue").name;
         assert_eq!(name, queue_name);
+        assert_eq!(queue.id(), device.id(), "a queue keeps the device identity");
 
         // Dropping the clone first does not affect the original queue —
         // exercises the "independent handles" half of Handle's ownership
