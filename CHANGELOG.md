@@ -89,6 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     supported-platform table with the privilege and driver each platform
     needs, listing only what the privileged CI jobs test.
 
+- **Real-device latency benchmark (opt-in, Linux, macOS, Windows).** The
+  `tunnel-lattice` crate gains a `device` bench (`harness = false`) that
+  echoes UDP datagrams through a real TUN device, and a TAP device where
+  supported, and records round-trip latency percentiles and windowed echo
+  rate for sync `recv`/`send`, native async `packet_stream` + `send_async`,
+  and the thread bridge, as JSON and Markdown. It does nothing unless
+  `TUNNEL_LATTICE_PRIVILEGED_BENCH=1` is set; a manual `Device benchmark`
+  workflow runs it as root/Administrator on all three platforms in each
+  feature set and fails on any leftover adapter. Test and dev-dependency
+  only (`tunnel-lattice-async` as a dev-dependency); no public API change.
+
 - **Windows TAP is now tested on real devices in CI.** The privileged CI
   job stages the tap-windows6 9.27.0 driver package (SHA-256 and catalog
   signature checked, `pnputil /add-driver`, no adapter created in advance)
