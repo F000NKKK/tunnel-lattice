@@ -69,7 +69,7 @@ blocking = { version = "1.7.0", optional = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 libloading = "0.9.0"
 # `TunRsBackend::capabilities` probes for the tap-windows6 (`tap0901`)
-# driver through SetupAPI (see `src/windows_tap_probe.rs`), repeating the
+# driver through SetupAPI (see `src/windows_tap_probe.rs`), following the
 # driver lookup tun-rs's own `open(Tap)` performs, without creating a
 # device. Already locked at 0.61.2 via tun-rs 2.8.11; adds no package to
 # Cargo.lock.

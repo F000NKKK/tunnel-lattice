@@ -41,6 +41,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     that on Linux opening an existing persistent TAP device with a MAC
     changes that device's MAC.
 
+- **More TAP tests on real devices (Linux and macOS), test-only.** The
+  privileged CI jobs now also run, in every feature set: on Linux and macOS
+  (`feth`), open and snapshot of a TAP device (kind, MAC, MTU set at open,
+  `recv_buffer_len`) and an MTU change by `apply` that reads back (on macOS
+  on both `feth` interfaces of the pair); on Linux, admin state toggled
+  down and up by `apply`, with `send` on a down device reported as
+  `Error::Platform(PlatformErrorCode::Linux(5))` (`EIO`) and a frame
+  shorter than an Ethernet header as `Linux(22)` (`EINVAL`), the mappings
+  this crate already had, now pinned; on macOS, sending a 42-byte frame and
+  `AlreadyExists` for an existing `feth` name, with the existing interface
+  left intact; on Windows, a waiting `recv` that returns once the TAP
+  adapter is disabled. The Linux job now fails if a TAP device is left
+  behind, as the Windows and macOS jobs already did. No library behaviour
+  changes.
+  - The oversize-receive test no longer leaves its device behind when no
+    packet arrives within its 60 s timeout: before failing it releases the
+    waiting `recv` by deleting or disabling the device (Linux, macOS TAP,
+    Windows), so the device is dropped.
+  - The Windows driver staging step now checks that the driver store holds
+    the tap-windows6 package itself (its INF, provider and version), not
+    just any matching text.
+
 - **Async send on the facade: `Handle::send_async`.** With the `async-io`
   or `tokio` feature, `Handle::send_async(&buf)` returns the device's own
   `AsyncPacketIo::send` future, declared `Send`, so an async forwarder can

@@ -234,6 +234,14 @@ again. The rules match raw OS codes only on the platform they belong to
 macOS has no `EBADFD`), and `WriteZero` and `EFAULT` are remapped on one
 direction only (`send` and `recv` respectively).
 
+A Linux TAP device that is administratively down is not in this table: the
+kernel refuses `send` with `EIO`, which is reported as
+`Error::Platform(PlatformErrorCode::Linux(5))`, and applying
+`DesiredAdminState::Up` makes the same handle send again. A TAP frame
+shorter than an Ethernet header (14 bytes) is refused with `EINVAL`
+(`Error::Platform(PlatformErrorCode::Linux(22))`) whether the device is up
+or down.
+
 On Linux, a blocking `recv` that is already waiting when the device is
 deleted is woken by the kernel with `EFAULT` rather than `EBADFD`; later
 calls get `EBADFD`. Both are `Disconnected`, so deleting a Linux device
@@ -426,7 +434,8 @@ drops), so none has to be created in advance. This project's CI stages
 tap-windows6 9.27.0 that way, after checking the archive's SHA-256 and the
 driver catalog's signature, and runs the TAP tests against it: open and
 snapshot, a MAC set at creation, MTU changes, sending a frame, an oversize
-receive, and an existing adapter name. See `tun-rs`'s own README for
+receive, an existing adapter name, and a waiting `recv` that returns once
+the adapter is disabled. See `tun-rs`'s own README for
 details neither this crate nor `tunnel-lattice` re-derives.
 
 ## 🔀 Persistent devices and multi-queue

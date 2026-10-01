@@ -473,8 +473,8 @@ infallible: a capability the backend cannot confirm is simply absent.
 The Windows answer comes from a SetupAPI driver lookup that follows the one
 `tun-rs` performs before creating a TAP adapter (the same hardware-id and
 driver-version checks, without selecting the driver) and stops before
-anything is registered: it creates no adapter, needs no elevation, runs once per process
-on the first call, and is cached (a driver installed later is noticed after
-a restart). Either answer is advisory: `open` is never refused because of
+anything is registered: it creates no adapter, needs no elevation, runs
+once per process on the first call, and is cached (a driver installed
+later is noticed after a restart). Either answer is advisory: `open` is never refused because of
 it, and a missing driver is still reported by `open` as
 `Error::DriverUnavailable`.
