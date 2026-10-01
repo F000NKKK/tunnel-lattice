@@ -90,11 +90,10 @@ addresses and routes.
 | Platform    | TUN | TAP | Sync | Tokio | async-io | Notes |
 |-------------|:---:|:---:|:----:|:-----:|:--------:|-------|
 | **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | Persistent devices and multi-queue |
-| **Windows** | ✅  | ⚠️  | ✅   | ✅    | ✅       | TUN needs `wintun.dll`; TAP needs the tap-windows6 driver |
+| **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       | TUN needs `wintun.dll`; TAP needs the tap-windows6 driver |
 | **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via `utun`, TAP via `feth` pairs |
 
-✅ tested in CI on real devices. ⚠️ supported, but only the missing-driver
-path is tested in CI so far.
+✅ tested in CI on real devices.
 
 > Creating a device needs `CAP_NET_ADMIN` on Linux, Administrator on
 > Windows, or root on macOS.
@@ -261,7 +260,10 @@ A missing `tun` module is reported as `Error::DriverUnavailable`.
   [wintun.net](https://www.wintun.net/) and place it next to your executable
   or on `PATH`.
 - **TAP**: install the
-  [tap-windows6](https://build.openvpn.net/downloads/releases/) driver.
+  [tap-windows6](https://github.com/OpenVPN/tap-windows6/releases) driver.
+  Staging its package in the driver store is enough (for example
+  `pnputil /add-driver OemVista.inf` from the release's `dist.win10.zip`):
+  `open` creates its own adapter, so none has to be created in advance.
   `Tunnel::capabilities()` reports `Capability::TAP_DEVICES` on Windows
   only when this driver is installed; the check needs no Administrator
   rights, creates no adapter, and runs once per process.

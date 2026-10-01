@@ -87,12 +87,11 @@ error into a typed `tunnel_lattice_core::Error`.
 | Platform    | TUN | TAP | Sync | Tokio | async-io | Mechanism |
 |-------------|:---:|:---:|:----:|:-----:|:--------:|-----------|
 | **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | `/dev/net/tun`; persistence and multi-queue |
-| **Windows** | ✅  | ⚠️  | ✅   | ✅    | ✅       | TUN via Wintun (`wintun.dll`), TAP via tap-windows6 |
+| **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via Wintun (`wintun.dll`), TAP via tap-windows6 |
 | **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via `utun`, TAP via `feth` pairs and BPF |
 
-✅ tested in CI on real devices. ⚠️ supported, but only the missing-driver
-path is tested in CI so far. Administrative-state read-back is exact only
-on Linux; elsewhere `snapshot()` reports `AdminState::Unknown`.
+✅ tested in CI on real devices. Administrative-state read-back is exact
+only on Linux; elsewhere `snapshot()` reports `AdminState::Unknown`.
 
 ## 🧩 Host-level capabilities
 
@@ -417,10 +416,18 @@ Download the matching architecture's `wintun.dll` from
 application's executable, or anywhere on `PATH`. This project's own CI
 downloads it at job time (see `.github/workflows/ci.yml`'s `privileged`
 job) rather than committing the binary to the repository. TAP mode instead
-needs the separate [tap-windows](https://build.openvpn.net/downloads/releases/)
-driver installed (without it, `open` for a TAP device also fails with
-`Error::DriverUnavailable`) — see `tun-rs`'s own README for details neither
-this crate nor `tunnel-lattice` re-derives.
+needs the separate [tap-windows6](https://github.com/OpenVPN/tap-windows6/releases)
+driver (hardware id `tap0901`) installed; without it, `open` for a TAP
+device also fails with `Error::DriverUnavailable`. Staging the driver
+package in the driver store is enough, for example
+`pnputil /add-driver OemVista.inf` from the release's `dist.win10.zip`:
+`tun-rs` creates its own adapter on `open` (and removes it when the handle
+drops), so none has to be created in advance. This project's CI stages
+tap-windows6 9.27.0 that way, after checking the archive's SHA-256 and the
+driver catalog's signature, and runs the TAP tests against it: open and
+snapshot, a MAC set at creation, MTU changes, sending a frame, an oversize
+receive, and an existing adapter name. See `tun-rs`'s own README for
+details neither this crate nor `tunnel-lattice` re-derives.
 
 ## 🔀 Persistent devices and multi-queue
 

@@ -67,11 +67,11 @@ configuration once a device exists.
 | Platform    | TUN | TAP | Sync | Tokio | async-io |
 |-------------|:---:|:---:|:----:|:-----:|:--------:|
 | **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       |
-| **Windows** | ✅  | ⚠️  | ✅   | ✅    | ✅       |
+| **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       |
 | **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       |
 
-✅ tested in CI on real devices. ⚠️ supported, but only the missing-driver
-path is tested in CI so far. See
+✅ tested in CI on real devices (Windows TAP with the tap-windows6 driver
+installed). See
 [`tunnel-lattice-backend-tunrs`](https://crates.io/crates/tunnel-lattice-backend-tunrs)
 for the per-OS mechanisms and error mapping.
 

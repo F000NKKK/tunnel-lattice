@@ -91,11 +91,10 @@ Lattice; адреса и маршруты настраиваются через
 | Платформа   | TUN | TAP | Sync | Tokio | async-io | Примечания |
 |-------------|:---:|:---:|:----:|:-----:|:--------:|------------|
 | **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | Персистентные устройства и multi-queue |
-| **Windows** | ✅  | ⚠️  | ✅   | ✅    | ✅       | TUN нужен `wintun.dll`; TAP нужен драйвер tap-windows6 |
+| **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       | TUN нужен `wintun.dll`; TAP нужен драйвер tap-windows6 |
 | **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN через `utun`, TAP через пары `feth` |
 
-✅ проверено в CI на реальных устройствах. ⚠️ поддерживается, но в CI пока
-проверен только сценарий без драйвера.
+✅ проверено в CI на реальных устройствах.
 
 > Для создания устройства нужны `CAP_NET_ADMIN` на Linux, права
 > администратора на Windows или root на macOS.
@@ -263,7 +262,10 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
   [wintun.net](https://www.wintun.net/) и положите рядом с исполняемым
   файлом или в `PATH`.
 - **TAP**: установите драйвер
-  [tap-windows6](https://build.openvpn.net/downloads/releases/).
+  [tap-windows6](https://github.com/OpenVPN/tap-windows6/releases).
+  Достаточно поместить его пакет в хранилище драйверов (например,
+  `pnputil /add-driver OemVista.inf` из `dist.win10.zip` релиза): `open`
+  создаёт адаптер сам, заранее создавать его не нужно.
   `Tunnel::capabilities()` сообщает `Capability::TAP_DEVICES` на Windows,
   только если этот драйвер установлен; проверка не требует прав
   администратора, не создаёт адаптер и выполняется один раз за процесс.

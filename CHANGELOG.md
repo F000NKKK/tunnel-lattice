@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Windows TAP is now tested on real devices in CI.** The privileged CI
+  job stages the tap-windows6 9.27.0 driver package (SHA-256 and catalog
+  signature checked, `pnputil /add-driver`, no adapter created in advance)
+  after the missing-driver tests and runs Windows TAP tests in every
+  feature set: the driver lookup and `TAP_DEVICES`, open and snapshot (a
+  MAC is reported, `MAC_MUTATION` is not), a MAC set at creation that
+  reads back while a later MAC patch returns `Unsupported`, MTU changes
+  read back, sending a 42-byte frame, an oversize receive reported as
+  `BufferTooSmall`, and `AlreadyExists` for an existing adapter name. The
+  job also fails if a TAP adapter is left behind. The platform tables now
+  mark Windows TAP as tested.
+  - `TunRsDevice::apply` no longer runs the Windows driver lookup: whether
+    a handle can change its MAC is decided from its kind and the OS. The
+    lookup itself now also ignores a driver whose version is 0, as `tun-rs`
+    does.
+  - Documentation only: `TunRsBackend`'s "Opening a device" now describes
+    the MAC precheck and read-back on `open`, and `DeviceConfig::mac` notes
+    that on Linux opening an existing persistent TAP device with a MAC
+    changes that device's MAC.
+
 - **Async send on the facade: `Handle::send_async`.** With the `async-io`
   or `tokio` feature, `Handle::send_async(&buf)` returns the device's own
   `AsyncPacketIo::send` future, declared `Send`, so an async forwarder can
