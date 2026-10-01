@@ -54,7 +54,7 @@ Lattice; адреса и маршруты настраиваются через
   [`tun-rs`](https://github.com/tun-rs/tun-rs); нативные бэкенды под каждую
   ОС встанут на его место без изменений в вашем коде.
 
-> **Статус:** опубликована `0.4.0`, идёт активная разработка. До `1.0` API
+> **Статус:** опубликована `0.5.0`, идёт активная разработка. До `1.0` API
 > не заморожен; см. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
 
 ## 🌟 Ключевые возможности
@@ -186,13 +186,13 @@ cargo bench -p tunnel-lattice-async --bench pool   # накладные расх
 ```toml
 [dependencies]
 # Синхронный API, без async-рантайма
-tunnel-lattice = "0.4"
+tunnel-lattice = "0.5"
 
 # Асинхронный поток пакетов на Tokio (многопоточный рантайм)
-tunnel-lattice = { version = "0.4", features = ["tokio"] }
+tunnel-lattice = { version = "0.5", features = ["tokio"] }
 
 # Асинхронный поток пакетов на async-io (smol, async-std, ...)
-tunnel-lattice = { version = "0.4", features = ["async-io"] }
+tunnel-lattice = { version = "0.5", features = ["async-io"] }
 ```
 
 `tokio` и `async-io` взаимоисключающие.
@@ -439,8 +439,8 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 
 С `tokio` для открытия устройства вызывающий поток должен войти в рантайм
 Tokio, а блокирующим `recv`/`send` этот рантайм нужен **многопоточным**
-(вариант `#[tokio::main]` по умолчанию). Рантайм `current_thread` никогда не обслуживает I/O устройства для
-блокирующих `recv`/`send`. В асинхронном коде используйте вместо них
+(вариант `#[tokio::main]` по умолчанию). Рантайм `current_thread`
+никогда не обслуживает I/O устройства для блокирующих `recv`/`send`. В асинхронном коде используйте вместо них
 `packet_stream` и `send_async`; `send_async` работает и на рантайме
 `current_thread`. Если блокирующие вызовы нужны на однопоточном рантайме,
 используйте `async-io`.

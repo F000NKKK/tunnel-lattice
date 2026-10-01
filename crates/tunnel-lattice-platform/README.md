@@ -77,10 +77,10 @@ public API. The workspace
 
 ```toml
 [dependencies]
-tunnel-lattice-platform = "0.4"
+tunnel-lattice-platform = "0.5"
 
 # With the native async packet I/O trait
-tunnel-lattice-platform = { version = "0.4", features = ["async"] }
+tunnel-lattice-platform = { version = "0.5", features = ["async"] }
 ```
 
 ## 📐 Backend Contract

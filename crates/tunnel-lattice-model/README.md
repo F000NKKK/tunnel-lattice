@@ -34,8 +34,9 @@ contracts; it never inspects or changes the host system.
   optional name, an optional MTU, an optional TAP MAC address, a
   multi-queue request), built with
   `DeviceConfig::new`/`with_name`/`with_mtu`/`with_mac`/`with_multi_queue`.
-  The `name` field's docs list the per-OS name formats a backend accepts (anything
-  else is rejected with `Error::InvalidState` before any native call) and
+  The `name` field's docs list the per-OS name formats a backend accepts
+  (anything else is rejected with `Error::InvalidState` before any native
+  call) and
   what happens when an interface with that name already exists.
 - ✅ **`Device`**: an observed, already-open device (id, actual name, kind,
   MTU, administrative state, and a TAP device's MAC address; `None` for
@@ -69,9 +70,9 @@ contracts; it never inspects or changes the host system.
 
 ```toml
 [dependencies]
-tunnel-lattice-model = "0.4"
+tunnel-lattice-model = "0.5"
 # For `tunnel_lattice_core::Error`, used in the example below
-tunnel-lattice-core = "0.4"
+tunnel-lattice-core = "0.5"
 ```
 
 ## 🎓 Quick Start

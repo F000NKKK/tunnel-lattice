@@ -139,11 +139,11 @@ if host.contains(Capability::TAP_DEVICES) {
 ```toml
 [dependencies]
 # Synchronous backend
-tunnel-lattice-backend-tunrs = "0.4"
+tunnel-lattice-backend-tunrs = "0.5"
 
 # With the native async path on Tokio or async-io (mutually exclusive)
-tunnel-lattice-backend-tunrs = { version = "0.4", features = ["tokio"] }
-tunnel-lattice-backend-tunrs = { version = "0.4", features = ["async-io"] }
+tunnel-lattice-backend-tunrs = { version = "0.5", features = ["tokio"] }
+tunnel-lattice-backend-tunrs = { version = "0.5", features = ["async-io"] }
 ```
 
 ## 🧭 Error mapping

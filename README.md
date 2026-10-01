@@ -54,7 +54,7 @@ addresses and routes.
   [`tun-rs`](https://github.com/tun-rs/tun-rs); native per-OS backends can
   slot in without changing your code.
 
-> **Status:** `0.4.0` is published and development is active. Nothing is
+> **Status:** `0.5.0` is published and development is active. Nothing is
 > API-frozen before `1.0`; see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 🌟 Key Features
@@ -161,8 +161,9 @@ every push and pull request; it does not run the benchmark.
 Tunnel Lattice can at best match `tun-rs` minus its own overhead; the ratio
 column measures that overhead. The range in brackets is the spread over
 the repetitions of this one recorded run only; it says nothing about how
-much the ratio varies between runs or machines. Going beyond `tun-rs` needs batched I/O and
-GSO/GRO offload, planned for 0.6, and native per-OS backends after that.
+much the ratio varies between runs or machines. Going beyond `tun-rs`
+needs batched I/O and GSO/GRO offload, planned for 0.6, and native per-OS
+backends after that.
 `tun-rs`'s own published numbers come from different hardware, and its
 headline figures use offload, so they are not comparable with this table.
 
@@ -180,13 +181,13 @@ cargo bench -p tunnel-lattice-async --bench pool   # PacketPool overhead and con
 ```toml
 [dependencies]
 # Synchronous API, no async runtime
-tunnel-lattice = "0.4"
+tunnel-lattice = "0.5"
 
 # Async packet stream on Tokio (multi-threaded runtime)
-tunnel-lattice = { version = "0.4", features = ["tokio"] }
+tunnel-lattice = { version = "0.5", features = ["tokio"] }
 
 # Async packet stream on async-io (smol, async-std, ...)
-tunnel-lattice = { version = "0.4", features = ["async-io"] }
+tunnel-lattice = { version = "0.5", features = ["async-io"] }
 ```
 
 `tokio` and `async-io` are mutually exclusive.
@@ -431,8 +432,9 @@ loaded or `/dev/net/tun` is missing; run `sudo modprobe tun`.
 With `tokio`, opening a device needs a Tokio runtime entered on the
 calling thread, and the blocking `recv`/`send` need that runtime to be
 **multi-threaded** (`#[tokio::main]`'s default flavor). A `current_thread`
-runtime never drives the device's I/O for the blocking `recv`/`send`. Inside async code use `packet_stream` and `send_async`
-instead; `send_async` also works on a `current_thread` runtime. Use
+runtime never drives the device's I/O for the blocking `recv`/`send`.
+Inside async code use `packet_stream` and `send_async` instead;
+`send_async` also works on a `current_thread` runtime. Use
 `async-io` if you need blocking calls on a single-threaded runtime.
 </details>
 

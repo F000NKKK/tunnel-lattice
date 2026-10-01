@@ -52,8 +52,8 @@ configuration once a device exists.
   reports `Capability::MAC_MUTATION`: Linux and macOS; on Windows a TAP
   MAC address can only be requested at open with `DeviceConfig::with_mac`);
 - 🐧 `Handle::persist`/`Handle::unpersist`/`Handle::additional_queue`, on
-  backends that implement `PersistentDevice`/`MultiQueueProvider` (Linux only, via
-  `tunnel-lattice-backend-tunrs` — see
+  backends that implement `PersistentDevice`/`MultiQueueProvider` (Linux
+  only, via `tunnel-lattice-backend-tunrs` — see
   [Persistent devices and multi-queue](#-persistent-devices-and-multi-queue));
 - ⚡ with the `async-io` or `tokio` feature (mutually exclusive):
   `Handle::packet_stream` and `Handle::packet_stream_with_pool`, a
@@ -117,8 +117,9 @@ While the only backend wraps `tun-rs`, this crate can at best match
 `tun-rs` minus its own overhead; the ratio column measures that overhead.
 The range in brackets is the spread over the repetitions of this one
 recorded run only; it says nothing about how much the ratio varies between
-runs or machines. Going beyond `tun-rs` needs batched I/O and GSO/GRO offload, planned for
-0.6, and native per-OS backends after that. `tun-rs`'s own published
+runs or machines. Going beyond `tun-rs` needs batched I/O and GSO/GRO
+offload, planned for 0.6, and native per-OS backends after that. `tun-rs`'s
+own published
 numbers come from different hardware, and its headline figures use
 offload, so they are not comparable with this table.
 
@@ -127,13 +128,13 @@ offload, so they are not comparable with this table.
 ```toml
 [dependencies]
 # Synchronous API, no async runtime
-tunnel-lattice = "0.4"
+tunnel-lattice = "0.5"
 
 # Async packet stream on Tokio (multi-threaded runtime)
-tunnel-lattice = { version = "0.4", features = ["tokio"] }
+tunnel-lattice = { version = "0.5", features = ["tokio"] }
 
 # Async packet stream on async-io (smol, async-std, ...)
-tunnel-lattice = { version = "0.4", features = ["async-io"] }
+tunnel-lattice = { version = "0.5", features = ["async-io"] }
 ```
 
 `tokio` and `async-io` are mutually exclusive.

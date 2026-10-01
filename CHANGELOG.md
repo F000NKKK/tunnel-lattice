@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0]
+
 - **A down device's `send` is `InvalidState` on Linux and Windows TAP.**
   On Linux, `send` on an administratively down TUN or TAP device now
   returns `Error::InvalidState` instead of

@@ -43,7 +43,8 @@ tokio = { version = "1.53.1", default-features = false }
 # Re-verified on 2026-10-01 for the 0.5 release: 2.8.11 is both the latest
 # tun-rs on crates.io and the version Cargo.lock resolves, and every pinned
 # message, error kind, feature name and the libloading major were re-checked
-# against its source. Not exact-pinned: this is a library, so a downstream lockfile may resolve a
-# newer 2.x; the privileged CI job's Windows missing-driver tests detect a
+# against its source. Not exact-pinned: this is a library, so a downstream
+# lockfile may resolve a newer 2.x; the privileged CI job's Windows
+# missing-driver tests detect a
 # newer tun-rs that changes the errors the classifier relies on.
 tun-rs = { version = "2.8.11", default-features = false }

@@ -50,7 +50,7 @@ It has no OS dependency and no TUN/TAP-specific types.
 
 ```toml
 [dependencies]
-tunnel-lattice-core = "0.4"
+tunnel-lattice-core = "0.5"
 ```
 
 ## 🎓 Quick Start
