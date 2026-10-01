@@ -1,0 +1,97 @@
+# iperf3 forwarder benchmark harness: raw tun-rs baselines and the
+# tunnel-lattice facade forwarding between two TUN devices, measured the
+# same way in the same run (see README.md and scripts/bench-forward.sh).
+#
+# A standalone workspace, deliberately NOT a member of the root workspace:
+# - scripts/release.sh publishes every crates/* package, and this one must
+#   never be published;
+# - the root CI runs `--workspace` under the `async-io` and `tokio` feature
+#   sets, and tun-rs refuses to build with both runtimes at once, so the
+#   three build sets below have to stay separate cargo invocations;
+# - benchmark-only dependencies stay out of the library's preflight.
+[workspace]
+
+[package]
+name = "tunnel-lattice-bench-forwarder"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MPL-2.0"
+publish = false
+description = "Unpublished iperf3 forwarder benchmark harness comparing tunnel-lattice with raw tun-rs."
+readme = "README.md"
+
+# Exactly one build set per cargo invocation (src/lib.rs has a
+# `compile_error!` for more than one). The report tool and the library's
+# unit tests need none of them.
+[features]
+# Blocking I/O: raw `tun_rs::SyncDevice` and the facade's `Handle::recv`/
+# `send` without any async feature (the facade's sync path differs with an
+# async feature enabled, so it must be measured in this build only).
+sync = ["dep:tunnel-lattice", "dep:tun-rs"]
+# Tokio: raw `tun_rs::AsyncDevice` and the facade's `packet_stream` +
+# `send_async`.
+tokio = [
+    "dep:tunnel-lattice",
+    "tunnel-lattice/tokio",
+    "dep:tun-rs",
+    "tun-rs/async_tokio",
+    "dep:tokio",
+    "dep:futures",
+]
+# async-io: the same two shapes on the runtime-agnostic async-io reactor.
+async-io = [
+    "dep:tunnel-lattice",
+    "tunnel-lattice/async-io",
+    "dep:tun-rs",
+    "tun-rs/async_io",
+    "dep:async-io",
+    "dep:futures",
+]
+
+# Requirements are kept identical to the root workspace's
+# [workspace.dependencies] (and to the sibling Lattice crates where they
+# share one); update them together.
+[dependencies]
+tunnel-lattice = { path = "../../crates/tunnel-lattice", default-features = false, features = ["tun-rs"], optional = true }
+tun-rs = { version = "2.8.11", default-features = false, optional = true }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread"], optional = true }
+futures = { version = "0.3.34", optional = true }
+# Already in the graph through tun-rs's `async_io` feature.
+async-io = { version = "2.6.0", optional = true }
+serde_json = "1.0.151"
+
+[[bin]]
+name = "tunrs-sync"
+required-features = ["sync"]
+
+[[bin]]
+name = "tl-sync"
+required-features = ["sync"]
+
+[[bin]]
+name = "tunrs-async-tokio"
+required-features = ["tokio"]
+
+[[bin]]
+name = "tl-async-tokio"
+required-features = ["tokio"]
+
+[[bin]]
+name = "tl-async-tokio-shared-pool"
+required-features = ["tokio"]
+
+[[bin]]
+name = "tunrs-async-asyncio"
+required-features = ["async-io"]
+
+[[bin]]
+name = "tl-async-asyncio"
+required-features = ["async-io"]
+
+[[bin]]
+name = "forwarder-report"
+
+[profile.release]
+# Symbols for `perf` profiles of a forwarder; no effect on the hot path.
+debug = "line-tables-only"

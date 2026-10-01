@@ -1,0 +1,19 @@
+{
+	"start": {
+		"connected": [],
+		"version": "iperf 3.16",
+		"system_info": "Linux runner 6.11.0-1018-azure #18~24.04.1-Ubuntu SMP x86_64",
+		"timestamp": {
+			"time": "Wed, 01 Oct 2026 12:00:00 GMT",
+			"timesecs": 1790856000
+		},
+		"connecting_to": {
+			"host": "10.0.2.1",
+			"port": 5201
+		}
+	},
+	"intervals": [],
+	"end": {
+	},
+	"error": "unable to connect to server - server may have stopped running or use a different port, firewall issue, etc.: Connection refused"
+}
