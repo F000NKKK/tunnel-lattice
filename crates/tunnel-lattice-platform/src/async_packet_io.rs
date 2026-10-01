@@ -32,5 +32,15 @@ pub trait AsyncPacketIo {
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send;
 
     /// Writes one packet from `buf`.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned future before it completes must be safe and
+    /// must leave either the whole packet sent or nothing: never part of a
+    /// packet, and never the packet twice. The implementation must not use
+    /// `buf` after the future is dropped (copy it first if a write can
+    /// outlive the future). Whether a dropped send reached the device may
+    /// be unknown to the caller, so the portable contract is "whole packet
+    /// at most once; unknown after drop".
     fn send(&self, buf: &[u8]) -> impl Future<Output = Result<usize>> + Send;
 }

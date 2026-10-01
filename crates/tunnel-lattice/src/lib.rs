@@ -38,11 +38,14 @@
 //!   `PacketPool` slot (both re-exported under these features). Uses
 //!   a backend's native async I/O path when it reports
 //!   `Capability::NATIVE_ASYNC`; otherwise falls back to
-//!   `tunnel-lattice-async`'s thread-based adapter. No async runtime is
-//!   forced on a caller that enables neither feature. `packet_stream` is
-//!   referenced here as plain text, not an intra-doc link, because it only
-//!   exists under these features and this crate's default `cargo doc`
-//!   build (no features beyond `tun-rs`) cannot resolve it.
+//!   `tunnel-lattice-async`'s thread-based adapter. Either feature also adds
+//!   `Handle::send_async`, which returns the backend's own async send
+//!   future for use inside async code, where the blocking `Handle::send`
+//!   must not be called. No async runtime is forced on a caller that
+//!   enables neither feature. `packet_stream` and `send_async` are
+//!   referenced here as plain text, not intra-doc links, because they only
+//!   exist under these features and this crate's default `cargo doc` build
+//!   (no features beyond `tun-rs`) cannot resolve them.
 
 #![warn(missing_docs)]
 
@@ -222,10 +225,13 @@ impl Tunnel<TunRsBackend> {
 ///   vice versa. See `tunnel_lattice_async::PacketStream`'s own docs for
 ///   its worker-thread shutdown caveat on `Drop` (a known limitation, not
 ///   related to this ownership model).
+/// - **`send_async` only borrows.** Its future borrows the `Handle` and the
+///   packet buffer; it needs no `Arc` clone and keeps nothing alive after
+///   it completes or is dropped.
 ///
-/// Referenced as plain text, not an intra-doc link, for the same reason as
-/// the crate-level docs above (`packet_stream` only exists under the
-/// `async-io`/`tokio` features).
+/// Referenced as plain text, not intra-doc links, for the same reason as
+/// the crate-level docs above (`packet_stream` and `send_async` only exist
+/// under the `async-io`/`tokio` features).
 pub struct Handle<D> {
     device: std::sync::Arc<D>,
     kind: DeviceKind,
@@ -268,11 +274,45 @@ where
     }
 
     /// Reads one packet into `buf`, returning the number of bytes written.
+    ///
+    /// Blocks the calling thread until a packet arrives. Inside async code,
+    /// receive with `packet_stream` instead (available with the `async-io`
+    /// or `tokio` feature).
+    ///
+    /// With the `async-io` feature and the tun-rs backend, this blocks on
+    /// the device's async receive, so called from an async task it parks the
+    /// executor thread that polls that task. With the `tokio` feature and
+    /// the tun-rs backend, the calling thread must have a multi-threaded
+    /// Tokio runtime entered; on a `current_thread` runtime it hangs (see
+    /// the backend's documentation).
+    ///
+    /// # Panics
+    ///
+    /// With the `tokio` feature and the tun-rs backend: when called outside
+    /// a Tokio runtime context, or from inside an asynchronous context (a
+    /// task, `#[tokio::main]`, or `block_on`).
     pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
         self.device.recv(buf)
     }
 
     /// Writes one packet from `buf`.
+    ///
+    /// Blocks the calling thread until the packet is written. Inside async
+    /// code, use `send_async` instead (available with the `async-io` or
+    /// `tokio` feature); it has the same results and errors.
+    ///
+    /// With the `async-io` feature and the tun-rs backend, this blocks on
+    /// the device's async send, so called from an async task it parks the
+    /// executor thread that polls that task. With the `tokio` feature and
+    /// the tun-rs backend, the calling thread must have a multi-threaded
+    /// Tokio runtime entered; on a `current_thread` runtime it hangs (see
+    /// the backend's documentation).
+    ///
+    /// # Panics
+    ///
+    /// With the `tokio` feature and the tun-rs backend: when called outside
+    /// a Tokio runtime context, or from inside an asynchronous context (a
+    /// task, `#[tokio::main]`, or `block_on`).
     pub fn send(&self, buf: &[u8]) -> Result<usize> {
         self.device.send(buf)
     }
@@ -438,6 +478,77 @@ where
     }
 }
 
+#[cfg(feature = "async")]
+impl<D> Handle<D>
+where
+    D: AsyncPacketIo,
+{
+    /// Writes one packet from `buf` without blocking the calling thread.
+    ///
+    /// The async counterpart of [`Handle::send`]: `buf` holds exactly one
+    /// packet, framed as [`PacketIo::send`] expects (one raw IP packet for
+    /// TUN, one Ethernet frame for TAP). The returned future is the device's
+    /// own [`AsyncPacketIo::send`] future, unchanged: this method adds no
+    /// validation, mapping, allocation, or copy. A received [`PacketBuf`]
+    /// derefs to `[u8]`, so it can be passed straight through.
+    ///
+    /// Use this, not `send`, inside async code. With the `tokio` feature
+    /// the future must be polled by the Tokio runtime the device was opened
+    /// under; it also works on a `current_thread` runtime, where the
+    /// blocking `send` hangs. With the `async-io` feature any executor can
+    /// poll it.
+    ///
+    /// There is no capability check and no fallback. A device that does
+    /// not report `Capability::NATIVE_ASYNC` may return a future that
+    /// blocks the thread polling it while it writes. The tun-rs backend
+    /// reports `NATIVE_ASYNC` in every async build.
+    ///
+    /// ```no_run
+    /// # #[cfg(any(feature = "async-io", feature = "tokio"))]
+    /// # async fn example() -> tunnel_lattice::Result<()> {
+    /// use futures::StreamExt;
+    /// use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+    ///
+    /// let tunnel = Tunnel::connect();
+    /// let inside = tunnel.open(DeviceConfig::new(DeviceKind::Tun))?;
+    /// let outside = tunnel.open(DeviceConfig::new(DeviceKind::Tun))?;
+    /// let mut packets = inside.packet_stream(inside.snapshot()?.recv_buffer_len())?;
+    /// if let Some(packet) = packets.next().await {
+    ///     let packet = packet?;
+    ///     // Forwards the pooled packet without copying it.
+    ///     outside.send_async(&packet).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Whatever the device's [`AsyncPacketIo::send`] returns. With the
+    /// tun-rs backend these are the same results and errors as
+    /// [`Handle::send`] in the same build: [`Error::Disconnected`] once the
+    /// device is gone, [`Error::InvalidState`] while a Windows (Wintun)
+    /// interface is disabled, and other native failures as the backend's
+    /// error table maps them. An interrupted write is retried, not reported.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future before it completes is always safe and never
+    /// sends part of a packet. With the tun-rs backend:
+    ///
+    /// - Linux, and macOS TUN (`utun`) and TAP (`feth`): a future dropped
+    ///   before it completed sent nothing.
+    /// - Windows (Wintun and tap-windows6): a future dropped before it
+    ///   completed may or may not have sent the packet.
+    ///
+    /// The portable contract is "the whole packet at most once; unknown
+    /// after drop". A caller that must know whether a packet went out has
+    /// to await the future to completion.
+    pub fn send_async(&self, buf: &[u8]) -> impl Future<Output = Result<usize>> + Send {
+        AsyncPacketIo::send(&*self.device, buf)
+    }
+}
+
 /// Mock-based tests of the facade's stream constructors (no privilege, no
 /// real device).
 #[cfg(all(test, feature = "async"))]
@@ -539,7 +650,9 @@ mod stream_tests {
 }
 
 /// Privileged, `async`-feature-only tests exercising `Handle::packet_stream`
-/// against a real device — see `tunnel-lattice-backend-tunrs`'s
+/// and `Handle::send_async` against a real device (run in CI with
+/// `cargo test -p tunnel-lattice --lib` plus an async feature and
+/// `-- --ignored`) — see `tunnel-lattice-backend-tunrs`'s
 /// `privileged_tests` module for why these are `#[ignore]`d and how to run
 /// them, and `tunnel-lattice-async`'s own unit tests for the
 /// cancellation-semantics proof against a mock (no privilege needed there).
@@ -599,5 +712,93 @@ mod privileged_tests {
         // blocking recv the way the pre-0.4 thread-bridge path could leave
         // one behind.
         drop(stream);
+    }
+
+    /// A well-formed 32-byte IPv4/UDP packet between two TEST-NET-1
+    /// addresses (192.0.2.1 -> 192.0.2.2, port 9 "discard"), with a valid
+    /// header checksum and the UDP checksum left at zero (allowed for
+    /// IPv4). The host drops it after routing; the write itself succeeds.
+    fn ipv4_udp_packet() -> [u8; 32] {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x45; // version 4, header length 5 words
+        packet[2..4].copy_from_slice(&32u16.to_be_bytes()); // total length
+        packet[8] = 64; // TTL
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 2]);
+        let checksum = !ones_complement_sum(&packet[..20]);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        packet[20..22].copy_from_slice(&40000u16.to_be_bytes()); // source port
+        packet[22..24].copy_from_slice(&9u16.to_be_bytes()); // destination port
+        packet[24..26].copy_from_slice(&12u16.to_be_bytes()); // UDP length
+        packet[28..32].copy_from_slice(b"ping");
+        packet
+    }
+
+    /// The 16-bit one's-complement sum of `bytes` (RFC 1071).
+    fn ones_complement_sum(bytes: &[u8]) -> u16 {
+        let mut sum = bytes
+            .chunks_exact(2)
+            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+            .sum::<u32>();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        u16::try_from(sum).expect("folded into 16 bits")
+    }
+
+    #[test]
+    fn the_test_packet_has_a_valid_ipv4_header_checksum() {
+        let packet = ipv4_udp_packet();
+        assert_eq!(
+            ones_complement_sum(&packet[..20]),
+            0xffff,
+            "a header including its checksum sums to 0xffff"
+        );
+        assert_eq!(
+            usize::from(u16::from_be_bytes([packet[2], packet[3]])),
+            packet.len()
+        );
+    }
+
+    /// Opens a TUN device and sends one packet through `send_async`.
+    async fn open_and_send_async() -> Result<usize> {
+        let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))?;
+        device.send_async(&ipv4_udp_packet()).await
+    }
+
+    /// The case the blocking `Handle::send` panics on ("Cannot start a
+    /// runtime from within a runtime"): a send from inside a spawned task.
+    #[cfg(feature = "tokio")]
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn send_async_works_inside_a_task_on_a_multi_thread_tokio_runtime() {
+        let runtime = enter_tokio_runtime();
+        let sent = runtime
+            .block_on(async { tokio::spawn(open_and_send_async()).await })
+            .expect("the task does not panic");
+        assert!(matches!(sent, Ok(32)), "send_async: {sent:?}");
+    }
+
+    /// The blocking `Handle::send` hangs on a `current_thread` runtime;
+    /// `send_async` is polled by the runtime itself, so it does not.
+    #[cfg(feature = "tokio")]
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn send_async_works_on_a_current_thread_tokio_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build a current_thread Tokio runtime");
+        let sent = runtime.block_on(open_and_send_async());
+        assert!(matches!(sent, Ok(32)), "send_async: {sent:?}");
+    }
+
+    #[cfg(not(feature = "tokio"))]
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
+    fn send_async_works_under_a_foreign_executor_with_async_io() {
+        let sent = futures::executor::block_on(open_and_send_async());
+        assert!(matches!(sent, Ok(32)), "send_async: {sent:?}");
     }
 }

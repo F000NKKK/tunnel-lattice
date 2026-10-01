@@ -356,6 +356,29 @@ every backend `tunnel-lattice` ships as of this crate implements
 `AsyncPacketIo` (previously only `PacketIo`), a pre-1.0 change that was
 additive in effect for every shipped backend.
 
+The send side is a single method, `Handle::send_async`, under the same
+features. It returns the device's own `AsyncPacketIo::send` future
+unchanged (declared `impl Future<Output = Result<usize>> + Send`, not an
+`async fn`, so `Send` is part of the contract), with no capability check,
+no fallback, and no error mapping: with the tun-rs backend the blocking
+`send` blocks on the very same future, so both have identical results and
+errors. It exists because the blocking `send` cannot be used from async
+code (with `tokio` it panics inside a task and hangs on `current_thread`;
+with `async-io` it parks the executor thread), and `Handle` does not
+expose its device. A backend without `Capability::NATIVE_ASYNC` must still
+implement `AsyncPacketIo` itself, and its send future may block the
+polling thread. There is deliberately no `Sink`: `AsyncPacketIo::send` is
+not poll-based, so a `Sink` would box a future and own a copy (or a pool
+slot) per packet, which the packet-buffer design below exists to avoid; one
+can be layered on `send_async` later. Dropping the future is always safe
+and never sends part of a packet. Per OS with tun-rs: on Linux and macOS
+(`utun` and `feth`) a send dropped before completion sent nothing, because
+the write happens only in the poll that completes it; on Windows tun-rs
+copies the packet and writes on its blocking pool, so a dropped send may or
+may not have gone out. The portable contract, also stated on
+`AsyncPacketIo::send` as a backend obligation, is "the whole packet at most
+once; unknown after drop."
+
 ### Packet buffers
 
 `PacketStream` yields `Result<PacketBuf>`. Each stream receives into a

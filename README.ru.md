@@ -61,8 +61,8 @@ Lattice; адреса и маршруты настраиваются через
 
 ### Основное
 - ✅ **TUN и TAP**: устройства сырого IP (уровень 3) и Ethernet (уровень 2)
-- ✅ **Sync и async**: блокирующие `recv`/`send` или `futures::Stream` с
-  фичей `tokio` или `async-io`
+- ✅ **Sync и async**: блокирующие `recv`/`send` или `futures::Stream` и
+  неблокирующий `send_async` с фичей `tokio` или `async-io`
 - ✅ **Чтение и изменение**: перечитать имя, MTU, административное
   состояние и MAC-адрес TAP-устройства; поменять MTU, MAC и up/down на
   открытом устройстве
@@ -188,6 +188,12 @@ async fn main() -> tunnel_lattice::Result<()> {
 Когда устройство исчезает, поток отдаёт одну ошибку и завершается; на
 слишком большой пакет он отдаёт `BufferTooSmall` и продолжает работу.
 
+В асинхронном коде отправляйте через `send_async(&packet).await`, а не
+блокирующий `send` (он паникует внутри задачи Tokio). `send_async`
+принимает полученный `PacketBuf` без копирования и возвращает те же ошибки,
+что и `send`. Отброшенный `send_async` никогда не отправляет часть пакета;
+на Windows неизвестно, ушёл ли пакет.
+
 ## 📚 Примеры
 
 ### Персистентное устройство и multi-queue (Linux)
@@ -303,6 +309,7 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 | `Handle::capabilities` | Что устройство поддерживает в рантайме |
 | `Handle::persist` / `additional_queue` | Персистентность и multi-queue на Linux |
 | `Handle::packet_stream` | Асинхронный `Stream` пакетов из пула (`tokio` / `async-io`) |
+| `Handle::send_async` | Неблокирующая отправка для асинхронного кода (`tokio` / `async-io`) |
 
 ### Крейты воркспейса
 
@@ -345,8 +352,19 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 
 С `tokio` каждому вызову устройства нужен **многопоточный** рантайм Tokio,
 в который вошёл вызывающий поток (вариант `#[tokio::main]` по умолчанию).
-Рантайм `current_thread` никогда не обслуживает I/O устройства. Если нужен
-однопоточный рантайм, используйте `async-io`.
+Рантайм `current_thread` никогда не обслуживает I/O устройства для
+блокирующих `recv`/`send`. В асинхронном коде используйте вместо них
+`packet_stream` и `send_async`; `send_async` работает и на рантайме
+`current_thread`. Если блокирующие вызовы нужны на однопоточном рантайме,
+используйте `async-io`.
+</details>
+
+<details>
+<summary><b><code>send</code> паникует внутри задачи Tokio</b></summary>
+
+"Cannot start a runtime from within a runtime": блокирующие `send`/`recv`
+блокируются на рантайме, а Tokio запрещает это внутри асинхронного кода.
+Используйте там `send_async(&packet).await` и `packet_stream`.
 </details>
 
 <details>
@@ -378,6 +396,7 @@ git clone https://github.com/F000NKKK/tunnel-lattice.git
 cd tunnel-lattice
 cargo test --workspace                                      # тесты без привилегий
 sudo -E cargo test -p tunnel-lattice-backend-tunrs -- --ignored   # на реальных устройствах
+sudo -E cargo test -p tunnel-lattice --lib --features tokio -- --ignored   # фасад, на реальных устройствах
 ```
 
 ## 📄 Лицензия

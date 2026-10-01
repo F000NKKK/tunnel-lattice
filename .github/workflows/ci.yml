@@ -7,8 +7,8 @@ name: CI
 # privilege to open a real TUN/TAP device, so they cover construction/model
 # logic only; the `privileged` job below (mirroring net-lattice's own
 # pattern) actually opens, mutates, and tears down a real device on each
-# platform via `tunnel-lattice-backend-tunrs`'s `#[ignore]`d
-# `privileged_tests`.
+# platform via the `#[ignore]`d `privileged_tests` of
+# `tunnel-lattice-backend-tunrs` and of the `tunnel-lattice` facade.
 
 on:
   push:
@@ -125,12 +125,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         features:
+          # `facade_flags` selects the same feature set for the
+          # `tunnel-lattice` facade's own ignored tests, which exist only
+          # with an async feature (none for `default`).
           - name: default
             flags: ""
+            facade_flags: ""
           - name: async-io
             flags: "--no-default-features --features tunnel-lattice-backend-tunrs/async-io"
+            facade_flags: "--no-default-features --features tunnel-lattice/tun-rs,tunnel-lattice/async-io"
           - name: tokio
             flags: "--no-default-features --features tunnel-lattice-backend-tunrs/tokio"
+            facade_flags: "--no-default-features --features tunnel-lattice/tun-rs,tunnel-lattice/tokio"
     steps:
       - uses: actions/checkout@v7
 
@@ -189,6 +195,14 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --nocapture
 
+      # The facade's own `privileged_tests` (`packet_stream` dispatch and
+      # `send_async` on a real TUN device), unit tests only (`--lib`): the
+      # integration tests and doctests need no privilege and already run in
+      # the `ci` job.
+      - name: cargo test -p tunnel-lattice --lib -- --ignored (Linux/macOS, sudo)
+        if: matrix.os != 'windows-latest' && matrix.features.name != 'default'
+        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
+
       # A macOS TAP device is a `feth` interface pair, a cloned interface
       # that outlives the test process, so the privileged tests must tear
       # down every pair they create (the device's own drop, or the tests'
@@ -210,3 +224,8 @@ jobs:
       - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored (Windows)
         if: matrix.os == 'windows-latest'
         run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --skip windows_missing_driver_ --nocapture
+
+      # Runs after "Download wintun.dll": these open a TUN device.
+      - name: cargo test -p tunnel-lattice --lib -- --ignored (Windows)
+        if: matrix.os == 'windows-latest' && matrix.features.name != 'default'
+        run: cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture

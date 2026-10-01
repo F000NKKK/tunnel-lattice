@@ -61,8 +61,8 @@ addresses and routes.
 
 ### Core Capabilities
 - ✅ **TUN and TAP**: raw IP (Layer 3) and Ethernet (Layer 2) devices
-- ✅ **Sync and async**: blocking `recv`/`send`, or a `futures::Stream` with
-  the `tokio` or `async-io` feature
+- ✅ **Sync and async**: blocking `recv`/`send`, or a `futures::Stream`
+  and a non-blocking `send_async` with the `tokio` or `async-io` feature
 - ✅ **Observe and mutate**: re-read name, MTU, administrative state, and
   a TAP device's MAC address; change MTU, MAC, and up/down on an open
   device
@@ -186,6 +186,12 @@ async fn main() -> tunnel_lattice::Result<()> {
 The stream yields one error and ends when the device goes away; an
 oversize packet yields `BufferTooSmall` and the stream keeps going.
 
+Inside async code, send with `send_async(&packet).await`, not the blocking
+`send` (which panics inside a Tokio task). It takes the received
+`PacketBuf` without a copy and has the same errors as `send`. A dropped
+`send_async` never sends part of a packet; on Windows whether it sent the
+packet is unknown.
+
 ## 📚 Examples
 
 ### Persistent Device and Multi-Queue (Linux)
@@ -301,6 +307,7 @@ Tunnel Lattice layer adds and what it does not have yet.
 | `Handle::capabilities` | What this device supports at runtime |
 | `Handle::persist` / `additional_queue` | Linux persistence and multi-queue |
 | `Handle::packet_stream` | Async `Stream` of pooled packets (`tokio` / `async-io`) |
+| `Handle::send_async` | Non-blocking send for async code (`tokio` / `async-io`) |
 
 ### Workspace Crates
 
@@ -343,8 +350,18 @@ loaded or `/dev/net/tun` is missing; run `sudo modprobe tun`.
 
 With `tokio`, every device call needs a **multi-threaded** Tokio runtime
 entered on the calling thread (`#[tokio::main]`'s default flavor). A
-`current_thread` runtime never drives the device's I/O. Use `async-io` if
-you need a single-threaded runtime.
+`current_thread` runtime never drives the device's I/O for the blocking
+`recv`/`send`. Inside async code use `packet_stream` and `send_async`
+instead; `send_async` also works on a `current_thread` runtime. Use
+`async-io` if you need blocking calls on a single-threaded runtime.
+</details>
+
+<details>
+<summary><b><code>send</code> panics inside a Tokio task</b></summary>
+
+"Cannot start a runtime from within a runtime": the blocking `send`/`recv`
+block on the runtime and Tokio forbids that inside async code. Use
+`send_async(&packet).await` and `packet_stream` there.
 </details>
 
 <details>
@@ -376,6 +393,7 @@ git clone https://github.com/F000NKKK/tunnel-lattice.git
 cd tunnel-lattice
 cargo test --workspace                                      # unprivileged tests
 sudo -E cargo test -p tunnel-lattice-backend-tunrs -- --ignored   # real devices
+sudo -E cargo test -p tunnel-lattice --lib --features tokio -- --ignored   # facade, real devices
 ```
 
 ## 📄 License

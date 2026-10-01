@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Async send on the facade: `Handle::send_async`.** With the `async-io`
+  or `tokio` feature, `Handle::send_async(&buf)` returns the device's own
+  `AsyncPacketIo::send` future, declared `Send`, so an async forwarder can
+  be written against the facade alone (`packet_stream` to receive,
+  `send_async` to send; a received `PacketBuf` is sent without a copy).
+  Previously the only facade send was the blocking `Handle::send`, which
+  with `tokio` panics inside a task ("Cannot start a runtime from within a
+  runtime") and hangs on a `current_thread` runtime, and with `async-io`
+  parks the executor thread. `send_async` works on a `current_thread`
+  Tokio runtime too. Additive: no existing signature or behaviour changes.
+  - Same results and errors as `Handle::send` in the same build; no
+    capability check, fallback, or mapping is added. A backend that does
+    not report `NATIVE_ASYNC` may return a future that blocks the polling
+    thread.
+  - Dropping the future never sends part of a packet. With the `tun-rs`
+    backend a send dropped before completion sent nothing on Linux and
+    macOS, and may or may not have been sent on Windows. The portable
+    contract, "the whole packet at most once; unknown after drop", is now
+    also documented as a backend obligation on `AsyncPacketIo::send`.
+  - Documentation only: `Handle::send`/`recv` and `TunRsDevice` now state
+    that with `tokio` the blocking calls panic outside a runtime context or
+    inside async code, and that with `async-io` they block the executor
+    thread.
+  - CI's privileged job now also runs the facade's ignored tests (async
+    feature sets, Linux, macOS, and Windows), which open a TUN device and
+    send with `send_async` from a task on a multi-threaded Tokio runtime,
+    on a `current_thread` Tokio runtime, and under a foreign executor with
+    `async-io`.
+
 - **Host-level capabilities from the `tun-rs` backend, with an honest
   `TAP_DEVICES` on Windows.** `TunRsBackend` now implements
   `CapabilityProvider`, so `Tunnel::connect().capabilities()` reports what

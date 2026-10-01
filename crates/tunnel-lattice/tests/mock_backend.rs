@@ -20,7 +20,17 @@ struct State {
     mtu: Mutex<u32>,
     admin: Mutex<Option<AdminState>>,
     inbox: Mutex<VecDeque<Vec<u8>>>,
+    /// Packets written through `PacketIo::send`.
     sent: Mutex<Vec<Vec<u8>>>,
+    /// Packets written through `AsyncPacketIo::send`, kept apart so a test
+    /// can tell which path a facade method took.
+    #[cfg(feature = "async")]
+    async_sent: Mutex<Vec<Vec<u8>>>,
+    /// Both send paths fail with `Error::Disconnected`.
+    fail_send: AtomicBool,
+    /// An async send stays `Pending` while this is set.
+    #[cfg(feature = "async")]
+    hold_async_send: AtomicBool,
     persistent: AtomicBool,
     fail_admin: AtomicBool,
     native_async: bool,
@@ -95,6 +105,9 @@ impl PacketIo for MockDevice {
     }
 
     fn send(&self, buf: &[u8]) -> Result<usize> {
+        if self.state.fail_send.load(Ordering::SeqCst) {
+            return Err(Error::Disconnected);
+        }
         self.state.sent.lock().unwrap().push(buf.to_vec());
         Ok(buf.len())
     }
@@ -183,9 +196,21 @@ impl tunnel_lattice::AsyncPacketIo for MockDevice {
         async move { result }
     }
 
+    /// Writes only when polled, and only once `hold_async_send` is clear, so
+    /// a future dropped while `Pending` has sent nothing. Borrows `buf`
+    /// instead of copying it up front.
     fn send(&self, buf: &[u8]) -> impl Future<Output = Result<usize>> + Send {
-        let result = PacketIo::send(self, buf);
-        async move { result }
+        let state = &self.state;
+        std::future::poll_fn(move |_| {
+            if state.hold_async_send.load(Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+            if state.fail_send.load(Ordering::SeqCst) {
+                return std::task::Poll::Ready(Err(Error::Disconnected));
+            }
+            state.async_sent.lock().unwrap().push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        })
     }
 }
 
@@ -382,4 +407,110 @@ fn packet_stream_works_on_both_dispatch_branches() {
         ));
         assert!(futures::executor::block_on(stream.next()).is_none());
     }
+}
+
+/// Opens a TUN handle on a mock that reports `NATIVE_ASYNC` or not.
+#[cfg(feature = "async")]
+fn async_handle(native_async: bool) -> (tunnel_lattice::Handle<MockDevice>, Arc<State>) {
+    let backend = MockBackend::with_state(State {
+        native_async,
+        ..State::default()
+    });
+    let state = Arc::clone(&backend.state);
+    let handle = Tunnel::new(backend)
+        .open(DeviceConfig::new(DeviceKind::Tun))
+        .expect("open");
+    (handle, state)
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn send_async_takes_the_async_path_whatever_the_capabilities_say() {
+    for native_async in [true, false] {
+        let (handle, state) = async_handle(native_async);
+        assert_eq!(
+            handle.capabilities().contains(Capability::NATIVE_ASYNC),
+            native_async
+        );
+
+        let sent = futures::executor::block_on(handle.send_async(b"async"));
+        assert_eq!(sent.expect("send_async"), 5, "native_async: {native_async}");
+        assert_eq!(*state.async_sent.lock().unwrap(), [b"async".to_vec()]);
+        assert!(state.sent.lock().unwrap().is_empty(), "not PacketIo::send");
+
+        handle.send(b"sync").expect("send");
+        assert_eq!(*state.sent.lock().unwrap(), [b"sync".to_vec()]);
+        assert_eq!(
+            state.async_sent.lock().unwrap().len(),
+            1,
+            "not AsyncPacketIo::send"
+        );
+    }
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn a_send_async_error_reaches_the_caller_unchanged() {
+    let (handle, state) = async_handle(true);
+    state.fail_send.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        futures::executor::block_on(handle.send_async(b"pkt")),
+        Err(Error::Disconnected)
+    ));
+    assert!(matches!(handle.send(b"pkt"), Err(Error::Disconnected)));
+    assert!(state.async_sent.lock().unwrap().is_empty());
+
+    state.fail_send.store(false, Ordering::SeqCst);
+    assert_eq!(
+        futures::executor::block_on(handle.send_async(b"pkt")).expect("send_async"),
+        3
+    );
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn the_send_async_future_is_send_and_runs_on_another_thread() {
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    let (handle, state) = async_handle(true);
+    let clone = handle.clone();
+    let packet = b"moved".to_vec();
+    // Built on this thread, polled to completion on another one.
+    let future = assert_send(clone.send_async(&packet));
+    let sent = std::thread::scope(|scope| {
+        scope
+            .spawn(move || futures::executor::block_on(future))
+            .join()
+            .expect("the sending thread does not panic")
+    });
+    assert_eq!(sent.expect("send_async"), 5);
+    assert_eq!(*state.async_sent.lock().unwrap(), [b"moved".to_vec()]);
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn dropping_a_pending_send_async_sends_nothing_and_the_handle_stays_usable() {
+    use std::task::{Context, Waker};
+
+    let (handle, state) = async_handle(true);
+    state.hold_async_send.store(true, Ordering::SeqCst);
+    {
+        let mut future = std::pin::pin!(handle.send_async(b"dropped"));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(state.async_sent.lock().unwrap().is_empty());
+    assert!(state.sent.lock().unwrap().is_empty());
+
+    state.hold_async_send.store(false, Ordering::SeqCst);
+    let sent = futures::executor::block_on(handle.send_async(b"next"));
+    assert_eq!(sent.expect("send_async"), 4);
+    assert_eq!(*state.async_sent.lock().unwrap(), [b"next".to_vec()]);
+    assert_eq!(
+        state.closed.load(Ordering::SeqCst),
+        0,
+        "the device is still open"
+    );
 }

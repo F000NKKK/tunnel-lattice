@@ -93,6 +93,12 @@ Callers such as `tunnel-lattice-async`'s buffer pool reuse receive buffers
 without clearing them, so reporting bytes that were not written would
 expose data from an earlier packet.
 
+Dropping an `AsyncPacketIo::send` future before it completes must leave
+either the whole packet sent or nothing, never part of it and never twice,
+and must not use `buf` afterwards (copy it first if the write can outlive
+the future). Callers may rely only on "the whole packet at most once;
+unknown after drop".
+
 ## 📖 Documentation
 
 - **API reference**: [docs.rs/tunnel-lattice-platform](https://docs.rs/tunnel-lattice-platform)

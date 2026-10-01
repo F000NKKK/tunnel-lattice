@@ -372,20 +372,33 @@ already depends on it with both, so no new package enters the build.
 
 ### `tokio` requires a multi-threaded runtime
 
-With the `tokio` feature, every call into `TunRsDevice` — including plain
-`PacketIo::recv`/`send`, not only the async API — must happen while a
-**multi-threaded** Tokio runtime is entered on the calling thread
-(`#[tokio::main]`'s default flavor, or `Builder::new_multi_thread()`
-explicitly). `tokio::runtime::Handle::block_on` only drives that runtime's
-I/O reactor on the `multi_thread` flavor, whose worker threads poll it
-independently of where `block_on` is called from; on `current_thread`, only
+With the `tokio` feature, every call into `TunRsDevice` must happen while a
+Tokio runtime is entered on the calling thread: building the
+`AsyncDevice` registers it with that runtime. The blocking
+`PacketIo::recv`/`send` additionally need that runtime to be
+**multi-threaded** (`#[tokio::main]`'s default flavor, or
+`Builder::new_multi_thread()` explicitly).
+`tokio::runtime::Handle::block_on` only drives that runtime's I/O reactor
+on the `multi_thread` flavor, whose worker threads poll it independently of
+where `block_on` is called from; on `current_thread`, only
 `Runtime::block_on` (called on the owned `Runtime` value, not a `Handle`)
-drives it, so a `current_thread` runtime
-(`#[tokio::main(flavor = "current_thread")]`) hangs the first `recv`/`send`
-call forever. This was confirmed with an isolated repro against `tun-rs`
-directly (not a bug specific to this crate) and is exercised by this crate's
-`privileged_tests`. Prefer the `async-io` feature instead if a
-single-threaded runtime is a hard requirement.
+drives it, so on a `current_thread` runtime
+(`#[tokio::main(flavor = "current_thread")]`) the first blocking
+`recv`/`send` call hangs forever. This was confirmed with an isolated repro
+against `tun-rs` directly (not a bug specific to this crate) and is
+exercised by this crate's `privileged_tests`.
+
+The blocking `PacketIo::recv`/`send` must also not be called from async
+code. With `tokio`, `Handle::current()` panics outside a runtime context
+and `Handle::block_on` panics inside an asynchronous context (a task,
+`#[tokio::main]`, or `block_on`); with `async-io`,
+`futures::executor::block_on` parks the executor thread that polls the
+calling task. Inside async code use `AsyncPacketIo` instead — through the
+`tunnel-lattice` facade, `Handle::send_async` and `Handle::packet_stream`.
+Their futures are polled by the runtime itself rather than blocked on, so
+`send_async` also works on a `current_thread` Tokio runtime. Prefer the
+`async-io` feature if single-threaded blocking calls are a hard
+requirement.
 
 ## 🪟 Windows requires `wintun.dll`
 

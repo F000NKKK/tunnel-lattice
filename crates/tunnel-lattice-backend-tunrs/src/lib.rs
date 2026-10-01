@@ -120,6 +120,18 @@ impl TunRsBackend {
 /// so device metadata (name/mtu/if_index/enabled) reads identically either
 /// way.
 ///
+/// Because of that, the blocking [`PacketIo`] `recv`/`send` must not be
+/// called from async code in an async build. With `tokio` they block
+/// through `tokio::runtime::Handle::current().block_on`, which panics when
+/// called outside a Tokio runtime context or from inside an asynchronous
+/// context (a task, `#[tokio::main]`, or `block_on`), and hangs on a
+/// `current_thread` runtime. With `async-io` they block through
+/// `futures::executor::block_on`, which parks the executor thread polling
+/// the calling task. Inside async code use `AsyncPacketIo` (the facade's
+/// `send_async` and `packet_stream`), whose futures are polled by the
+/// runtime itself rather than blocked on; `send_async` also works on a
+/// `current_thread` Tokio runtime.
+///
 /// On Linux with the `tokio` feature, receiving is the one exception: it
 /// reads through a private duplicate of the device descriptor, registered
 /// with the Tokio reactor for both readable and error readiness, because

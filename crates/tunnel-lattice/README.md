@@ -59,7 +59,8 @@ configuration once a device exists.
   `Handle::packet_stream` and `Handle::packet_stream_with_pool`, a
   `futures::Stream` of received packets, each a `PacketBuf` view into a
   `PacketPool` slot (both re-exported here), with no allocation or copy per
-  packet.
+  packet; and `Handle::send_async`, the non-blocking send to use inside
+  async code.
 
 ## 💻 Supported Platforms
 
@@ -132,6 +133,35 @@ async fn main() -> tunnel_lattice::Result<()> {
 }
 ```
 
+### Async Send (Forwarding)
+
+Inside async code, send with `send_async`, never the blocking `send`. A
+`PacketBuf` derefs to `[u8]`, so a received packet is forwarded without a
+copy:
+
+```rust,ignore
+use futures::StreamExt;
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+#[tokio::main]
+async fn main() -> tunnel_lattice::Result<()> {
+    let tunnel = Tunnel::connect();
+    let inside = tunnel.open(DeviceConfig::new(DeviceKind::Tun))?;
+    let outside = tunnel.open(DeviceConfig::new(DeviceKind::Tun))?;
+    let mut packets = inside.packet_stream(inside.snapshot()?.recv_buffer_len())?;
+    while let Some(packet) = packets.next().await {
+        outside.send_async(&packet?).await?;
+    }
+    Ok(())
+}
+```
+
+`send_async` returns the backend's own async send future unchanged, with
+the same results and errors as `send`. Dropping it before it completes
+never sends part of a packet: on Linux and macOS nothing was sent; on
+Windows the packet may or may not have been sent. Portably, a packet is
+sent whole at most once, and whether a dropped send went out is unknown.
+
 ## 🚩 Feature Flags
 
 - **`tun-rs`** (default) — selects `tunnel-lattice-backend-tunrs`. A Cargo
@@ -139,9 +169,9 @@ async fn main() -> tunnel_lattice::Result<()> {
   be added alongside it rather than replacing it (see the project's
   `ARCHITECTURE.md`, "Backend replacement plan").
 - **`async-io`** / **`tokio`** (mutually exclusive; enabling both is a
-  compile error from `tun-rs`) — either adds `Handle::packet_stream` and
-  `Handle::packet_stream_with_pool`. No async runtime dependency is imposed
-  when neither feature is enabled.
+  compile error from `tun-rs`) — either adds `Handle::packet_stream`,
+  `Handle::packet_stream_with_pool`, and `Handle::send_async`. No async
+  runtime dependency is imposed when neither feature is enabled.
   - `async-io` selects `tun-rs`'s `async-io`/`blocking`-based backend (no
     tokio dependency); `tokio` selects its tokio-based one.
   - The stream uses a backend's native async path (no worker thread;
@@ -173,14 +203,21 @@ async fn main() -> tunnel_lattice::Result<()> {
 
 **With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
 multi-threaded Tokio runtime entered on the calling thread**
-(`#[tokio::main]`'s default flavor, or `Builder::new_multi_thread()`) —
-not only `packet_stream`. `tunnel-lattice-backend-tunrs`'s `PacketIo`
-drives tun-rs's Tokio-backed handle through
-`tokio::runtime::Handle::current().block_on`, which only polls that
-runtime's I/O driver on the `multi_thread` flavor; on `current_thread` the
-first `recv`/`send` call hangs forever. See that crate's README, "`tokio`
-requires a multi-threaded runtime," for why. Prefer `async-io` if a
-single-threaded runtime is a hard requirement.
+(`#[tokio::main]`'s default flavor, or `Builder::new_multi_thread()`;
+for the blocking `recv`/`send`, entered with `Runtime::enter` on a thread
+that is not running async code, see below).
+`tunnel-lattice-backend-tunrs`'s `PacketIo` drives tun-rs's Tokio-backed
+handle through `tokio::runtime::Handle::current().block_on`, which only
+polls that runtime's I/O driver on the `multi_thread` flavor; on `current_thread` the
+first blocking `recv`/`send` call hangs forever. See that crate's README,
+"`tokio` requires a multi-threaded runtime," for why.
+
+The blocking `recv`/`send` also panic when called from inside async code
+(a task, `#[tokio::main]`, or `block_on`): Tokio refuses to block inside
+its own runtime. With `async-io` they do not panic but park the executor
+thread. Inside async code use `send_async` and `packet_stream`; their
+futures are polled by the runtime, so `send_async` also works on a
+`current_thread` runtime.
 
 ## 🤝 Ownership: `Handle` is `Clone`
 
