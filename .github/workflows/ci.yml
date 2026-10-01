@@ -235,12 +235,22 @@ jobs:
           $staged | Write-Host
           exit 0
 
+      # Baseline for the "No TUN/TAP device left behind (Linux)" check
+      # below: whatever TUN/TAP devices the runner image already has.
+      - name: Record existing TUN/TAP devices (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ip -d -o link show | grep -E '\btun type (tun|tap)\b' | awk -F': ' '{print $2}' | sort > "$RUNNER_TEMP/tuntap-before.txt" || true
+          cat "$RUNNER_TEMP/tuntap-before.txt"
+
       # `-p tunnel-lattice-backend-tunrs` only: `privileged_tests` lives
       # there, and building the rest of the workspace under `sudo`/as
       # Administrator is unnecessary privilege widening for no benefit.
+      # The `persist_cross_process_` steps belong to the `persistence` job
+      # below (they are no-ops without its environment variable anyway).
       - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored (Linux/macOS, sudo)
         if: matrix.os != 'windows-latest'
-        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --nocapture
+        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --skip persist_cross_process_ --nocapture
 
       # The facade's own `privileged_tests` (`packet_stream` dispatch and
       # `send_async` on a real TUN device), unit tests only (`--lib`): the
@@ -250,18 +260,21 @@ jobs:
         if: matrix.os != 'windows-latest' && matrix.features.name != 'default'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
 
-      # Every Linux TAP device the privileged tests create is non-persistent
-      # and goes away when its handle drops (at the latest when the test
-      # process exits), and the runner starts with none. Fails the job if a
-      # TAP device (`tun type tap` in the link details) is left on the
-      # runner, also after a failed test run.
-      - name: No TAP device left behind (Linux)
+      # Every Linux TUN/TAP device the privileged tests create goes away
+      # when its last handle drops (at the latest when the test process
+      # exits), except the ones the persistence tests make persistent on
+      # purpose, which they delete themselves. Fails the job if a TUN or TAP
+      # device (`tun type tun|tap` in the link details) not in the baseline
+      # is left on the runner, also after a failed test run.
+      - name: No TUN/TAP device left behind (Linux)
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: |
-          leftover=$(ip -d -o link show | grep -E '\btun type tap\b' || true)
+          touch "$RUNNER_TEMP/tuntap-before.txt"
+          ip -d -o link show | grep -E '\btun type (tun|tap)\b' | awk -F': ' '{print $2}' | sort > "$RUNNER_TEMP/tuntap-after.txt" || true
+          leftover=$(comm -13 "$RUNNER_TEMP/tuntap-before.txt" "$RUNNER_TEMP/tuntap-after.txt")
           if [ -n "$leftover" ]; then
-            echo "$leftover"
-            echo "::error::TAP devices left behind by the privileged tests: $(echo "$leftover" | awk -F': ' '{print $2}' | tr '\n' ' ')"
+            ip -d link show
+            echo "::error::TUN/TAP devices left behind by the privileged tests: $(echo $leftover)"
             exit 1
           fi
 
@@ -322,3 +335,100 @@ jobs:
           Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 30 -ErrorAction SilentlyContinue | Format-List TimeCreated, Id, Message
           Get-Content -Tail 200 "$env:windir\INF\setupapi.dev.log"
           exit 0
+
+  # Linux device persistence across processes. Destructive on purpose, so
+  # it runs in its own job (its own runner) rather than inside the
+  # `privileged` job: process A creates a TUN device, marks it persistent,
+  # and exits with the handle still open; the job checks the device
+  # survived with `IFF_PERSIST` (0x800) set; process B re-attaches to it by
+  # name (checking it got the same interface index), clears persistence,
+  # and drops its handle; the job then checks the device is gone. The two
+  # processes are the backend's `persist_cross_process_step_a_`/`_b_`
+  # ignored tests, which do nothing unless `TL_PERSIST_CROSS_PROCESS_NAME`
+  # is set. A final step deletes the device whatever happened before it.
+  persistence:
+    name: persistence (ubuntu-latest, ${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: default
+            flags: ""
+          - name: async-io
+            flags: "--no-default-features --features tunnel-lattice-backend-tunrs/async-io"
+          - name: tokio
+            flags: "--no-default-features --features tunnel-lattice-backend-tunrs/tokio"
+    env:
+      TL_DEVICE: tlxproc0
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: privileged-${{ matrix.features.name }}
+
+      # Built unprivileged first, so the two `sudo` runs below only execute.
+      - name: Build the backend's unit-test binary
+        run: cargo test -p tunnel-lattice-backend-tunrs --lib ${{ matrix.features.flags }} --no-run
+
+      - name: The device does not exist yet
+        run: |
+          if [ -e "/sys/class/net/$TL_DEVICE" ]; then
+            echo "::error::$TL_DEVICE already exists before process A"
+            exit 1
+          fi
+
+      # Each run must report exactly one passed test: a filter that matches
+      # nothing exits 0 and would otherwise turn the step into a no-op.
+      - name: Process A creates the device, persists it, and exits
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/persist-a.log"
+          sudo env "PATH=$PATH" "HOME=$HOME" "TL_PERSIST_CROSS_PROCESS_NAME=$TL_DEVICE" \
+            cargo test -p tunnel-lattice-backend-tunrs --lib ${{ matrix.features.flags }} -- \
+            --ignored --exact privileged_tests::persist_cross_process_step_a_create_and_persist --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' "$log" || { echo "::error::process A did not report exactly one passed test"; exit 1; }
+
+      - name: The device survived process A and is persistent
+        shell: bash
+        run: |
+          if [ ! -e "/sys/class/net/$TL_DEVICE" ]; then
+            echo "::error::$TL_DEVICE did not survive process A's exit"
+            exit 1
+          fi
+          flags=$(cat "/sys/class/net/$TL_DEVICE/tun_flags")
+          index=$(cat "/sys/class/net/$TL_DEVICE/ifindex")
+          echo "$TL_DEVICE: tun_flags=$flags ifindex=$index"
+          if [ $(( flags & 0x800 )) -eq 0 ]; then
+            echo "::error::$TL_DEVICE has no IFF_PERSIST (0x800) after process A"
+            exit 1
+          fi
+          echo "TL_DEVICE_INDEX=$index" >> "$GITHUB_ENV"
+
+      - name: Process B re-attaches by name, unpersists, and drops it
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/persist-b.log"
+          sudo env "PATH=$PATH" "HOME=$HOME" "TL_PERSIST_CROSS_PROCESS_NAME=$TL_DEVICE" "TL_PERSIST_CROSS_PROCESS_INDEX=$TL_DEVICE_INDEX" \
+            cargo test -p tunnel-lattice-backend-tunrs --lib ${{ matrix.features.flags }} -- \
+            --ignored --exact privileged_tests::persist_cross_process_step_b_re_attach_and_unpersist --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed;' "$log" || { echo "::error::process B did not report exactly one passed test"; exit 1; }
+
+      - name: The device is gone after process B
+        run: |
+          if [ -e "/sys/class/net/$TL_DEVICE" ]; then
+            ip -d link show "$TL_DEVICE"
+            echo "::error::$TL_DEVICE still exists after process B unpersisted it and exited"
+            exit 1
+          fi
+          echo "/sys/class/net/$TL_DEVICE is gone"
+
+      - name: Remove the device (always)
+        if: always()
+        run: sudo ip link del "$TL_DEVICE" 2>/dev/null || true
