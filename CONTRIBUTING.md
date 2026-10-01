@@ -50,8 +50,12 @@ Tunnel Lattice follows standard Rust ecosystem conventions:
 only): raw `tun-rs` baselines and `tunnel-lattice` forwarding between two
 TUN devices, measured in the same run. It is a standalone Cargo workspace,
 not part of the root workspace, so check it with
-`--manifest-path bench/forwarder/Cargo.toml` and one build set (`sync`,
-`tokio` or `async-io`) per invocation. Running it needs root and `iperf3`:
+`--manifest-path bench/forwarder/Cargo.toml --target-dir target/forwarder`
+and one build set (`sync`, `tokio` or `async-io`) per invocation. The
+`--target-dir` keeps build output under the ignored root `target/`; without
+it cargo writes `bench/forwarder/target/`, which git does not ignore, and
+the benchmark then records the tree as dirty. Running it needs root and
+`iperf3`:
 
 ```sh
 scripts/bench-forward.sh build

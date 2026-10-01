@@ -341,7 +341,9 @@ run_steps() {
     SAMPLER_PID=$!
 
     local rc=0
-    timeout "$((DURATION + 20))" \
+    # --foreground keeps iperf3 in this process group, so Ctrl-C reaches it
+    # at once instead of waiting out the timeout.
+    timeout --foreground "$((DURATION + 20))" \
         iperf3 -c "$IP2" -p "$IPERF3_PORT" -t "$DURATION" -J --connect-timeout 3000 \
         >"$dir/iperf3.json" 2>"$dir/client.stderr" || rc=$?
 

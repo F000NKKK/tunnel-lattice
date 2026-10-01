@@ -53,6 +53,10 @@ jobs:
   check:
     name: check (bench/forwarder)
     runs-on: ubuntu-latest
+    # The standalone workspace would otherwise build into
+    # bench/forwarder/target/, which the root .gitignore does not cover.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/forwarder
     steps:
       - uses: actions/checkout@v7
 
@@ -65,7 +69,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: bench-forward-check
-          workspaces: bench/forwarder
+          workspaces: bench/forwarder -> ../../target/forwarder
 
       - name: cargo fmt --check
         run: cargo fmt --check --manifest-path bench/forwarder/Cargo.toml

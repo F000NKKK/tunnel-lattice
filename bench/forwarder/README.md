@@ -121,11 +121,15 @@ per-OS backends.
 
 The harness is a standalone Cargo workspace, not a member of the
 repository's root workspace, so the root release tooling never sees it.
-Enable exactly one build set per cargo invocation:
+Enable exactly one build set per cargo invocation, and pass
+`--target-dir target/forwarder` from the repository root: cargo's default
+for a standalone workspace is `bench/forwarder/target/`, which git does not
+ignore, and `scripts/bench-forward.sh build` would then record the tree as
+dirty (`git_dirty: true`, "(uncommitted changes)" in the results footer).
 
 ```sh
-cargo clippy --manifest-path bench/forwarder/Cargo.toml --no-default-features --features tokio --all-targets -- -D warnings
-cargo test --manifest-path bench/forwarder/Cargo.toml --no-default-features --features sync
+cargo clippy --manifest-path bench/forwarder/Cargo.toml --target-dir target/forwarder --no-default-features --features tokio --all-targets -- -D warnings
+cargo test --manifest-path bench/forwarder/Cargo.toml --target-dir target/forwarder --no-default-features --features sync
 ```
 
 The tests cover the command line, the report's parsing and aggregation (on
