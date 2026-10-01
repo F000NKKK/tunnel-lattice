@@ -164,6 +164,13 @@ all, so `from_async_device` is the path actually taken in practice.
 implements `PacketIo` — it needs no async story of its own to be usable
 this way; implementing `PacketIo` alone is enough.
 
+`from_device`'s worker is a plain `std::thread` that enters no async
+runtime. Do not bridge a device whose blocking `recv` needs one: the
+`tunnel-lattice-backend-tunrs` device built with its `tokio` feature calls
+`tokio::runtime::Handle::current().block_on` there, which panics on the
+worker and ends the stream. Use `from_async_device` for that device, as
+`tunnel_lattice::Handle::packet_stream` does.
+
 ## 🚧 Known Limitation (only `from_device`)
 
 `from_device`'s worker thread cannot be forcibly cancelled: dropping the

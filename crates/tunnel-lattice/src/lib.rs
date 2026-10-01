@@ -226,12 +226,19 @@ impl Tunnel<TunRsBackend> {
 /// - **`packet_stream` holds its own `Arc` clone**, independent of the
 ///   `Handle` it was created from — dropping the original `Handle` while a
 ///   `PacketStream` is still alive does not close the device early, and
-///   vice versa. See `tunnel_lattice_async::PacketStream`'s own docs for
-///   its worker-thread shutdown caveat on `Drop` (a known limitation, not
-///   related to this ownership model).
+///   vice versa. Every backend this crate ships builds that stream on its
+///   native async path, so dropping the stream cancels its in-flight
+///   `recv` at once; the facade runs no worker thread for it.
 /// - **`send_async` only borrows.** Its future borrows the `Handle` and the
-///   packet buffer; it needs no `Arc` clone and keeps nothing alive after
-///   it completes or is dropped.
+///   packet buffer; it needs no `Arc` clone, and the facade keeps nothing
+///   alive after it completes or is dropped.
+///
+/// A backend may still hold on to the device briefly after a future is
+/// dropped. With `tun-rs` on Windows, an async send runs on a background
+/// thread that keeps a copy of the device until its cancel signal fires;
+/// with `tunnel-lattice-backend-tunrs` on macOS, a TAP (`feth`) receive
+/// waits on a background thread that keeps a duplicate of the device's
+/// BPF descriptor until the same kind of signal ends the wait.
 ///
 /// Referenced as plain text, not intra-doc links, for the same reason as
 /// the crate-level docs above (`packet_stream` and `send_async` only exist

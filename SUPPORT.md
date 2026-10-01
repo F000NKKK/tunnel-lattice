@@ -12,6 +12,7 @@ Thank you for your interest in Tunnel Lattice.
 
 Tunnel Lattice has published `0.4.0` and has a working crate architecture
 (see [ARCHITECTURE.md](ARCHITECTURE.md)), but nothing in the public API is
-frozen — a future `0.x` release may still change it (see
-`versioning.md`'s pre-1.0 policy). Questions about direction and design are
+frozen. Until `1.0.0`, any new `0.x` minor release may change the public
+API, including in breaking ways; every such change is listed in
+[CHANGELOG.md](CHANGELOG.md). Questions about direction and design are
 welcome alongside ordinary usage support.

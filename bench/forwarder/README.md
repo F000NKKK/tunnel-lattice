@@ -134,7 +134,10 @@ cargo test --manifest-path bench/forwarder/Cargo.toml --target-dir target/forwar
 
 The tests cover the command line, the report's parsing and aggregation (on
 fixtures), the paired ratio and the Markdown output. They need no
-privilege.
+privilege. The `bench-forwarder` job of the repository's `CI` workflow runs
+these checks on every push and pull request, in all three build sets, with
+a `cargo check` for Windows and macOS targets and `shellcheck` on the
+script.
 
 Dependency requirements match the root workspace's; update them together.
 

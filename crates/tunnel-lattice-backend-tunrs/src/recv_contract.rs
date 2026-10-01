@@ -25,7 +25,7 @@
 //! | Windows | code-less `Other`, message exactly `"The interface has been disabled"` (Wintun session ended by `apply(Down)`; `apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | Linux (send) | raw `EIO` (5): the device is administratively down (`apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | Windows, TAP only (recv) | the first raw 995 (`ERROR_OPERATION_ABORTED`) in a call while the adapter's operational status reads `Up`: a read cancelled because the thread that issued it exited, on a healthy adapter | retried once ([`tap_abort_retries`]) |
-//! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`) otherwise (on `recv`: the status is not `Up`, the status read fails, or the call already retried): the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it) | [`Error::InvalidState`] |
+//! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`) otherwise (on `recv`: the status is not `Up`, the status read fails, or the call already retried): a call made while the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it; a read already waiting is not ended by it), or the adapter was disabled outside this crate | [`Error::InvalidState`] |
 //! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
 //!
 //! `WriteZero` and `EIO` are remapped on `send` only, so the same signal
@@ -39,15 +39,15 @@
 //! and the thread then exits, Windows cancels the read, and the next
 //! `recv` collects the 995. While the adapter reads `Up`, the first 995 in
 //! a call is retried with a fresh read, which waits as usual, so the
-//! caller sees nothing. The status is read
-//! at most once per call, and a call retries at most once, so it never
-//! spins. One case remains: a single `recv` call that meets two reads
-//! cancelled this way (for example, it collects one left by an earlier
-//! dropped `recv`, and then a thread that polled it exits while it is
-//! still pending) reports [`Error::InvalidState`] once while the adapter
-//! is up, and the next call works. `send` has no
-//! such retry: `tun-rs` discards a cancelled pending write, so a `send`
-//! 995 always comes from the driver refusing a fresh write.
+//! caller sees nothing. The status is read at most once per call, and a
+//! call retries at most once, so it never spins. One case remains: a
+//! single `recv` call that meets two reads cancelled this way (for
+//! example, it collects one left by an earlier dropped `recv`, and then a
+//! thread that polled it exits while it is still pending) reports
+//! [`Error::InvalidState`] once while the adapter is up, and the next call
+//! works. `send` has no such retry: `tun-rs` discards a cancelled pending
+//! write, so a `send` 995 always comes from the driver refusing a fresh
+//! write.
 //!
 //! [`Error::InvalidState`] from `recv`/`send` means the device exists but
 //! is not passing packets because it is down or disabled. When applying
@@ -57,11 +57,10 @@
 //! arrives. On Windows TAP the media disconnect fails only the calls made
 //! while it lasts: a `recv` whose read was already waiting when
 //! `apply(Down)` ran is not ended by it, nor by a later `apply(Up)`, and
-//! keeps waiting as on a down Linux device; disabling the adapter outside
-//! this API ends it with [`Error::InvalidState`]. A Windows TAP adapter disabled outside this API
-//! (`Disable-NetAdapter`) also fails with raw 995 and so also reads as
-//! [`Error::InvalidState`], but only re-enabling the adapter outside this
-//! API recovers that one.
+//! keeps waiting as on a down Linux device. Disabling the adapter outside
+//! this API (`Disable-NetAdapter`) does end a waiting `recv`, with the
+//! same raw 995 and so also with [`Error::InvalidState`], but only
+//! re-enabling the adapter outside this API recovers that one.
 //!
 //! Linux TUN/TAP and macOS utun truncate an oversize packet silently, so on
 //! unix the backend reads into `[buf, 1-byte sentinel]` with `readv`: a

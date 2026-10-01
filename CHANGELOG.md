@@ -66,7 +66,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last, so a sender panic can no longer skip releasing the waiting
   `recv`. The Windows TAP disable test measures its latency from the start
   of the disable call. The Windows privileged job now also fails if a
-  `tunnel-lattice-test-echo-*` firewall rule is left behind.
+  `tunnel-lattice-test-echo-*` firewall rule or a Wintun adapter is left
+  behind. Linux test interface names now use the whole process id, so two
+  live test processes can no longer pick the same name. The `persistence`
+  CI job uses its own build cache key.
+
+- **Documentation corrections, no behaviour change.**
+  - `Handle`'s rustdoc no longer points at a worker-thread shutdown caveat
+    for `packet_stream`: every shipped backend builds that stream on its
+    native async path. It now says the facade keeps nothing alive after a
+    `send_async` future ends, while the backend may for a moment: a
+    Windows async send (in `tun-rs`) and a macOS TAP receive wait each hold
+    the device, or a duplicate of its descriptor, on a background thread
+    until their cancel signal fires.
+  - With `tokio`, only opening a device needs a Tokio runtime entered, and
+    only the blocking `recv`/`send` need it to be multi-threaded;
+    `snapshot` and `apply` never wait on the runtime. The facade and
+    backend READMEs and the root README said every call needed a
+    multi-threaded runtime.
+  - `tunnel_lattice_async::from_device`'s worker enters no async runtime,
+    so a device whose blocking `recv` needs one (the `tun-rs` device built
+    with `tokio`) panics there and ends the stream; use
+    `from_async_device` for it, as `Handle::packet_stream` does.
+  - `tun-rs` 2.8.11, both the minimum and the latest release, was
+    re-checked against every message and error kind the backend matches.
+  - `SUPPORT.md`, `SECURITY.md`, and the architecture documents state the
+    pre-1.0 policy inline: any new `0.x` minor release may change the
+    public API, including in breaking ways, and every such change is
+    listed here.
 
 - **Concurrent `recv`/`send` through cloned `Handle`s checked on real
   devices, test-only.** The `Handle` contract's claim that clones of one
@@ -78,12 +105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within 60 seconds (identifier, sequence number, and payload checked). With
   `async-io` or `tokio` a second test does the same with a `packet_stream`
   polled as a task on one clone and `send_async` on another. On a timeout
-  the waiting receive is released, both sides are joined, and the device is
-  dropped before the test fails. On Windows the test adds a firewall rule
-  that lets echo requests to the device's own address in (Windows Firewall
-  drops them by default) and deletes it again on every exit path. The
-  `Handle` rustdoc, the architecture documents, and the facade README say
-  so.
+  the waiting receive is released, each side is joined once it reports
+  back, and the device is dropped before the test fails. On Windows the
+  test adds a firewall rule that lets echo requests to the device's own
+  address in (Windows Firewall drops them by default) and deletes it again
+  when the test returns or unwinds; a test process killed outright can
+  leave the rule behind, which the Windows CI job then reports as a
+  failure. The `Handle` rustdoc, the architecture documents, and the facade
+  README say so.
 
 - **Exact capability sets checked on real devices, test-only.** New
   privileged facade tests assert, on Linux, macOS, and Windows and in every
@@ -155,6 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and route on every exit path, and reports; a manual `Forwarder benchmark`
   GitHub Actions workflow runs it and uploads the results. A standalone
   Cargo workspace, so no published crate or root-workspace build changes.
+  The `CI` workflow's unfiltered `bench-forwarder` job formats, lints,
+  tests, and cross-checks the harness (and `shellcheck`s the script) on
+  every push and pull request; it never runs the benchmark.
   - Documentation only: the root README (English and Russian) and the
     `tunnel-lattice` crate README now publish the first recorded results
     table with its environment, versions, method, and reproduce command
@@ -204,8 +236,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `recv_buffer_len`) and an MTU change by `apply` that reads back (on macOS
   on both `feth` interfaces of the pair); on Linux, admin state toggled
   down and up by `apply`, with `send` on a down device refused (now
-  reported as `Error::InvalidState`, see "Down-device `send` on Linux"
-  below) and a frame shorter than an Ethernet header reported as
+  reported as `Error::InvalidState`, see "A down device's `send` is
+  `InvalidState`" above) and a frame shorter than an Ethernet header reported as
   `Error::Platform(PlatformErrorCode::Linux(22))` (`EINVAL`), the mapping
   this crate already had, now pinned; on macOS, sending a 42-byte frame and
   `AlreadyExists` for an existing `feth` name, with the existing interface

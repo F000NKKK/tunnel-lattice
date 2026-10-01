@@ -63,8 +63,14 @@ sudo scripts/bench-forward.sh run
 scripts/bench-forward.sh report target/bench-forward/runs/<UTC time>
 ```
 
-The `Forwarder benchmark` workflow runs the same commands when started
-manually and uploads the results as an artifact. Throughput numbers in the
+CI's `bench-forwarder` job (in `.github/workflows/ci.yml`) runs on every
+push and pull request and keeps the harness formatted, building, linted
+(`-D warnings`, each build set, plus a Windows and macOS `cargo check`)
+and tested, and runs `bash -n` and `shellcheck` on
+`scripts/bench-forward.sh`; it never runs the benchmark. The
+`Forwarder benchmark` workflow (`.github/workflows/bench-forward.yml`) is
+manual only: it runs the same commands as above when started and uploads
+the results as an artifact. Throughput numbers in the
 documentation must be copied from such a recorded `results.md`, with its
 footer, never typed in by hand. See `bench/forwarder/README.md` for the
 method and the variants.

@@ -33,8 +33,8 @@ contracts; it never inspects or changes the host system.
 - ✅ **`DeviceConfig`**: desired intent for creating a device (kind, an
   optional name, an optional MTU, an optional TAP MAC address, a
   multi-queue request), built with
-  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_mac`/`with_multi_queue`. The `name`
-  field's docs list the per-OS name formats a backend accepts (anything
+  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_mac`/`with_multi_queue`.
+  The `name` field's docs list the per-OS name formats a backend accepts (anything
   else is rejected with `Error::InvalidState` before any native call) and
   what happens when an interface with that name already exists.
 - ✅ **`Device`**: an observed, already-open device (id, actual name, kind,

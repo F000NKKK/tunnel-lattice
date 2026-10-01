@@ -282,6 +282,17 @@ where
 /// whenever the backend implements `AsyncPacketIo`, which has no such
 /// limitation.
 ///
+/// **No async runtime on the worker**: the worker is a plain
+/// [`std::thread`] that enters no Tokio (or other) runtime before calling
+/// `recv`. A device whose blocking `recv` needs one panics there, which
+/// ends the stream (see [`PacketStream`], "End of life"). The
+/// `tunnel-lattice-backend-tunrs` device built with its `tokio` feature is
+/// such a device: its blocking `recv` calls
+/// `tokio::runtime::Handle::current().block_on`. `tunnel_lattice`'s
+/// `Handle::packet_stream` never routes that device through this bridge
+/// (it reports `Capability::NATIVE_ASYNC`), but a direct caller of this
+/// function can; use [`from_async_device`] for it instead.
+///
 /// # Errors
 ///
 /// [`Error::InvalidState`] if [`PacketPool::with_buf_len`] rejects
@@ -310,7 +321,8 @@ where
 ///
 /// Every packet is received into one of `pool`'s slots, so `pool.buf_len()`
 /// is the receive buffer size and bounds every item's length. Any valid
-/// pool is accepted. The worker queues at most `pool.slots()` items.
+/// pool is accepted. The worker queues at most `pool.slots()` items. Like
+/// [`from_device`]'s, it runs with no async runtime entered.
 ///
 /// # Panics
 ///

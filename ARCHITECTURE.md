@@ -169,9 +169,9 @@ thread that started it exited (an async `recv` starts its read on the
 polling thread, so a dropped `recv` whose thread then exits leaves one
 behind). On `recv`, the first 995 in a call is therefore retried once with
 a fresh read if the adapter's operational status reads up; the status is
-read at most once per call. A single call that meets two cancelled reads reports
-`InvalidState` once on a healthy adapter. `send` is not retried, because
-`tun-rs` discards a cancelled pending write.
+read at most once per call. A single call that meets two cancelled reads
+reports `InvalidState` once on a healthy adapter. `send` is not retried,
+because `tun-rs` discards a cancelled pending write.
 `InvalidState` from `recv`/`send` means "the device exists but is not
 passing packets because it is down or disabled"; when `apply(Down)` caused
 it, `apply(Up)` on the same handle recovers it. A down Linux device makes
@@ -179,25 +179,26 @@ it, `apply(Up)` on the same handle recovers it. A down Linux device makes
 `send`. A Windows TAP adapter disabled outside the crate
 (`Disable-NetAdapter`) fails with the same code and so also reports
 `InvalidState`, although only re-enabling it outside the crate recovers
-it. These rules match raw OS codes only on the
-OS they belong to, and a raw-coded error is never matched through `kind()`
-(which `std` decodes with the running host's code table); only the
-code-less Wintun errors are matched by kind and message. Every rule is
-therefore unit-tested on every host.
+it. These rules match raw OS codes only on the OS they belong to, and a
+raw-coded error is never matched through `kind()` (which `std` decodes
+with the running host's code table); only the code-less Wintun errors are
+matched by kind and message. Every rule is therefore unit-tested on every
+host.
 
 Both `PacketStream` variants yield `BufferTooSmall` and keep receiving.
 Every other error is yielded once and then ends the stream — `Disconnected`
 and recoverable errors alike. A device whose `recv` fails immediately and
 repeatedly (a deleted Linux device, a destroyed macOS `feth`, a disabled
 Wintun adapter) would otherwise turn the stream into a busy loop of error
-items and, on the thread bridge, keep its worker thread spinning; a back-off or
-an error-count cap would need a timer (the crate is runtime-agnostic) or
-an arbitrary limit. The caller creates a new stream with
-`Handle::packet_stream` after recovering. Transient conditions never reach
-the stream because the backend retries them, which is why the `EINTR`
-retry is required: without it a signal would end a healthy stream. On
-Windows no condition is retried, so `BufferTooSmall` is the only error that
-does not end a stream there.
+items and, on the thread bridge, keep its worker thread spinning; a
+back-off or an error-count cap would need a timer (the crate is
+runtime-agnostic) or an arbitrary limit. The caller creates a new stream
+with `Handle::packet_stream` after recovering. Transient conditions never
+reach the stream because the backend retries them, which is why the
+`EINTR` retry and the Windows TAP cancelled-read retry are required:
+without them a signal, or a read cancelled by an exited thread, would end
+a healthy stream. `BufferTooSmall` stays the only error that does not end
+a stream, on every OS.
 
 `DeviceMutator::apply` has one contract for every backend. It checks
 every precondition before any native call:
@@ -234,8 +235,10 @@ so it can be requested at open but not changed afterwards.
 
 `0.4.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
 workspace is API-frozen; every type, trait, and feature flag described here
-may still change in a future `0.x` release (see `versioning.md`'s pre-1.0
-policy). See `index.md`, "Current release and roadmap," for the stage this
+may still change in a future `0.x` release: until `1.0.0`, any new `0.x`
+minor release may change the public API, including in breaking ways, and
+every such change is listed in `CHANGELOG.md`. See `index.md`, "Current
+release and roadmap," for the stage this
 freeze is scheduled at (`1.0`, unscheduled) and what ships before it.
 
 ## Ownership and concurrency contract
@@ -527,6 +530,6 @@ The Windows answer comes from a SetupAPI driver lookup that follows the one
 driver-version checks, without selecting the driver) and stops before
 anything is registered: it creates no adapter, needs no elevation, runs
 once per process on the first call, and is cached (a driver installed
-later is noticed after a restart). Either answer is advisory: `open` is never refused because of
-it, and a missing driver is still reported by `open` as
-`Error::DriverUnavailable`.
+later is noticed after a restart). Either answer is advisory: `open` is
+never refused because of it, and a missing driver is still reported by
+`open` as `Error::DriverUnavailable`.

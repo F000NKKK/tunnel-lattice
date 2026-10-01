@@ -153,11 +153,15 @@ To reproduce on GitHub instead, start the manual **Forwarder benchmark**
 workflow (`workflow_dispatch` in `.github/workflows/bench-forward.yml`); it
 writes the table to the job summary and uploads `results.md`,
 `results.json`, and every raw run as an artifact. Running locally needs
-root, `iperf3`, and Linux.
+root, `iperf3`, and Linux. CI's `bench-forwarder` job (in
+`.github/workflows/ci.yml`) only builds, lints, and tests the harness on
+every push and pull request; it does not run the benchmark.
 
 **What this can and cannot show.** While the only backend wraps `tun-rs`,
 Tunnel Lattice can at best match `tun-rs` minus its own overhead; the ratio
-column measures that overhead. Going beyond `tun-rs` needs batched I/O and
+column measures that overhead. The range in brackets is the spread over
+the repetitions of this one recorded run only; it says nothing about how
+much the ratio varies between runs or machines. Going beyond `tun-rs` needs batched I/O and
 GSO/GRO offload, planned for 0.6, and native per-OS backends after that.
 `tun-rs`'s own published numbers come from different hardware, and its
 headline figures use offload, so they are not comparable with this table.
@@ -424,10 +428,10 @@ loaded or `/dev/net/tun` is missing; run `sudo modprobe tun`.
 <details>
 <summary><b><code>recv</code> hangs with the <code>tokio</code> feature</b></summary>
 
-With `tokio`, every device call needs a **multi-threaded** Tokio runtime
-entered on the calling thread (`#[tokio::main]`'s default flavor). A
-`current_thread` runtime never drives the device's I/O for the blocking
-`recv`/`send`. Inside async code use `packet_stream` and `send_async`
+With `tokio`, opening a device needs a Tokio runtime entered on the
+calling thread, and the blocking `recv`/`send` need that runtime to be
+**multi-threaded** (`#[tokio::main]`'s default flavor). A `current_thread`
+runtime never drives the device's I/O for the blocking `recv`/`send`. Inside async code use `packet_stream` and `send_async`
 instead; `send_async` also works on a `current_thread` runtime. Use
 `async-io` if you need blocking calls on a single-threaded runtime.
 </details>

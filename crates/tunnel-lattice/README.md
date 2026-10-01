@@ -51,8 +51,8 @@ configuration once a device exists.
   administrative state, or TAP MAC address (the last where the handle
   reports `Capability::MAC_MUTATION`: Linux and macOS; on Windows a TAP
   MAC address can only be requested at open with `DeviceConfig::with_mac`);
-- 🐧 `Handle::persist`/`Handle::unpersist`/`Handle::additional_queue`, on backends that implement
-  `PersistentDevice`/`MultiQueueProvider` (Linux only, via
+- 🐧 `Handle::persist`/`Handle::unpersist`/`Handle::additional_queue`, on
+  backends that implement `PersistentDevice`/`MultiQueueProvider` (Linux only, via
   `tunnel-lattice-backend-tunrs` — see
   [Persistent devices and multi-queue](#-persistent-devices-and-multi-queue));
 - ⚡ with the `async-io` or `tokio` feature (mutually exclusive):
@@ -115,7 +115,9 @@ root and `iperf3`. On GitHub, the manual **Forwarder benchmark** workflow
 
 While the only backend wraps `tun-rs`, this crate can at best match
 `tun-rs` minus its own overhead; the ratio column measures that overhead.
-Going beyond `tun-rs` needs batched I/O and GSO/GRO offload, planned for
+The range in brackets is the spread over the repetitions of this one
+recorded run only; it says nothing about how much the ratio varies between
+runs or machines. Going beyond `tun-rs` needs batched I/O and GSO/GRO offload, planned for
 0.6, and native per-OS backends after that. `tun-rs`'s own published
 numbers come from different hardware, and its headline figures use
 offload, so they are not comparable with this table.
@@ -246,16 +248,18 @@ sent whole at most once, and whether a dropped send went out is unknown.
 
 ### `tokio` requires a multi-threaded runtime
 
-**With `tokio`, `Handle::recv`/`send`/`snapshot`/`apply` all require a
-multi-threaded Tokio runtime entered on the calling thread**
-(`#[tokio::main]`'s default flavor, or `Builder::new_multi_thread()`;
-for the blocking `recv`/`send`, entered with `Runtime::enter` on a thread
-that is not running async code, see below).
-`tunnel-lattice-backend-tunrs`'s `PacketIo` drives tun-rs's Tokio-backed
-handle through `tokio::runtime::Handle::current().block_on`, which only
-polls that runtime's I/O driver on the `multi_thread` flavor; on `current_thread` the
+**With `tokio`, `Tunnel::open` needs a Tokio runtime entered on the
+calling thread, and the blocking `Handle::recv`/`send` need that runtime
+to be multi-threaded** (`#[tokio::main]`'s default flavor, or
+`Builder::new_multi_thread()`, entered with `Runtime::enter` on a thread
+that is not running async code; see below). Opening registers the device
+with the runtime. `tunnel-lattice-backend-tunrs`'s `PacketIo` then drives
+tun-rs's Tokio-backed handle through
+`tokio::runtime::Handle::current().block_on`, which only polls that
+runtime's I/O driver on the `multi_thread` flavor; on `current_thread` the
 first blocking `recv`/`send` call hangs forever. See that crate's README,
-"`tokio` requires a multi-threaded runtime," for why.
+"`tokio` requires a multi-threaded runtime," for why. `snapshot` and
+`apply` are plain OS queries and changes that never wait on the runtime.
 
 The blocking `recv`/`send` also panic when called from inside async code
 (a task, `#[tokio::main]`, or `block_on`): Tokio refuses to block inside

@@ -2,8 +2,9 @@
 
 ## Supported Versions
 
-Only the latest published `0.x` release is supported. Pre-1.0, a new minor
-release may include breaking changes (see `versioning.md`); security fixes
+Only the latest published `0.x` release is supported. Until `1.0.0`, any
+new `0.x` minor release may change the public API, including in breaking
+ways, and every such change is listed in `CHANGELOG.md`; security fixes
 target the latest release and `main`, not older `0.x` versions.
 
 | Version | Supported |

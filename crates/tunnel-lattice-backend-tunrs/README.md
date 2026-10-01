@@ -364,7 +364,8 @@ unmatched errors go through the general table above:
 loading the missing driver makes the same call succeed.
 
 The Windows rules depend on `tun-rs` internals, written against `tun-rs`
-2.8.11 (this crate's minimum `tun-rs` version):
+2.8.11 (this crate's minimum `tun-rs` version) and re-checked against its
+source on 2026-10-01, when 2.8.11 was also the latest `tun-rs` release:
 
 - a missing `wintun.dll` is recognized by downcasting the
   `libloading::Error` that `tun-rs` wraps (it carries no OS error code, and
@@ -428,12 +429,13 @@ already depends on it with both, so no new package enters the build.
 
 ### `tokio` requires a multi-threaded runtime
 
-With the `tokio` feature, every call into `TunRsDevice` must happen while a
-Tokio runtime is entered on the calling thread: building the
-`AsyncDevice` registers it with that runtime. The blocking
-`PacketIo::recv`/`send` additionally need that runtime to be
-**multi-threaded** (`#[tokio::main]`'s default flavor, or
-`Builder::new_multi_thread()` explicitly).
+With the `tokio` feature, `TunRsBackend::open` must run while a Tokio
+runtime is entered on the calling thread: building the `AsyncDevice`
+registers it with that runtime. The blocking `PacketIo::recv`/`send`
+additionally need that runtime to be **multi-threaded** (`#[tokio::main]`'s
+default flavor, or `Builder::new_multi_thread()` explicitly). `snapshot`
+and `apply` are plain OS queries and changes that never wait on the
+runtime.
 `tokio::runtime::Handle::block_on` only drives that runtime's I/O reactor
 on the `multi_thread` flavor, whose worker threads poll it independently of
 where `block_on` is called from; on `current_thread`, only
