@@ -566,11 +566,11 @@ fn run_case(
         Err(err) => return failed(err),
     };
     eprintln!(
-        "device-bench: {} on {} {} ({}.1/24)",
+        "device-bench: {} on {} {} ({}/24)",
         path.id(),
         kind_id(kind),
         running.name,
-        Ipv4Addr::new(198, 18, subnet, 0)
+        flow.local
     );
     let configured = match host::configure(kind, &running.name, flow.local, flow.peer) {
         Ok(configured) => configured,

@@ -64,17 +64,20 @@ pub struct Throughput {
     pub received_total: u64,
     /// Round trips per second.
     pub pps: f64,
-    /// IP-packet megabits per second in each direction through the device.
+    /// Megabits per second of device-level packets in each direction: the
+    /// IP packet for TUN, the Ethernet frame (IP packet plus 14-byte
+    /// header) for TAP.
     pub mbps: f64,
 }
 
-/// Rates for `round_trips` echoes of `ip_len`-byte packets in `secs`.
+/// Rates for `round_trips` echoes of `wire_len`-byte device packets in
+/// `secs`.
 pub fn throughput(
     secs: f64,
     round_trips: u64,
     sent_total: u64,
     received_total: u64,
-    ip_len: usize,
+    wire_len: usize,
 ) -> Throughput {
     let pps = if secs > 0.0 {
         round_trips as f64 / secs
@@ -87,7 +90,7 @@ pub fn throughput(
         sent_total,
         received_total,
         pps,
-        mbps: pps * ip_len as f64 * 8.0 / 1e6,
+        mbps: pps * wire_len as f64 * 8.0 / 1e6,
     }
 }
 
@@ -361,7 +364,7 @@ pub fn to_markdown(meta: &Meta, scenarios: &[Scenario]) -> String {
         meta.window
     );
     out.push_str(
-        "Each datagram goes from a UDP socket through the host's IP stack into the device, is read and written back by the path under test, and returns through the stack to the socket. RTT includes both kernel traversals. Throughput counts each IP packet once per direction. Shared CI runners are noisy: compare rows within one run, not across runs or hosts.\n",
+        "Each datagram goes from a UDP socket through the host's IP stack into the device, is read and written back by the path under test, and returns through the stack to the socket. RTT includes both kernel traversals. Throughput counts each device packet (IP packet for TUN, Ethernet frame for TAP) once per direction. Shared CI runners are noisy: compare rows within one run, not across runs or hosts.\n",
     );
     out
 }
