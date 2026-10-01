@@ -20,14 +20,17 @@ fn fixture_json(name: &str) -> Value {
     serde_json::from_str(&fixture(name)).expect("fixture is JSON")
 }
 
+/// `iperf3-ok.json` is a real iperf3 3.16 `-J` client output recorded by
+/// the benchmark workflow (`tl-sync`, repetition 1), with `intervals` and
+/// `end.streams` emptied.
 #[test]
 fn iperf3_success_fields() {
     let parsed = parse_iperf3(&fixture_json("iperf3-ok.json")).expect("ok fixture");
-    assert_eq!(parsed.recv_bps, 4_998_240_000.5);
-    assert_eq!(parsed.sent_bps, 4_999_977_500.1);
-    assert_eq!(parsed.retransmits, 42);
-    assert_eq!(parsed.host_cpu, 61.5);
-    assert_eq!(parsed.remote_cpu, 38.25);
+    assert_eq!(parsed.recv_bps, 2_787_578_560.552_386_8);
+    assert_eq!(parsed.sent_bps, 2_790_552_080.059_525_5);
+    assert_eq!(parsed.retransmits, 64);
+    assert_eq!(parsed.host_cpu, 5.594_368_815_995_75);
+    assert_eq!(parsed.remote_cpu, 79.113_969_670_483_34);
 }
 
 #[test]
@@ -266,7 +269,7 @@ fn collect_pairs_ratios_per_repetition() {
     assert!(close(&tl["ratio_median"], 0.9), "{}", tl["ratio_median"]);
     assert!(close(&tl["ratio_min"], 0.7), "{}", tl["ratio_min"]);
     assert!(close(&tl["ratio_max"], 1.1), "{}", tl["ratio_max"]);
-    assert_eq!(tl["retrans_median"], 42.0);
+    assert_eq!(tl["retrans_median"], 64.0);
     assert_eq!(tl["cpu_avg_median"], 100.0);
 
     let failed = results["runs"]
@@ -337,11 +340,11 @@ fn markdown_table_and_footer() {
     );
     assert_eq!(
         lines[2],
-        "| tun-rs sync | 20.00 | — | 100 % | 3.1 MB | 42 |"
+        "| tun-rs sync | 20.00 | — | 100 % | 3.1 MB | 64 |"
     );
     assert_eq!(
         lines[3],
-        "| tunnel-lattice sync | 14.00 | 90.0 % (70.0–110.0) | 100 % | 3.1 MB | 42 |"
+        "| tunnel-lattice sync | 14.00 | 90.0 % (70.0–110.0) | 100 % | 3.1 MB | 64 |"
     );
     assert!(table.contains("Recorded 2026-10-01T12:00:00Z on GitHub Actions ubuntu24 runner, Test CPU, 4 CPUs, Linux 6.11.0-1018-azure."));
     assert!(table.contains("Code 0123456; tun-rs 2.8.11, tunnel-lattice 0.4.0, iperf3 3.16"));
