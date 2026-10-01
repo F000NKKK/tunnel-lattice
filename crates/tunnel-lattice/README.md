@@ -14,7 +14,7 @@
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
 ![macOS](https://img.shields.io/badge/macOS-supported-success)
 
-[Overview](#-overview) • [Features](#-key-features) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Feature Flags](#-feature-flags) • [Ownership](#-ownership-handle-is-clone) • [Privileges](#-platform-and-privilege-notes)
+[Overview](#-overview) • [Features](#-key-features) • [Platforms](#-supported-platforms) • [Performance](#-performance) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Feature Flags](#-feature-flags) • [Ownership](#-ownership-handle-is-clone) • [Privileges](#-platform-and-privilege-notes) • [Comparison](#-comparison)
 
 </div>
 
@@ -64,16 +64,61 @@ configuration once a device exists.
 
 ## 💻 Supported Platforms
 
-| Platform    | TUN | TAP | Sync | Tokio | async-io |
-|-------------|:---:|:---:|:----:|:-----:|:--------:|
-| **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       |
-| **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       |
-| **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       |
+| Platform    | TUN | TAP | Sync | Tokio | async-io | Privilege | Driver |
+|-------------|:---:|:---:|:----:|:-----:|:--------:|-----------|--------|
+| **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | `CAP_NET_ADMIN` (root or `setcap`) | `tun` kernel module (`/dev/net/tun`) for TUN and TAP |
+| **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       | Administrator | TUN: Wintun, `wintun.dll` next to the executable or on `PATH`; TAP: the tap-windows6 (`tap0901`) driver staged in the driver store |
+| **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | root | None: TUN is `utun`, TAP is a `feth` pair, both built in |
 
-✅ tested in CI on real devices (Windows TAP with the tap-windows6 driver
-installed). See
+✅ tested in CI on real devices: the privileged jobs on `ubuntu-latest`,
+`windows-latest`, and `macos-latest` open, use, and delete TUN and TAP
+devices in every feature set (on Windows after downloading Wintun 0.14.1
+and staging the tap-windows6 9.27.0 driver package), and a separate Linux
+job checks persistence across two processes. Only platforms CI tests are
+listed: `tun-rs` runs on more, but this crate does not claim them. See
 [`tunnel-lattice-backend-tunrs`](https://crates.io/crates/tunnel-lattice-backend-tunrs)
 for the per-OS mechanisms and error mapping.
+
+## 🚀 Performance
+
+Forwarding throughput, measured with the project's
+[`bench/forwarder`](https://github.com/F000NKKK/tunnel-lattice/tree/main/bench/forwarder)
+harness. It uses the method of tun-rs's
+[tun-benchmark2](https://github.com/tun-rs/tun-benchmark2): a forwarder
+copies packets between two TUN devices while `iperf3` measures TCP
+throughput across them, and raw `tun-rs` is measured next to this crate in
+the same run, on the same machine. Neither side uses offload. The table and
+its notes are copied unchanged from the recorded
+[workflow run](https://github.com/F000NKKK/tunnel-lattice/actions/runs/36855227427):
+
+| Configuration | Throughput (median Gbps) | vs tun-rs, same run | CPU avg | RSS max | Retransmissions |
+|---|---:|---:|---:|---:|---:|
+| tun-rs sync | 2.87 | — | 173 % | 2.7 MB | 79 |
+| tunnel-lattice sync (Handle::recv/send) | 2.73 | 94.9 % (94.4–96.6) | 173 % | 2.5 MB | 74 |
+| tun-rs async (Tokio) | 2.35 | — | 179 % | 3.6 MB | 64 |
+| tunnel-lattice async (Tokio, packet_stream + send_async) | 2.20 | 93.6 % (90.2–96.1) | 181 % | 3.5 MB | 57 |
+| tunnel-lattice async (Tokio, one shared PacketPool) | 2.18 | 92.9 % (88.3–97.2) | 180 % | 3.5 MB | 61 |
+| tun-rs async (async-io) | 3.04 | — | 187 % | 2.8 MB | 90 |
+| tunnel-lattice async (async-io, packet_stream + send_async) | 2.58 | 86.2 % (80.3–92.3) | 183 % | 2.8 MB | 55 |
+
+Recorded 2026-10-01T11:26:41Z on GitHub Actions ubuntu24 20260927.320.1 runner, AMD EPYC 9V74 80-Core Processor, 4 CPUs, Linux 6.17.0-1022-azure.
+Code 9f5d286; tun-rs 2.8.11, tunnel-lattice 0.4.0, iperf3 3.16; rustc 1.98.1 (48a229cea 2026-09-01), RUSTFLAGS `-C target-cpu=native`.
+Method: two TUN devices (one moved into a network namespace) joined by the forwarder; `iperf3 -t 10` TCP from the host to a server in the namespace. Each row is the median of 5 runs (order rotated every repetition, 1 warm-up run(s) discarded). Throughput is iperf3's receiver rate. "vs tun-rs, same run" is the median (min–max) of the per-repetition ratio to the tun-rs baseline above it, measured in the same repetition. CPU is the forwarder process's user+system time per second sampled at 1 Hz (100 % = one core); RSS is the largest resident set sampled.
+Reproduce: `scripts/bench-forward.sh build && sudo scripts/bench-forward.sh run && scripts/bench-forward.sh report <dir>`.
+Absolute Gbps from shared or virtual runners are not comparable with numbers published on other hardware; compare the same-run ratio.
+
+The reproduce command runs from a checkout of the
+[repository](https://github.com/F000NKKK/tunnel-lattice) on Linux, with
+root and `iperf3`. On GitHub, the manual **Forwarder benchmark** workflow
+(`workflow_dispatch`) runs the same script and uploads `results.md`,
+`results.json`, and every raw run as an artifact.
+
+While the only backend wraps `tun-rs`, this crate can at best match
+`tun-rs` minus its own overhead; the ratio column measures that overhead.
+Going beyond `tun-rs` needs batched I/O and GSO/GRO offload, planned for
+0.6, and native per-OS backends after that. `tun-rs`'s own published
+numbers come from different hardware, and its headline figures use
+offload, so they are not comparable with this table.
 
 ## 📦 Installation
 
@@ -293,6 +338,31 @@ and does not vendor it. Without it, `open` fails with
 tap-windows driver is not installed). Download it from
 [wintun.net](https://www.wintun.net/) and ship it with your application;
 see `tunnel-lattice-backend-tunrs`'s README for details.
+
+## 🤝 Comparison
+
+This crate currently runs on `tun-rs`, so this compares what the Tunnel
+Lattice layer adds, what it inherits from `tun-rs`, and what it does not
+have yet.
+
+| Feature | tunnel-lattice | Source | tun-rs (the backend it wraps) |
+|---------|----------------|--------|-------------------------------|
+| **TUN on Linux, Windows, macOS** | ✅ | Inherited from `tun-rs` | ✅ |
+| **TAP on Linux, Windows, macOS** | ✅ macOS via `feth` pairs | Inherited; Tunnel Lattice adds the bounded wait that ends a macOS async TAP `recv` | ✅ |
+| **Error type** | ✅ One typed `Error`, same meaning on every OS | Tunnel Lattice | ⚠️ `std::io::Error` with platform codes |
+| **Device deleted while `recv` waits** | ✅ Ends with `Disconnected` on every OS and feature set | Tunnel Lattice | ⚠️ Waits forever with Tokio on Linux and async TAP on macOS |
+| **Oversize packet** | ✅ `BufferTooSmall`, never truncated | Tunnel Lattice | ⚠️ Behaviour differs per platform |
+| **Async I/O** | ✅ `futures::Stream` and `send_async`, Tokio or async-io | Async I/O inherited; the stream is Tunnel Lattice | ✅ async `recv`/`send`, Tokio or async-io |
+| **Allocation-free packet stream** | ✅ Built-in `PacketPool` | Tunnel Lattice | ➖ Caller-managed buffers |
+| **Runtime capability flags** | ✅ Per host and per device | Tunnel Lattice | ❌ |
+| **Backend injection** | ✅ `Tunnel::new(backend)` over provider traits | Tunnel Lattice | ❌ |
+| **TAP MAC address** | ✅ Set at open; changed on an open device on Linux and macOS | Inherited | ✅ |
+| **Persistent devices (Linux)** | ✅ Persist, re-attach by name, un-persist | Persist inherited; un-persist is Tunnel Lattice | ⚠️ Persist only |
+| **Multi-queue (Linux)** | ✅ `additional_queue` | Inherited | ✅ |
+| **Batch I/O and GSO/GRO offload** | 🚧 Planned for 0.6 | — | ✅ Linux |
+| **Address and route setup** | ➖ Delegated to [`net-lattice`](https://crates.io/crates/net-lattice) | — | ✅ Built in |
+| **Throughput** | Measured against `tun-rs` in the same run; see [Performance](#-performance) | — | Baseline |
+| **Platforms** | Linux, Windows, macOS | — | 11+, including BSD, iOS, Android |
 
 ## 📖 Documentation
 

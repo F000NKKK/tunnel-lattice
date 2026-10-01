@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and route on every exit path, and reports; a manual `Forwarder benchmark`
   GitHub Actions workflow runs it and uploads the results. A standalone
   Cargo workspace, so no published crate or root-workspace build changes.
+  - Documentation only: the root README (English and Russian) and the
+    `tunnel-lattice` crate README now publish the first recorded results
+    table with its environment, versions, method, and reproduce command
+    (GitHub Actions `ubuntu-24.04` runner, 2026-10-01, `tunnel-lattice`
+    0.4.0 against `tun-rs` 2.8.11), together with the limit it implies:
+    on the `tun-rs` backend Tunnel Lattice can at best match `tun-rs`
+    minus its own overhead. They also gain a comparison table that marks
+    each feature as added by Tunnel Lattice, inherited from `tun-rs`, or
+    planned (batched I/O and GSO/GRO offload in 0.6), and a
+    supported-platform table with the privilege and driver each platform
+    needs, listing only what the privileged CI jobs test.
 
 - **Windows TAP is now tested on real devices in CI.** The privileged CI
   job stages the tap-windows6 9.27.0 driver package (SHA-256 and catalog
