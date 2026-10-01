@@ -188,6 +188,40 @@ jobs:
           Expand-Archive -Path wintun.zip -DestinationPath wintun
           echo "$PWD\wintun\wintun\bin\amd64" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      # Stages (does not install) the tap-windows6 `tap0901` driver package
+      # in the driver store. tun-rs's TAP open, and the backend's host-level
+      # driver lookup, search the store for a compatible driver with
+      # hardware id tap0901 and create their own adapter, so no adapter is
+      # created here (`devcon install`/`tapctl create` would leave an extra
+      # one behind and break the leak check below). Pinned to 9.27.0, the
+      # latest release, by SHA-256; the catalog must carry a valid
+      # Authenticode signature. The package is attestation-signed for
+      # Windows 10/11 client; the Server-based hosted image loads it because
+      # it runs with test signing on (printed below for the log). MUST stay
+      # after the `windows_missing_driver_` step, which asserts the driver
+      # is absent.
+      - name: Stage the tap-windows6 driver (tap0901) in the driver store (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = '9.27.0'
+          $sha256  = '36E2609B7CEEFEDCB978CE5C48CAF9E0E5AF83423717C4E2E3C1D7EBCA8F62A5'
+          $zip = Join-Path $env:RUNNER_TEMP 'tap-windows6.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'tap-windows6'
+          Invoke-WebRequest -Uri "https://github.com/OpenVPN/tap-windows6/releases/download/$version/dist.win10.zip" -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+          if ($got -ne $sha256) { throw "tap-windows6 $version checksum mismatch: $got" }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $amd64 = Join-Path $dir 'dist.win10\amd64'
+          $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $amd64 'tap0901.cat')
+          if ($sig.Status -ne 'Valid') { throw "tap0901.cat signature is $($sig.Status): $($sig.StatusMessage)" }
+          bcdedit /enum '{current}' | Select-String -Pattern 'testsigning'
+          pnputil /add-driver (Join-Path $amd64 'OemVista.inf')
+          if ($LASTEXITCODE -notin 0, 3010) { throw "pnputil /add-driver failed with exit code $LASTEXITCODE" }
+          $store = pnputil /enum-drivers | Out-String
+          if ($store -notmatch '(?i)oemvista\.inf') { throw 'tap0901 package not found in the driver store after pnputil /add-driver' }
+          exit 0
+
       # `-p tunnel-lattice-backend-tunrs` only: `privileged_tests` lives
       # there, and building the rest of the workspace under `sudo`/as
       # Administrator is unnecessary privilege widening for no benefit.
@@ -220,7 +254,10 @@ jobs:
       # windows-latest runners already execute as Administrator; opening a
       # TUN/TAP device there does not need an explicit elevation step the
       # way `sudo` provides one on Linux/macOS. The missing-driver tests ran
-      # in their own step above and no longer hold once wintun is on PATH.
+      # in their own step above and no longer hold once wintun is on PATH
+      # and the TAP driver is staged. The Windows TAP tests (`windows_tap_`)
+      # serialize themselves on a test-local mutex, so the default parallel
+      # test threads are safe.
       - name: cargo test -p tunnel-lattice-backend-tunrs -- --ignored (Windows)
         if: matrix.os == 'windows-latest'
         run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --skip windows_missing_driver_ --nocapture
@@ -229,3 +266,31 @@ jobs:
       - name: cargo test -p tunnel-lattice --lib -- --ignored (Windows)
         if: matrix.os == 'windows-latest' && matrix.features.name != 'default'
         run: cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
+
+      # Every TAP adapter the privileged tests create is non-persistent and
+      # removed when its handle drops. Fails the job if a tap0901 device is
+      # left on the runner, also after a failed test run.
+      - name: No TAP-Windows adapter left behind (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $left = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { @($_.HardwareID) -match '(?i)^(root\\)?tap0901$' })
+          if ($left.Count -gt 0) {
+            $left | Format-Table Status, FriendlyName, InstanceId -AutoSize | Out-String | Write-Host
+            Write-Host "::error::TAP-Windows adapters left behind by the privileged tests"
+            exit 1
+          }
+
+      # On a failure, records why a driver might not have loaded: test
+      # signing, the staged packages, devices with a problem code, Code
+      # Integrity events, and the tail of the SetupAPI device log.
+      - name: TAP driver diagnostics (Windows, on failure)
+        if: ${{ failure() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          bcdedit /enum '{current}'
+          pnputil /enum-drivers /class Net
+          pnputil /enum-devices /class Net /problem
+          Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 30 -ErrorAction SilentlyContinue | Format-List TimeCreated, Id, Message
+          Get-Content -Tail 200 "$env:windir\INF\setupapi.dev.log"
+          exit 0

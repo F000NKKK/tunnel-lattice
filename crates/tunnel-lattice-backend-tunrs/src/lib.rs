@@ -85,6 +85,13 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// by another process); and on Windows, an existing Wintun adapter whose
 /// name matches a `Tun` request.
 ///
+/// A requested MAC (`tunnel_lattice_model::DeviceConfig::mac`) is checked
+/// with the name and MTU: requesting one for a `Tun` device returns
+/// [`Error::InvalidState`] before any native call. For a `Tap` device the
+/// MAC is passed to the driver at creation and read back once the device
+/// exists; if the read-back MAC differs (the platform ignored the request),
+/// the new device is torn down and `open` returns [`Error::Unsupported`].
+///
 /// On Linux, attaching to an existing (persistent) device with an MTU the
 /// kernel rejects fails with `EINVAL` while the name exists, so it is
 /// reported as [`Error::AlreadyExists`] rather than an MTU error: the same
@@ -612,10 +619,12 @@ impl DeviceMutator for TunRsDevice {
     type DeviceConfigPatch = DeviceConfigPatch;
 
     fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()> {
+        // Not `self.capabilities()`: on Windows that also runs the host-level
+        // driver lookup, which a patch never needs.
         let target = ApplyTarget {
             id: self.id,
             kind: self.kind,
-            mac_mutation: self.capabilities().contains(Capability::MAC_MUTATION),
+            mac_mutation: mac_mutation_supported(self.kind),
         };
         apply_patch(&*self.handle, target, &patch)
     }
@@ -833,17 +842,21 @@ impl CapabilityProvider for TunRsDevice {
             return base;
         }
         let base = base | Capability::TAP_DEVICES;
-        // The Windows TAP driver takes a MAC only at creation; `tun-rs`
-        // returns `Unsupported` for a later change there.
-        #[cfg(not(target_os = "windows"))]
-        {
+        if mac_mutation_supported(self.kind) {
             base | Capability::MAC_MUTATION
-        }
-        #[cfg(target_os = "windows")]
-        {
+        } else {
             base
         }
     }
+}
+
+/// Whether a handle of `kind` can change its MAC after open
+/// (`Capability::MAC_MUTATION`): TAP on Linux and macOS. The Windows TAP
+/// driver takes a MAC only at creation; `tun-rs` returns `Unsupported` for
+/// a later change there. Decided from the kind and the target alone, with no
+/// native call.
+const fn mac_mutation_supported(kind: DeviceKind) -> bool {
+    matches!(kind, DeviceKind::Tap) && !cfg!(target_os = "windows")
 }
 
 /// Ordinary tests of the backend's host-level capability answer (no device
@@ -877,6 +890,17 @@ mod capability_tests {
             TunRsBackend::new()
                 .capabilities()
                 .contains(Capability::TAP_DEVICES)
+        );
+    }
+
+    /// `apply` decides `MAC_MUTATION` from the kind and the target alone
+    /// (no driver lookup); TUN never has it, TAP everywhere but Windows.
+    #[test]
+    fn mac_mutation_follows_the_kind_and_the_target_only() {
+        assert!(!mac_mutation_supported(DeviceKind::Tun));
+        assert_eq!(
+            mac_mutation_supported(DeviceKind::Tap),
+            !cfg!(target_os = "windows")
         );
     }
 
@@ -2123,6 +2147,221 @@ mod privileged_tests {
             "open(Tap) without the tap-windows6 driver should report DriverUnavailable, got {:?}",
             result.err()
         );
+    }
+
+    /// Serializes the privileged Windows TAP tests. `tun-rs` names a new
+    /// TAP adapter after the first free `tap{N}` it finds and then renames
+    /// it with `netsh`, and each open installs a device through SetupAPI, so
+    /// two concurrent opens could race for the same name. Take it as the
+    /// test's first local, so it is released only after the device dropped
+    /// (which removes the adapter).
+    #[cfg(target_os = "windows")]
+    fn serialize_windows_tap_tests() -> std::sync::MutexGuard<'static, ()> {
+        static WINDOWS_TAP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        WINDOWS_TAP_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// With the tap-windows6 driver staged, the host-level driver lookup
+    /// finds it, the backend reports `TAP_DEVICES`, and `open(Tap)`
+    /// succeeds with a snapshot of kind `Tap` that carries a MAC. The handle
+    /// reports `TAP_DEVICES` but not `MAC_MUTATION` (the Windows driver
+    /// takes a MAC only at creation). The privileged CI job runs this after
+    /// staging the driver; the name must not start with
+    /// `windows_missing_driver_`, which selects the driver-less tests.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_driver_is_detected_and_a_tap_device_opens() {
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        assert!(
+            windows_tap_probe::tap_driver_installed(),
+            "the driver lookup did not find the staged tap0901 driver"
+        );
+        let backend = TunRsBackend::new();
+        assert!(backend.capabilities().contains(Capability::TAP_DEVICES));
+
+        let device = backend
+            .open(DeviceConfig::new(DeviceKind::Tap))
+            .expect("open a TAP device");
+        let snapshot = device.snapshot().expect("snapshot the TAP device");
+        eprintln!("windows TAP snapshot: {snapshot:?}");
+        assert_eq!(snapshot.kind, DeviceKind::Tap);
+        assert!(snapshot.mac.is_some(), "a TAP snapshot carries its MAC");
+        assert!(!snapshot.name.is_empty());
+        assert_ne!(device.id().value(), 0, "an OS interface index is never 0");
+        assert_eq!(snapshot.id, device.id());
+        assert_eq!(
+            snapshot.recv_buffer_len(),
+            usize::try_from(snapshot.mtu).expect("an MTU fits in usize") + 18
+        );
+
+        let capabilities = device.capabilities();
+        assert!(capabilities.contains(Capability::TAP_DEVICES));
+        assert!(!capabilities.contains(Capability::MAC_MUTATION));
+        assert_eq!(capabilities, backend.capabilities());
+    }
+
+    /// A MAC requested at open is the one the Windows TAP adapter reports,
+    /// and a later MAC patch is `Unsupported` without changing anything:
+    /// the driver takes a MAC only at creation.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_mac_is_set_at_open_and_a_later_change_is_unsupported() {
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        // Locally administered unicast addresses.
+        let initial = MacAddress::new([0x02, 0x7c, 0x1a, 0x00, 0x00, 0x11]);
+        let changed = MacAddress::new([0x02, 0x7c, 0x1a, 0x00, 0x00, 0x12]);
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap).with_mac(initial))
+            .expect("open a TAP device with a MAC");
+        assert_eq!(
+            device.snapshot().expect("snapshot the device").mac,
+            Some(initial)
+        );
+
+        let result = device.apply(DeviceConfigPatch::new_mac(device.id(), changed));
+        assert!(
+            matches!(result, Err(Error::Unsupported)),
+            "a MAC patch on a Windows TAP device should be Unsupported, got {result:?}"
+        );
+        assert_eq!(
+            device
+                .snapshot()
+                .expect("snapshot after the refused patch")
+                .mac,
+            Some(initial),
+            "a refused MAC patch changes nothing"
+        );
+    }
+
+    /// A Windows TAP adapter's MTU is set at open and changed by a patch,
+    /// both read back from the next snapshot. Both values stay below the
+    /// driver's maximum of 1500.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_mtu_is_set_at_open_and_changed_by_apply() {
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap).with_mtu(1400))
+            .expect("open a TAP device");
+        assert_eq!(device.snapshot().expect("initial snapshot").mtu, 1400);
+
+        let patch = DeviceConfigPatch::new(device.id(), None, Some(1300)).expect("build a patch");
+        device.apply(patch).expect("apply the MTU patch");
+        assert_eq!(
+            device.snapshot().expect("snapshot after the patch").mtu,
+            1300
+        );
+    }
+
+    /// A 42-byte broadcast ARP request (the smallest common Ethernet frame,
+    /// before padding) is written to the Windows TAP adapter whole. The
+    /// adapter's media status is connected, because `tun-rs` enables a new
+    /// device.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_sends_a_broadcast_arp_frame() {
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap))
+            .expect("open a TAP device");
+        let mac = device
+            .snapshot()
+            .expect("snapshot the device")
+            .mac
+            .expect("a TAP snapshot carries its MAC")
+            .octets();
+
+        // Ethernet: broadcast destination, our source, EtherType ARP.
+        let mut frame = Vec::with_capacity(42);
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&mac);
+        frame.extend_from_slice(&[0x08, 0x06]);
+        // ARP request: Ethernet/IPv4, sender our MAC at 169.254.0.1, asking
+        // for 169.254.0.2.
+        frame.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]);
+        frame.extend_from_slice(&mac);
+        frame.extend_from_slice(&[169, 254, 0, 1]);
+        frame.extend_from_slice(&[0; 6]);
+        frame.extend_from_slice(&[169, 254, 0, 2]);
+        assert_eq!(frame.len(), 42);
+
+        let sent = PacketIo::send(&device, &frame);
+        assert!(matches!(sent, Ok(42)), "send of a 42-byte frame: {sent:?}");
+    }
+
+    /// The Windows TAP adapter rejects a frame larger than the buffer with
+    /// `InvalidInput`, reported as `BufferTooSmall`, and the next `recv`
+    /// with a `recv_buffer_len()` buffer succeeds. The host sends UDP to the
+    /// adapter's subnet broadcast address, so no ARP is needed.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_oversize_frame_reports_buffer_too_small_and_the_next_recv_succeeds() {
+        let _serial = serialize_windows_tap_tests();
+        assert_oversize_packet_is_rejected_then_next_recv_succeeds(
+            DeviceKind::Tap,
+            [10, 204, subnet_octet()],
+        );
+    }
+
+    /// Opening a Windows TAP device under the name of an existing adapter
+    /// fails with `AlreadyExists` (the backend turns `tun-rs`'s adapter
+    /// reuse off), and the existing adapter is untouched and still usable.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_open_of_an_existing_name_reports_already_exists() {
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = format!("tltap{}", std::process::id() % 100_000);
+        let backend = TunRsBackend::new();
+        let first = backend
+            .open(DeviceConfig::new(DeviceKind::Tap).with_name(name.as_str()))
+            .expect("open the first TAP device");
+        assert_eq!(first.snapshot().expect("snapshot the first").name, name);
+
+        let second = backend.open(DeviceConfig::new(DeviceKind::Tap).with_name(name.as_str()));
+        assert!(
+            matches!(second, Err(Error::AlreadyExists)),
+            "second open of an existing TAP name should report AlreadyExists, got {:?}",
+            second.err()
+        );
+        let snapshot = first
+            .snapshot()
+            .expect("the first device is still usable after the refused open");
+        assert_eq!(snapshot.name, name);
+        assert_eq!(snapshot.id, first.id());
     }
 
     /// A TAP device opened with a MAC address reports it, reports

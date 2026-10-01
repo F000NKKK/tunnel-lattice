@@ -5,8 +5,15 @@
 //! (`platform/windows/tap/iface.rs`, `create_interface`) builds an
 //! in-memory network-class device element, sets its hardware id to
 //! `tap0901`, asks SetupAPI for the compatible drivers, and fails with
-//! `"No driver found"` when none has that hardware id. This module repeats
-//! exactly those steps and stops there: it never calls the class installer
+//! `"No driver found"` unless one of them has that hardware id, a non-zero
+//! `DriverVersion`, and can be selected for the element
+//! (`SetupDiSetSelectedDriverW`). This module performs the same lookup with
+//! the same hardware-id and `DriverVersion` checks, but does not select a
+//! driver: selection only marks the driver on this in-memory element, and
+//! skipping it keeps the probe free of any state change. So the probe can
+//! report a driver that `tun-rs` would then fail to select; that mismatch is
+//! not expected for a staged driver package, and `open` stays authoritative
+//! either way. The probe never calls the class installer
 //! (`DIF_REGISTERDEVICE`/`DIF_INSTALLDEVICE`), so the element only ever
 //! exists inside the device information set, which is destroyed before
 //! returning. None of these calls needs elevation.
@@ -182,6 +189,9 @@ fn probe_tap_driver() -> bool {
     let found = (0..MAX_DRIVERS)
         .map_while(|index| enum_driver(&drivers, index))
         .flatten()
+        // `tun-rs` only accepts a driver whose version is above the best one
+        // so far, starting from 0, so a zero `DriverVersion` never counts.
+        .filter(|driver| driver.DriverVersion != 0)
         .any(|driver| {
             driver_hardware_id(&drivers, &driver)
                 .is_some_and(|id| id.eq_ignore_ascii_case(TAP_HARDWARE_ID))

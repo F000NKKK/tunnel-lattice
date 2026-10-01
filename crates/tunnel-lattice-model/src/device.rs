@@ -147,7 +147,9 @@ pub struct DeviceConfig {
     /// [`Error::InvalidState`] before any native call. On Windows this is
     /// the only way to choose a TAP device's MAC address: the TAP driver
     /// cannot change it after creation, so `Capability::MAC_MUTATION` is
-    /// not reported there.
+    /// not reported there. On Linux, opening the name of an existing
+    /// persistent TAP device with a MAC attaches to that device and changes
+    /// its MAC address, which outlives the handle.
     pub mac: Option<MacAddress>,
 }
 
