@@ -1124,7 +1124,7 @@ mod privileged_tests {
 
     /// Runs a host network-configuration command, panicking with its
     /// output if it fails. Used only on the test's own device.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_host_command(program: &str, args: &[&str]) {
         let output = std::process::Command::new(program)
             .args(args)
@@ -1162,20 +1162,43 @@ mod privileged_tests {
             ),
             _ => run_host_command("ifconfig", &[name, "inet", &local, &peer, "up"]),
         }
+        // A freshly created Wintun adapter is not always registered with the
+        // IP helper yet, and an adapter name reused right after the previous
+        // test's adapter was removed can still resolve to the retired
+        // interface; netsh then fails with "Failed to configure the DHCP
+        // service". Retry for a bounded time before failing the test.
         #[cfg(target_os = "windows")]
-        run_host_command(
-            "netsh",
-            &[
+        {
+            let name_arg = format!("name={name}");
+            let args = [
                 "interface",
                 "ipv4",
                 "set",
                 "address",
-                &format!("name={name}"),
+                name_arg.as_str(),
                 "static",
                 &local,
                 "255.255.255.0",
-            ],
-        );
+            ];
+            let mut attempts = 0;
+            loop {
+                let output = std::process::Command::new("netsh")
+                    .args(args)
+                    .output()
+                    .unwrap_or_else(|err| panic!("run netsh: {err}"));
+                if output.status.success() {
+                    break;
+                }
+                attempts += 1;
+                assert!(
+                    attempts < 20,
+                    "netsh {args:?} failed after {attempts} attempts: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
         let target = match kind {
             DeviceKind::Tap => format!("{a}.{b}.{c}.255:9"),
             _ => format!("{peer}:9"),
