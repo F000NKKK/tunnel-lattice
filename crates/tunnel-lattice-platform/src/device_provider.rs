@@ -27,6 +27,6 @@ pub trait DeviceProvider {
 
     /// Opens a new device matching `config`, or attaches to a persistent one
     /// requested by name where the backend and `Capability::PERSISTENT_DEVICES`
-    /// support it.
+    /// support it. The result does not say which of the two happened.
     fn open(&self, config: Self::DeviceConfig) -> Result<Self::Device>;
 }

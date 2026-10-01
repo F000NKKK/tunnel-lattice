@@ -178,6 +178,11 @@ impl PersistentDevice for MockDevice {
         self.state.persistent.store(true, Ordering::SeqCst);
         Ok(())
     }
+
+    fn unpersist(&self) -> Result<()> {
+        self.state.persistent.store(false, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl MultiQueueProvider for MockDevice {
@@ -373,6 +378,22 @@ fn persist_reaches_the_device() {
         .expect("open");
     handle.persist().expect("persist");
     assert!(state.persistent.load(Ordering::SeqCst));
+}
+
+#[test]
+fn unpersist_reaches_the_device_from_any_queue_and_is_idempotent() {
+    let backend = MockBackend::new();
+    let state = Arc::clone(&backend.state);
+    let handle = Tunnel::new(backend)
+        .open(DeviceConfig::new(DeviceKind::Tun).with_multi_queue(true))
+        .expect("open");
+    let queue = handle.additional_queue().expect("second queue");
+    handle.persist().expect("persist");
+
+    queue.unpersist().expect("unpersist from the second queue");
+    assert!(!state.persistent.load(Ordering::SeqCst));
+    handle.unpersist().expect("unpersist again");
+    assert!(!state.persistent.load(Ordering::SeqCst));
 }
 
 #[cfg(feature = "async")]

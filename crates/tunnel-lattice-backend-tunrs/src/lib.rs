@@ -80,10 +80,14 @@ use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
 /// the requested name: it fails with [`Error::AlreadyExists`] and leaves the
 /// existing interface untouched. Two cases attach to an existing device
 /// instead, and neither destroys it when the handle drops: on Linux, a
-/// persistent same-kind device with no queue attached, or any same-kind
-/// multi-queue device when `multi_queue` is requested (including one opened
-/// by another process); and on Windows, an existing Wintun adapter whose
-/// name matches a `Tun` request.
+/// persistent device of the same kind and multi-queue setting with no queue
+/// attached, or any same-kind multi-queue device when `multi_queue` is
+/// requested (including one opened by another process); and on Windows, an
+/// existing Wintun adapter whose name matches a `Tun` request. A successful
+/// `open` does not report whether it attached or created. Re-attaching is
+/// how a later process reopens a device made persistent with
+/// `PersistentDevice::persist`; `PersistentDevice::unpersist` lets it go
+/// away with its last handle again.
 ///
 /// A requested MAC (`tunnel_lattice_model::DeviceConfig::mac`) is checked
 /// with the name and MTU: requesting one for a `Tun` device returns
@@ -745,10 +749,38 @@ fn apply_patch(
     Ok(())
 }
 
+/// Linux persistence through the kernel's `TUNSETPERSIST` ioctl, which
+/// takes its argument by value: non-zero sets `IFF_PERSIST`, zero clears it.
+/// Both calls act on the device, so they work from any of its queues.
 #[cfg(target_os = "linux")]
 impl PersistentDevice for TunRsDevice {
     fn persist(&self) -> Result<()> {
         self.handle.persist().map_err(io_error)
+    }
+
+    /// Clears `IFF_PERSIST` with `TUNSETPERSIST(0)`. `tun-rs` has no call
+    /// for this (its `persist` can only set the flag), so the backend issues
+    /// the ioctl itself on the handle's descriptor.
+    fn unpersist(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        // The argument is passed as an integer by value, never as a pointer:
+        // the kernel only tests it for non-zero, so a pointer to `0` (what
+        // `tun-rs`'s `ioctl_write_ptr!` wrapper would pass) is itself
+        // non-zero and would *set* persistence instead.
+        let off: libc::c_ulong = 0;
+        // SAFETY: `as_raw_fd` is this handle's own open `/dev/net/tun`
+        // descriptor, valid for the whole lifetime of `self.handle`, which
+        // outlives this call. `TUNSETPERSIST` reads no memory through its
+        // argument: it is an integer passed by value, and `0` clears the
+        // persistence flag. The call has no other side effect on the
+        // descriptor or on any Rust-owned memory.
+        let rc = unsafe { libc::ioctl(self.handle.as_raw_fd(), libc::TUNSETPERSIST, off) };
+        if rc < 0 {
+            Err(io_error(std::io::Error::last_os_error()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1543,9 +1575,16 @@ mod io_error_tests {
 /// Administrator on Windows, or root on macOS/BSD — see `.claude/rules/
 /// ci.md`. Run with `cargo test -p tunnel-lattice-backend-tunrs -- --ignored`
 /// under the required privilege (`sudo` on Linux/macOS). Each test creates
-/// its own non-persistent device and never touches pre-existing host state:
-/// dropping `TunRsDevice` tears the interface down, so there is nothing to
-/// restore on any exit path (including a panic through `expect`).
+/// its own device and never touches pre-existing host state: dropping
+/// `TunRsDevice` tears a non-persistent interface down, so there is nothing
+/// to restore on any exit path (including a panic through `expect`). The
+/// Linux persistence tests make their device persistent on purpose; each
+/// holds a guard that deletes it with `ip link del` on every exit path that
+/// unwinds. The two `persist_cross_process_step_*` tests are the exception:
+/// they do nothing unless `TL_PERSIST_CROSS_PROCESS_NAME` is set, and are
+/// run one process after the other by a dedicated CI job that removes the
+/// device afterwards. The macOS `feth` tests clean up with their own
+/// guards.
 #[cfg(test)]
 mod privileged_tests {
     #[cfg(target_os = "linux")]
@@ -1703,6 +1742,60 @@ mod privileged_tests {
         );
     }
 
+    /// Reads a Linux TUN/TAP device's kernel flags (`IFF_TUN`,
+    /// `IFF_PERSIST`, ...) from sysfs, which prints them as `0x<hex>`.
+    #[cfg(target_os = "linux")]
+    fn linux_tun_flags(name: &str) -> u32 {
+        let path = format!("/sys/class/net/{name}/tun_flags");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        let hex = text.trim().trim_start_matches("0x");
+        u32::from_str_radix(hex, 16).unwrap_or_else(|err| panic!("parse {path} {text:?}: {err}"))
+    }
+
+    /// Whether the kernel has `IFF_PERSIST` set on the device `name`.
+    #[cfg(target_os = "linux")]
+    fn linux_is_persistent(name: &str) -> bool {
+        linux_tun_flags(name) & libc::IFF_PERSIST as u32 != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_interface_exists(name: &str) -> bool {
+        std::path::Path::new("/sys/class/net").join(name).exists()
+    }
+
+    /// Waits up to 5 s for the interface `name` to disappear. Closing the
+    /// last descriptor of a non-persistent device unregisters it before
+    /// `close` returns, so this normally succeeds on the first check.
+    #[cfg(target_os = "linux")]
+    fn linux_interface_is_gone(name: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while linux_interface_exists(name) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        true
+    }
+
+    /// Deletes the Linux interface `name` when dropped (a no-op if it is
+    /// already gone). Declare it before the device so it runs after the
+    /// device's own drop, on every exit path including a panic, and removes
+    /// a device a failed assertion left persistent.
+    #[cfg(target_os = "linux")]
+    fn delete_on_drop(name: &str) -> RemoveOnDrop {
+        RemoveOnDrop {
+            program: "ip",
+            args: vec!["link".into(), "del".into(), name.into()],
+        }
+    }
+
+    /// `persist` sets the kernel's `IFF_PERSIST` flag, `unpersist` clears
+    /// it again and is idempotent, and once cleared the device goes away
+    /// with its last handle. The flag is read back from
+    /// `/sys/class/net/<name>/tun_flags`. A teardown guard deletes the
+    /// device on every exit path, so a failure cannot leave it behind.
     #[test]
     #[cfg(target_os = "linux")]
     #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
@@ -1714,21 +1807,237 @@ mod privileged_tests {
         #[cfg(feature = "tokio")]
         let _entered = _runtime.enter();
 
-        let backend = TunRsBackend::new();
-        let device = backend
-            .open(DeviceConfig::new(DeviceKind::Tun))
+        let name = unique_linux_name("pers");
+        let _cleanup = delete_on_drop(&name);
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
             .expect("open a TUN device");
+        assert!(
+            !linux_is_persistent(&name),
+            "a new device is not persistent"
+        );
 
-        // `persist()` succeeding is the whole observable contract here —
-        // `tun-rs` exposes no getter to read the persistent flag back, and
-        // actually leaving a persistent interface behind after this test
-        // process exits would violate this crate's own privileged-test
-        // convention of never touching state outside what the test itself
-        // owns and tears down (see `privileged_tests`'s module docs). A
-        // real end-to-end "survives process exit" check belongs in a
-        // separate, explicitly destructive test outside the default
-        // `--ignored` run, not here.
         device.persist().expect("mark the device persistent");
+        assert!(linux_is_persistent(&name), "persist sets IFF_PERSIST");
+
+        device.unpersist().expect("clear persistence");
+        assert!(!linux_is_persistent(&name), "unpersist clears IFF_PERSIST");
+        device
+            .unpersist()
+            .expect("clearing persistence again succeeds");
+        assert!(!linux_is_persistent(&name), "unpersist is idempotent");
+
+        drop(device);
+        assert!(
+            linux_interface_is_gone(&name),
+            "{name} survived its last handle after unpersist"
+        );
+    }
+
+    /// A persistent multi-queue device outlives its handle and is
+    /// re-attached by opening the same name with `multi_queue = true`; the
+    /// re-attached handle has the same identity, can add a queue, and
+    /// `unpersist` through that added queue lets the device go away with
+    /// its last handle.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn persistent_multi_queue_device_is_re_attached_by_name_on_linux() {
+        use tunnel_lattice_platform::{MultiQueueProvider, PersistentDevice};
+
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = unique_linux_name("pmq");
+        let _cleanup = delete_on_drop(&name);
+        let backend = TunRsBackend::new();
+        let config = DeviceConfig::new(DeviceKind::Tun)
+            .with_name(name.as_str())
+            .with_multi_queue(true);
+
+        let first = backend
+            .open(config.clone())
+            .expect("open a multi-queue TUN device");
+        let id = first.id();
+        first.persist().expect("mark the device persistent");
+        drop(first);
+        assert!(
+            linux_interface_exists(&name),
+            "a persistent device survives its last handle"
+        );
+        assert!(linux_is_persistent(&name));
+
+        let again = backend
+            .open(config)
+            .expect("re-attach the persistent multi-queue device by name");
+        assert_eq!(again.id(), id, "re-attached, not re-created");
+        assert!(linux_tun_flags(&name) & libc::IFF_MULTI_QUEUE as u32 != 0);
+        let queue = again
+            .additional_queue()
+            .expect("add a queue to the re-attached device");
+
+        queue
+            .unpersist()
+            .expect("clear persistence from the added queue");
+        assert!(!linux_is_persistent(&name));
+        drop(queue);
+        assert!(
+            linux_interface_exists(&name),
+            "the device stays while a handle is attached"
+        );
+        drop(again);
+        assert!(
+            linux_interface_is_gone(&name),
+            "{name} survived its last handle after unpersist"
+        );
+    }
+
+    /// Opening a persistent TUN device with no queue attached under the
+    /// wrong kind (TAP) or the wrong multi-queue setting is refused by the
+    /// kernel with `EINVAL`, which `open` reports as `AlreadyExists`; the
+    /// device is untouched and still re-attaches with the matching
+    /// settings.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn re_attaching_a_persistent_device_with_a_mismatch_reports_already_exists_on_linux() {
+        use tunnel_lattice_platform::PersistentDevice;
+
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = unique_linux_name("pmis");
+        let _cleanup = delete_on_drop(&name);
+        let backend = TunRsBackend::new();
+        let tun = DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str());
+
+        let first = backend.open(tun.clone()).expect("open a TUN device");
+        let id = first.id();
+        first.persist().expect("mark the device persistent");
+        drop(first);
+
+        let as_tap = backend.open(DeviceConfig::new(DeviceKind::Tap).with_name(name.as_str()));
+        assert!(
+            matches!(as_tap, Err(Error::AlreadyExists)),
+            "re-attaching a persistent TUN as TAP should report AlreadyExists, got {:?}",
+            as_tap.err()
+        );
+        let as_multi_queue = backend.open(tun.clone().with_multi_queue(true));
+        assert!(
+            matches!(as_multi_queue, Err(Error::AlreadyExists)),
+            "re-attaching a non-multi-queue device as multi-queue should report AlreadyExists, got {:?}",
+            as_multi_queue.err()
+        );
+        assert!(linux_is_persistent(&name), "a refused open changes nothing");
+
+        let again = backend
+            .open(tun)
+            .expect("re-attach with the matching kind and multi-queue setting");
+        assert_eq!(again.id(), id, "re-attached, not re-created");
+        again.unpersist().expect("clear persistence");
+        drop(again);
+        assert!(
+            linux_interface_is_gone(&name),
+            "{name} survived its last handle after unpersist"
+        );
+    }
+
+    /// The environment variable naming the device for the two
+    /// cross-process steps below. Unset (the default), both steps return
+    /// at once without touching the host.
+    #[cfg(target_os = "linux")]
+    const CROSS_PROCESS_NAME_VAR: &str = "TL_PERSIST_CROSS_PROCESS_NAME";
+
+    /// Step A of the cross-process persistence check, run by its own CI job
+    /// in its own process: opens a TUN device named by
+    /// `TL_PERSIST_CROSS_PROCESS_NAME`, marks it persistent, and exits with
+    /// the handle still open, so the device must outlive this process.
+    /// Destructive on purpose (it leaves a device behind for step B); does
+    /// nothing unless the variable is set, so an ordinary `--ignored` run
+    /// is unaffected. The CI job deletes the device in a final step that
+    /// always runs.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN; destructive, run by the persistence CI job only"]
+    fn persist_cross_process_step_a_create_and_persist() {
+        use tunnel_lattice_platform::PersistentDevice;
+
+        let Ok(name) = std::env::var(CROSS_PROCESS_NAME_VAR) else {
+            eprintln!("{CROSS_PROCESS_NAME_VAR} is not set; nothing to do");
+            return;
+        };
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        assert!(
+            !linux_interface_exists(&name),
+            "{name} must not exist before step A"
+        );
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
+            .expect("open a TUN device");
+        device.persist().expect("mark the device persistent");
+        assert!(linux_is_persistent(&name), "persist sets IFF_PERSIST");
+        eprintln!(
+            "step A: {name} (index {}) is persistent; exiting with the handle open",
+            device.id().value()
+        );
+        // Leave the handle to process exit rather than an explicit drop:
+        // the kernel closes it either way, and the device must survive.
+        std::mem::forget(device);
+    }
+
+    /// Step B of the cross-process persistence check, run in a second
+    /// process after step A exited: re-attaches to the persistent device by
+    /// name (with `TL_PERSIST_CROSS_PROCESS_INDEX` set, also checks it is
+    /// the same interface step A created), clears persistence, and checks
+    /// that dropping the handle removes the device. Does nothing unless
+    /// `TL_PERSIST_CROSS_PROCESS_NAME` is set.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN; destructive, run by the persistence CI job only"]
+    fn persist_cross_process_step_b_re_attach_and_unpersist() {
+        use tunnel_lattice_platform::PersistentDevice;
+
+        let Ok(name) = std::env::var(CROSS_PROCESS_NAME_VAR) else {
+            eprintln!("{CROSS_PROCESS_NAME_VAR} is not set; nothing to do");
+            return;
+        };
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let _cleanup = delete_on_drop(&name);
+        assert!(
+            linux_interface_exists(&name),
+            "{name} did not survive step A's exit"
+        );
+        assert!(linux_is_persistent(&name), "{name} is not persistent");
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
+            .expect("re-attach the persistent device by name");
+        if let Ok(index) = std::env::var("TL_PERSIST_CROSS_PROCESS_INDEX") {
+            let index: u64 = index.trim().parse().expect("parse the expected index");
+            assert_eq!(device.id().value(), index, "re-attached, not re-created");
+        }
+        assert_eq!(device.snapshot().expect("snapshot").name, name);
+
+        device.unpersist().expect("clear persistence");
+        assert!(!linux_is_persistent(&name), "unpersist clears IFF_PERSIST");
+        drop(device);
+        assert!(
+            linux_interface_is_gone(&name),
+            "{name} survived its last handle after unpersist"
+        );
+        eprintln!("step B: {name} re-attached, unpersisted, and removed");
     }
 
     #[test]
@@ -2819,12 +3128,13 @@ mod privileged_tests {
     /// itself. A failure (the device is already gone) is ignored, and it
     /// runs on unwind, not on a hard abort.
     ///
-    /// A Linux TUN/TAP device is non-persistent, so closing its handle, at
-    /// the latest when the test process exits, removes it as well. A macOS
-    /// `feth` pair is different: it is a cloned interface that outlives the
-    /// process, so after a failed test (whose drain thread still holds the
-    /// device) these guards, one per `feth`, are its only cleanup. A hard
-    /// abort would leak it; CI runners are ephemeral.
+    /// A non-persistent Linux TUN/TAP device goes away when its handle
+    /// closes, at the latest when the test process exits. A device a
+    /// persistence test made persistent, and a macOS `feth` pair (a cloned
+    /// interface), both outlive the process, so after a failed test these
+    /// guards are their only cleanup. A hard abort would leak them; CI
+    /// runners are ephemeral, and the Linux job fails if a TUN/TAP device
+    /// is left behind.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct RemoveOnDrop {
         program: &'static str,

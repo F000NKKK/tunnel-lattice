@@ -115,8 +115,15 @@ pub struct DeviceConfig {
     /// - Linux: a device of the other kind, a multi-queue mismatch (see
     ///   [`Self::multi_queue`]), or a non-multi-queue device that already has
     ///   a queue attached fails with [`Error::AlreadyExists`]. A persistent
-    ///   device of the same kind with no queue attached is **re-attached**:
-    ///   the handle joins it, and dropping the handle does not delete it.
+    ///   device of the same kind and multi-queue setting with no queue
+    ///   attached is **re-attached**: the handle joins it, and dropping the
+    ///   handle does not delete it (`PersistentDevice::unpersist` lets it go
+    ///   away with its last handle). With `multi_queue`, so is any live
+    ///   multi-queue device of the same kind, including one another process
+    ///   has open (see [`Self::multi_queue`]). This is how a persistent
+    ///   device is reopened by a later process; there is no separate attach
+    ///   call, and a successful `open` does not say whether it attached to
+    ///   an existing device or created a new one.
     /// - Windows TUN: an existing Wintun adapter with this name is
     ///   **adopted**: the handle uses it, and dropping the handle does not
     ///   delete it. A same-named adapter that is not a Wintun adapter makes
@@ -138,7 +145,9 @@ pub struct DeviceConfig {
     /// the attach never deletes the device: dropping the handle detaches
     /// only its own queue. Use a name nobody else uses (or `None`) if
     /// sharing is not intended. A multi-queue mismatch with an existing
-    /// device fails with [`Error::AlreadyExists`].
+    /// device fails with [`Error::AlreadyExists`], so re-attaching to a
+    /// persistent device needs the setting it was created with. `open`
+    /// does not report whether it attached or created.
     pub multi_queue: bool,
     /// A requested MAC address for a TAP device; `None` lets the OS or
     /// driver assign one.

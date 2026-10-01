@@ -12,11 +12,13 @@ bitflags::bitflags! {
         /// The backend can change an open device's MTU or administrative
         /// state after creation, through [`crate::DeviceMutator`].
         const DEVICE_MUTATION = 1 << 0;
-        /// The backend implements [`crate::PersistentDevice`], and attaches
-        /// to a pre-existing persistent device requested by name rather
-        /// than only ever creating a fresh, non-persistent one (the latter
-        /// is ordinary kernel `TUNSETIFF`-by-name behavior on Linux, not
-        /// something this crate implements itself).
+        /// The backend implements [`crate::PersistentDevice`]: it can mark a
+        /// device to survive its last handle closing and clear that again,
+        /// and opening the same name, kind, and multi-queue setting
+        /// attaches to such a device rather than creating a new one (on
+        /// Linux this is the kernel's own `TUNSETIFF`-by-name behavior; the
+        /// persistence flag is the kernel's `TUNSETPERSIST`, which sets or
+        /// clears it).
         const PERSISTENT_DEVICES = 1 << 1;
         /// The backend can open a TAP (Ethernet-framed) device, not only TUN.
         /// Some platforms/drivers support TUN only.

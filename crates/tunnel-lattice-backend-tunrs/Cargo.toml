@@ -47,8 +47,9 @@ futures = { workspace = true, optional = true }
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
 
 # `if_nametoindex`, used by `open` to tell an existing-name conflict apart
-# from other `EINVAL`/`EBUSY` failures. Already locked via tun-rs; adds no
-# package to Cargo.lock.
+# from other `EINVAL`/`EBUSY` failures, and on Linux the `TUNSETPERSIST`
+# ioctl `unpersist` issues itself (tun-rs can only set the flag). Already
+# locked via tun-rs; adds no package to Cargo.lock.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2.189"
 

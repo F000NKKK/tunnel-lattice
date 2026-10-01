@@ -14,8 +14,8 @@
 //! synchronous packet transfer on an open device, [`DeviceMutator`] for
 //! post-open MTU/administrative-state changes gated by `Capability`,
 //! [`CapabilityProvider`] for the runtime feature-flag contract,
-//! [`PersistentDevice`] for marking a device to survive process exit
-//! (`Capability::PERSISTENT_DEVICES`), and [`MultiQueueProvider`] for
+//! [`PersistentDevice`] for marking a device to survive process exit and
+//! clearing that again (`Capability::PERSISTENT_DEVICES`), and [`MultiQueueProvider`] for
 //! duplicating a hardware-scheduled queue (`Capability::MULTI_QUEUE`). The
 //! `async` feature additionally provides [`AsyncPacketIo`] for a native
 //! async transfer path — see that trait's docs for when a backend should

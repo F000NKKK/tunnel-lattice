@@ -337,11 +337,23 @@ impl<D> Handle<D>
 where
     D: PersistentDevice,
 {
-    /// Marks this device persistent — see [`PersistentDevice`]'s docs.
-    /// Requires `Capability::PERSISTENT_DEVICES`; only `TunRsDevice` on
-    /// Linux implements this today.
+    /// Marks this device persistent, so it survives its last handle closing
+    /// (including this process exiting) — see [`PersistentDevice`]'s docs.
+    /// A later process re-attaches by opening the same name, kind, and
+    /// multi-queue setting. Requires `Capability::PERSISTENT_DEVICES`; only
+    /// `TunRsDevice` on Linux implements this today.
     pub fn persist(&self) -> Result<()> {
         self.device.persist()
+    }
+
+    /// Clears persistence, so the device is destroyed when its last handle
+    /// (in any process) closes — see [`PersistentDevice`]'s docs.
+    /// Idempotent, and works from any handle or queue attached to the
+    /// device, including one re-attached by name in another process.
+    /// Requires `Capability::PERSISTENT_DEVICES`; only `TunRsDevice` on
+    /// Linux implements this today.
+    pub fn unpersist(&self) -> Result<()> {
+        self.device.unpersist()
     }
 }
 
