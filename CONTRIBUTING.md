@@ -65,6 +65,37 @@ documentation must be copied from such a recorded `results.md`, with its
 footer, never typed in by hand. See `bench/forwarder/README.md` for the
 method and the variants.
 
+### Real-device latency benchmark
+
+The `device` bench of the `tunnel-lattice` crate
+(`crates/tunnel-lattice/benches/device/`) opens a real TUN device, and a
+TAP device where the host supports one (Linux `tap`, macOS `feth`, Windows
+`tap0901`), on Linux, macOS and Windows. It echoes UDP datagrams back
+through the device and measures round-trip latency (p50/p99) and the echo
+rate of each packet path: synchronous `recv`/`send`, the native async
+`packet_stream` + `send_async` (with the `tokio` or `async-io` feature) and
+the thread bridge. It needs root or Administrator and does nothing unless
+`TUNNEL_LATTICE_PRIVILEGED_BENCH=1` is set, so a plain `cargo bench` or
+`cargo test` never touches the host's interfaces. Build unprivileged, then
+run only the built binary with privileges:
+
+```sh
+cargo bench -p tunnel-lattice --bench device --no-run   # prints the executable
+sudo env TUNNEL_LATTICE_PRIVILEGED_BENCH=1 \
+  TUNNEL_LATTICE_BENCH_OUT=target/bench-device \
+  target/release/deps/device-<hash> --bench
+```
+
+Add `--no-default-features --features tun-rs,tokio` (or `tun-rs,async-io`)
+to measure the async paths. `TUNNEL_LATTICE_BENCH_RTTS`, `_SECS`, `_WINDOW`
+and `_KINDS` (`tun,tap`) adjust the run; the module documentation in
+`benches/device/main.rs` describes the method. Each device is torn down
+before the next case starts, and the bench exits non-zero if any case
+failed. The `Device benchmark` workflow runs it manually on all three
+platforms in each feature set and uploads the JSON and Markdown results;
+as with the forwarder, published numbers must come from such a recorded
+run.
+
 ## Reporting Issues
 
 Please use the issue templates under `.github/ISSUE_TEMPLATE/` when filing
