@@ -126,8 +126,8 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         features:
           # `facade_flags` selects the same feature set for the
-          # `tunnel-lattice` facade's own ignored tests, which exist only
-          # with an async feature (none for `default`).
+          # `tunnel-lattice` facade's own ignored tests (the default
+          # feature set needs no flags there either).
           - name: default
             flags: ""
             facade_flags: ""
@@ -252,12 +252,13 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --skip persist_cross_process_ --nocapture
 
-      # The facade's own `privileged_tests` (`packet_stream` dispatch and
-      # `send_async` on a real TUN device), unit tests only (`--lib`): the
-      # integration tests and doctests need no privilege and already run in
-      # the `ci` job.
+      # The facade's own `privileged_tests` on a real device, in every
+      # feature set: the exact `capabilities()` sets for TUN and TAP, and
+      # with an async feature `packet_stream` dispatch and `send_async`.
+      # Unit tests only (`--lib`): the integration tests and doctests need
+      # no privilege and already run in the `ci` job.
       - name: cargo test -p tunnel-lattice --lib -- --ignored (Linux/macOS, sudo)
-        if: matrix.os != 'windows-latest' && matrix.features.name != 'default'
+        if: matrix.os != 'windows-latest'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
 
       # Every Linux TUN/TAP device the privileged tests create goes away
@@ -303,9 +304,11 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo test -p tunnel-lattice-backend-tunrs ${{ matrix.features.flags }} -- --ignored --skip windows_missing_driver_ --nocapture
 
-      # Runs after "Download wintun.dll": these open a TUN device.
+      # Runs after "Download wintun.dll" and after staging the TAP driver:
+      # these open TUN and TAP devices, and the capability tests expect
+      # `TAP_DEVICES` to be reported.
       - name: cargo test -p tunnel-lattice --lib -- --ignored (Windows)
-        if: matrix.os == 'windows-latest' && matrix.features.name != 'default'
+        if: matrix.os == 'windows-latest'
         run: cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
 
       # Every TAP adapter the privileged tests create is non-persistent and
