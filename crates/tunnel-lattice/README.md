@@ -300,7 +300,8 @@ is no separate attach call, and `open` does not report whether it attached
 or created a new device; a kind or multi-queue mismatch fails with
 `Error::AlreadyExists`). `Handle::unpersist` clears persistence from any
 handle or queue, so the device is removed once every handle to it, in any
-process, is closed:
+process, is closed. Like `persist`, it exists only on Linux, so this
+example does not compile on Windows or macOS either:
 
 ```rust,no_run
 use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};

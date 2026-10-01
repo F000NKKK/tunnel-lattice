@@ -252,9 +252,13 @@ fn main() -> tunnel_lattice::Result<()> {
 }
 ```
 
+`persist` and `additional_queue` exist only on Linux, so this example does
+not compile on Windows or macOS.
+
 A later process re-attaches by opening the same name, kind, and
 multi-queue setting, and can clear persistence so the device goes away
-with its last handle:
+with its last handle. `unpersist` is Linux-only too, so this example does
+not compile on Windows or macOS either:
 
 ```rust,no_run
 use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
