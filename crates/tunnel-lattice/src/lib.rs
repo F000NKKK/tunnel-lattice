@@ -737,9 +737,11 @@ mod privileged_tests {
 
     /// The 16-bit one's-complement sum of `bytes` (RFC 1071).
     fn ones_complement_sum(bytes: &[u8]) -> u16 {
-        let mut sum = bytes
-            .chunks_exact(2)
-            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+        let (words, rest) = bytes.as_chunks::<2>();
+        assert!(rest.is_empty(), "an even number of bytes");
+        let mut sum = words
+            .iter()
+            .map(|word| u32::from(u16::from_be_bytes(*word)))
             .sum::<u32>();
         while sum > 0xffff {
             sum = (sum & 0xffff) + (sum >> 16);
