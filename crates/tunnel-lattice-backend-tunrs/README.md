@@ -66,9 +66,14 @@ error into a typed `tunnel_lattice_core::Error`.
   `Capability::NATIVE_ASYNC`. Without either feature, the handle is a
   `tun_rs::SyncDevice` and `PacketIo` calls it directly.
 - ✅ Administrative-state read-back (`DeviceObserver::snapshot`'s
-  `AdminState`) is exact only on Linux (`tun_rs`'s `is_running`); macOS,
-  Windows, and BSD expose only a write-only `enabled(bool)` setter with no
-  corresponding getter, so `snapshot()` reports `AdminState::Unknown` there.
+  `AdminState`) is read from the host on every call, meaning
+  "administratively up and able to pass packets": on Linux through
+  `tun_rs`'s `is_running` (`IFF_UP` and `IFF_RUNNING`), on macOS from the
+  same interface flags (`SIOCGIFFLAGS`), and on Windows from the
+  adapter's operational status (`GetIfEntry2`). Windows applies a change
+  asynchronously, so a `snapshot()` taken right after `apply` can still
+  show the previous state for a moment. Other targets report
+  `AdminState::Unknown`.
 - 🐧 `PersistentDevice`/`MultiQueueProvider`, both Linux-only: `TunRsDevice`
   implements them on Linux and does not implement them at all elsewhere
   (verified in `tun-rs`'s source — the underlying `persist`/`multi_queue`/
@@ -91,8 +96,8 @@ error into a typed `tunnel_lattice_core::Error`.
 | **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via Wintun (`wintun.dll`), TAP via tap-windows6 |
 | **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via `utun`, TAP via `feth` pairs and BPF |
 
-✅ tested in CI on real devices. Administrative-state read-back is exact
-only on Linux; elsewhere `snapshot()` reports `AdminState::Unknown`.
+✅ tested in CI on real devices, including administrative-state read-back
+following `apply` on each platform and kind.
 
 ## 🧩 Host-level capabilities
 
@@ -227,21 +232,38 @@ disabled underneath the handle, before the general table above:
 | Linux                | `ENXIO` (mapped for symmetry with macOS; the Linux tun driver does not return it on read or write) | `Disconnected` |
 | Windows TUN (`send`) | Wintun reports the adapter terminating, which `tun-rs` returns as `io::ErrorKind::WriteZero` without an OS code | `Disconnected` |
 | Windows TUN          | `"The interface has been disabled"` (no OS code; exact message pinned against `tun-rs` 2.8.11), after the adapter was disabled, for example by applying `DesiredAdminState::Down` | `InvalidState` |
+| Linux (`send`)       | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | `InvalidState` |
+| Windows TAP          | `ERROR_OPERATION_ABORTED` (995): the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this crate | `InvalidState` |
 
-The disabled Wintun adapter is not `Disconnected`: applying
-`DesiredAdminState::Up` starts a new session and the same handle works
-again. The rules match raw OS codes only on the platform they belong to
-(code 6 is `ENXIO` on Linux and macOS but a different error on Windows;
-macOS has no `EBADFD`), and `WriteZero` and `EFAULT` are remapped on one
-direction only (`send` and `recv` respectively).
+`InvalidState` from `recv` or `send` means the device exists but is down
+or disabled. When applying `DesiredAdminState::Down` caused it, applying
+`DesiredAdminState::Up` on the same handle recovers it: the disabled
+Wintun adapter starts a new session, a down Linux TUN/TAP device sends
+again, and a Windows TAP adapter's media is connected again. The Linux tun
+driver returns `EIO` from a write
+only for a down device. The rules match raw OS codes only on the platform
+they belong to (code 6 is `ENXIO` on Linux and macOS but a different error
+on Windows; macOS has no `EBADFD`; code 5 is mapped on Linux only; code
+995 is mapped on a Windows TAP handle only, not on Wintun), and
+`WriteZero`, `EIO`, and `EFAULT` are remapped on one direction only
+(`send`, `send`, and `recv` respectively).
 
-A Linux TAP device that is administratively down is not in this table: the
-kernel refuses `send` with `EIO`, which is reported as
-`Error::Platform(PlatformErrorCode::Linux(5))`, and applying
-`DesiredAdminState::Up` makes the same handle send again. A TAP frame
-shorter than an Ethernet header (14 bytes) is refused with `EINVAL`
-(`Error::Platform(PlatformErrorCode::Linux(22))`) whether the device is up
-or down.
+A down device does not fail every call:
+
+- On Linux, `recv` on a down device does not fail; it waits until a
+  packet arrives, the device comes up, or it is deleted. A TAP frame
+  shorter than an Ethernet header (14 bytes) is refused with `EINVAL`
+  (`Error::Platform(PlatformErrorCode::Linux(22))`) whether the device is
+  up or down: the kernel checks the length first.
+- On macOS, `send` on a down `utun` or `feth` still accepts the packet.
+- On Windows TAP, applying `DesiredAdminState::Down` disconnects the
+  adapter's media, and `send` and `recv` then fail at once with
+  `InvalidState` until `DesiredAdminState::Up` is applied; after that a
+  `recv` waits for traffic again. Disabling the adapter outside this
+  crate (for example with `Disable-NetAdapter`) ends a waiting `recv`
+  with the same native code and so also with `InvalidState`, but applying
+  `DesiredAdminState::Up` does not undo `Disable-NetAdapter`; only
+  re-enabling the adapter the same way does.
 
 On Linux, a blocking `recv` that is already waiting when the device is
 deleted is woken by the kernel with `EFAULT` rather than `EBADFD`; later
@@ -354,6 +376,7 @@ such end-to-end check.
 | macOS TUN (`utun`) | the unit is in use                                                 | `AlreadyExists` |
 | Windows TAP        | any adapter with that name                                         | `AlreadyExists`; the adapter is untouched |
 | Windows TUN        | a Wintun adapter                                                   | adopted; not deleted on drop |
+| Windows TUN        | a Wintun adapter whose session another handle still holds          | `Platform(Windows(1247))` (`ERROR_ALREADY_INITIALIZED`); the other handle keeps working |
 | Windows TUN        | a non-Wintun adapter                                               | `Platform(Windows(code))` |
 
 On macOS and Windows this relies on disabling `tun-rs`'s `reuse_dev`
@@ -439,8 +462,9 @@ drops), so none has to be created in advance. This project's CI stages
 tap-windows6 9.27.0 that way, after checking the archive's SHA-256 and the
 driver catalog's signature, and runs the TAP tests against it: open and
 snapshot, a MAC set at creation, MTU changes, sending a frame, an oversize
-receive, an existing adapter name, and a waiting `recv` that returns once
-the adapter is disabled. See `tun-rs`'s own README for
+receive, an existing adapter name, a requested name, administrative state
+following `apply`, and a waiting `recv` that returns once the adapter is
+disabled. See `tun-rs`'s own README for
 details neither this crate nor `tunnel-lattice` re-derives.
 
 ## 🔀 Persistent devices and multi-queue

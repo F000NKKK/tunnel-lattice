@@ -153,7 +153,20 @@ Linux `EFAULT` on `recv` only (a blocking read already waiting when the
 device was deleted), and Wintun's send-side "adapter terminating" signal
 on Windows. A Wintun adapter that was disabled (for example by applying
 `DesiredAdminState::Down`) reports `InvalidState` instead, because applying
-`Up` recovers the same handle. These rules match raw OS codes only on the
+`Up` recovers the same handle, and so does Linux `send` on an
+administratively down TUN/TAP device: the tun driver returns raw `EIO`
+from a write only for that case. On a Windows TAP handle, applying
+`Down` disconnects the adapter's media, and tap-windows then fails both
+`send` and `recv` at once with raw `ERROR_OPERATION_ABORTED` (995); that
+code is `InvalidState` on a TAP handle only (the rule takes the device
+kind as well as the OS), since applying `Up` recovers the same handle.
+`InvalidState` from `recv`/`send` means "the device exists but is down or
+disabled"; when `apply(Down)` caused it, `apply(Up)` on the same handle
+recovers it. A down Linux device makes `recv` wait rather than fail, and a
+down macOS device still accepts `send`. A Windows TAP adapter disabled
+outside the crate (`Disable-NetAdapter`) fails with the same code and so
+also reports `InvalidState`, although only re-enabling it outside the
+crate recovers it. These rules match raw OS codes only on the
 OS they belong to, and a raw-coded error is never matched through `kind()`
 (which `std` decodes with the running host's code table); only the
 code-less Wintun errors are matched by kind and message. Every rule is
@@ -182,8 +195,8 @@ every precondition before any native call:
   handle without `Capability::MAC_MUTATION`, returns `Unsupported`.
 
 It then applies the MTU, then the MAC address, then the administrative
-state, which goes last because it cannot be read back off Linux and so
-cannot be reverted. If a step fails, it reverts the earlier steps in
+state, which goes last so that no later step can fail after it and it never
+needs reverting. If a step fails, it reverts the earlier steps in
 reverse order on a best-effort basis and returns the failed step's own
 error. To make that revert possible it reads the previous MTU and MAC
 first, but only when a later step exists. There is no
@@ -266,7 +279,7 @@ macOS/Windows at all (not merely "ignored" — the methods don't exist there).
 Both platform traits are still declared unconditionally in
 `tunnel-lattice-platform`, since the contract itself is generic; only the
 `tunnel-lattice-backend-tunrs` implementation is `#[cfg(target_os =
-"linux")]`-gated, the same pattern as `AdminState` read-back.
+"linux")]`-gated.
 
 - **Persistence** (`Handle::persist`, `Handle::unpersist`) marks an open
   device to survive its last handle closing (including process exit), and

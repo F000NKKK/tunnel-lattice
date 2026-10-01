@@ -126,8 +126,12 @@ pub struct DeviceConfig {
     ///   an existing device or created a new one.
     /// - Windows TUN: an existing Wintun adapter with this name is
     ///   **adopted**: the handle uses it, and dropping the handle does not
-    ///   delete it. A same-named adapter that is not a Wintun adapter makes
-    ///   `open` fail with a platform error.
+    ///   delete it. While another handle still holds the adapter's session,
+    ///   Wintun refuses a second one: `open` fails with
+    ///   `Error::Platform(PlatformErrorCode::Windows(1247))`
+    ///   (`ERROR_ALREADY_INITIALIZED`) and the other handle keeps working.
+    ///   A same-named adapter that is not a Wintun adapter makes `open`
+    ///   fail with a platform error.
     pub name: Option<String>,
     /// A requested MTU, applied at creation where the platform allows it.
     pub mtu: Option<u32>,

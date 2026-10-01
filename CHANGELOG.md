@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A down device's `send` is `InvalidState` on Linux and Windows TAP.**
+  On Linux, `send` on an administratively down TUN or TAP device now
+  returns `Error::InvalidState` instead of
+  `Error::Platform(PlatformErrorCode::Linux(5))`: the Linux tun driver
+  returns `EIO` from a write only for a down device, so the raw code is
+  matched on Linux `send` only. On Windows TAP, applying
+  `DesiredAdminState::Down` disconnects the adapter's media, after which
+  `send` and `recv` both fail at once with `ERROR_OPERATION_ABORTED`; that
+  code on a Windows TAP handle is now `Error::InvalidState` on both
+  directions instead of `Error::Platform(PlatformErrorCode::Windows(995))`.
+  In both cases applying `DesiredAdminState::Up` on the same handle makes
+  it work again, as it already did for a disabled Wintun adapter.
+  `InvalidState` from `recv` or `send` now means "the device exists but is
+  down or disabled". A Windows TAP adapter disabled outside this API (for
+  example with `Disable-NetAdapter`) fails with the same code and so is
+  also `InvalidState` now, but only re-enabling it the same way recovers
+  it. Documented alongside: `recv` on a down Linux device waits instead of
+  failing, and on macOS `send` on a down device still succeeds.
+
+- **`snapshot()` reads the administrative state on macOS and Windows.**
+  `DeviceObserver::snapshot` now reports `AdminState::Up`/`Down` on macOS
+  (interface flags: `IFF_UP` and `IFF_RUNNING`, as on Linux) and on
+  Windows (the adapter's operational status) instead of
+  `AdminState::Unknown`; on Windows a change made by `apply` can take a
+  moment to show. Other targets still report `Unknown`. The backend's
+  `windows-sys` dependency enables two more features that `tun-rs`
+  already enables, so no package is added. New privileged tests check, on
+  every platform, kind, and feature set, that the state follows `apply`,
+  what `send` and `recv` do on a down device, and that a requested name
+  comes back exactly.
+
+- **Wintun adoption checked on real devices, test-only.** On Windows,
+  opening the name of an existing Wintun adapter adopts it, and a
+  privileged test now checks that dropping the adopting handle leaves the
+  adapter in place while the handle that created it keeps working and
+  removes it on drop. A second open of an adapter whose session another
+  handle still holds fails with
+  `Error::Platform(PlatformErrorCode::Windows(1247))`
+  (`ERROR_ALREADY_INITIALIZED`) and leaves the existing handle working;
+  the test asserts exactly that and the `DeviceConfig::name` and backend
+  documentation say so.
+
+- **Test hygiene.** The oversize-receive test reports a panicking receiver
+  thread as such rather than as a timeout, and joins its sender thread
+  last, so a sender panic can no longer skip releasing the waiting
+  `recv`. The Windows TAP disable test measures its latency from the start
+  of the disable call. The Windows privileged job now also fails if a
+  `tunnel-lattice-test-echo-*` firewall rule is left behind.
+
 - **Concurrent `recv`/`send` through cloned `Handle`s checked on real
   devices, test-only.** The `Handle` contract's claim that clones of one
   handle can receive and send concurrently on Linux, macOS, and Windows is
@@ -142,9 +191,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`feth`), open and snapshot of a TAP device (kind, MAC, MTU set at open,
   `recv_buffer_len`) and an MTU change by `apply` that reads back (on macOS
   on both `feth` interfaces of the pair); on Linux, admin state toggled
-  down and up by `apply`, with `send` on a down device reported as
-  `Error::Platform(PlatformErrorCode::Linux(5))` (`EIO`) and a frame
-  shorter than an Ethernet header as `Linux(22)` (`EINVAL`), the mappings
+  down and up by `apply`, with `send` on a down device refused (now
+  reported as `Error::InvalidState`, see "Down-device `send` on Linux"
+  below) and a frame shorter than an Ethernet header reported as
+  `Error::Platform(PlatformErrorCode::Linux(22))` (`EINVAL`), the mapping
   this crate already had, now pinned; on macOS, sending a 42-byte frame and
   `AlreadyExists` for an existing `feth` name, with the existing interface
   left intact; on Windows, a waiting `recv` that returns once the TAP
