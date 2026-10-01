@@ -1887,6 +1887,15 @@ mod privileged_tests {
     /// thread so a missing packet fails the test after 60 s instead of
     /// hanging it. Nothing outside the test's own device is changed: the
     /// address is assigned to that device and removed with it.
+    ///
+    /// On that timeout the receiver is still waiting in `recv` and holds a
+    /// reference to the device, so the device could not be torn down when
+    /// the test panics; a macOS `feth` pair and a Windows TAP adapter would
+    /// then outlive the test process. The helper therefore first makes the
+    /// waiting `recv` return ([`release_waiting_recv`]), waits for the
+    /// receiver thread to finish, and drops the device before it panics. If
+    /// the receiver still does not return, the panic message says so, and
+    /// the CI leak checks report the device.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn assert_oversize_packet_is_rejected_then_next_recv_succeeds(
         kind: DeviceKind,
@@ -1914,7 +1923,7 @@ mod privileged_tests {
         // guards; its peer (where the BPF descriptor reads) must be up to
         // receive the frames the host sends out of `dev`.
         #[cfg(target_os = "macos")]
-        let _feth = (kind == DeviceKind::Tap).then(|| {
+        let feth_pair = (kind == DeviceKind::Tap).then(|| {
             let feth = guard_feth_pair(&snapshot.name);
             run_host_command("ifconfig", &[&feth.peer, "up"]);
             feth
@@ -1938,7 +1947,7 @@ mod privileged_tests {
         };
 
         let (done, outcome) = std::sync::mpsc::channel();
-        {
+        let receiver = {
             let device = Arc::clone(&device);
             #[cfg(feature = "tokio")]
             let runtime = runtime.handle().clone();
@@ -1972,16 +1981,102 @@ mod privileged_tests {
                     };
                 }
                 let _ = done.send(result);
-            });
-        }
+            })
+        };
 
-        let outcome = outcome.recv_timeout(Duration::from_secs(60));
+        let first = outcome.recv_timeout(Duration::from_secs(60));
         stop.store(true, Ordering::Release);
         sender.join().expect("the sender thread does not panic");
-        match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => panic!("{kind:?}: {message}"),
-            Err(_) => panic!("{kind:?}: no packet arrived within 60 s"),
+        let (failure, receiver_returned) = match first {
+            Ok(Ok(())) => (None, true),
+            Ok(Err(message)) => (Some(message), true),
+            Err(_) => {
+                #[cfg(target_os = "macos")]
+                let feth_peer = feth_pair.as_ref().map(|feth| feth.peer.as_str());
+                #[cfg(not(target_os = "macos"))]
+                let feth_peer = None;
+                release_waiting_recv(&device, &snapshot.name, feth_peer);
+                let returned = outcome.recv_timeout(Duration::from_secs(30)).is_ok();
+                let message = if returned {
+                    "no packet arrived within 60 s".to_owned()
+                } else {
+                    "no packet arrived within 60 s, and the receiver did not return once \
+                     released: the device may outlive the test"
+                        .to_owned()
+                };
+                (Some(message), returned)
+            }
+        };
+        if receiver_returned {
+            // It has sent its result; joining waits for its reference to
+            // the device to drop, so the `drop` below tears the device down.
+            receiver.join().expect("the receiver thread does not panic");
+        }
+        drop(device);
+        if let Some(message) = failure {
+            panic!("{kind:?}: {message}");
+        }
+    }
+
+    /// Makes a `recv` waiting on the test's own device return, best effort
+    /// (failures are ignored), so a failing test's receiver thread lets go
+    /// of the device before the test panics. Each mechanism is the one a
+    /// test in this module shows ends a waiting `recv`:
+    ///
+    /// - Linux: `ip link del` (`recv_returns_disconnected_when_the_device_
+    ///   is_deleted_on_linux`);
+    /// - macOS TAP: destroying the peer `feth` (`recv_returns_disconnected_
+    ///   when_the_feth_is_destroyed_on_macos`);
+    /// - Windows TUN: `apply(Down)`, which ends the Wintun session
+    ///   (`tun_stream_ends_when_the_wintun_adapter_is_disabled_on_windows`);
+    /// - Windows TAP: `Disable-NetAdapter` (`windows_tap_recv_returns_once_
+    ///   the_adapter_is_disabled`).
+    ///
+    /// A macOS `utun` cannot be destroyed from outside, so nothing is done
+    /// for it; like every Linux device and a Wintun adapter, it goes away
+    /// when the test process exits, which a `feth` pair and a tap-windows6
+    /// adapter do not.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn release_waiting_recv(device: &TunRsDevice, name: &str, feth_peer: Option<&str>) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (device, feth_peer);
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", name])
+                .output();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (device, name);
+            if let Some(peer) = feth_peer {
+                let _ = std::process::Command::new("ifconfig")
+                    .args([peer, "destroy"])
+                    .output();
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = feth_peer;
+            match device.kind {
+                DeviceKind::Tap => {
+                    let _ = std::process::Command::new("powershell")
+                        .args([
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            &format!("Disable-NetAdapter -Name '{name}' -Confirm:$false"),
+                        ])
+                        .output();
+                }
+                _ => {
+                    use tunnel_lattice_model::DesiredAdminState;
+                    if let Ok(patch) =
+                        DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
+                    {
+                        let _ = device.apply(patch);
+                    }
+                }
+            }
         }
     }
 
@@ -1989,6 +2084,29 @@ mod privileged_tests {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn subnet_octet() -> u8 {
         u8::try_from(std::process::id() % 200).expect("below 200") + 20
+    }
+
+    /// A 42-byte broadcast ARP request from `mac` (the smallest common
+    /// Ethernet frame, before padding): sender `mac` at 169.254.0.1, asking
+    /// for 169.254.0.2. Link-local addresses, so a host that receives it
+    /// has nothing to route.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn broadcast_arp_request(mac: MacAddress) -> Vec<u8> {
+        let mac = mac.octets();
+        // Ethernet: broadcast destination, our source, EtherType ARP.
+        let mut frame = Vec::with_capacity(42);
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&mac);
+        frame.extend_from_slice(&[0x08, 0x06]);
+        // ARP request: Ethernet/IPv4, sender our MAC at 169.254.0.1, asking
+        // for 169.254.0.2.
+        frame.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]);
+        frame.extend_from_slice(&mac);
+        frame.extend_from_slice(&[169, 254, 0, 1]);
+        frame.extend_from_slice(&[0; 6]);
+        frame.extend_from_slice(&[169, 254, 0, 2]);
+        assert_eq!(frame.len(), 42);
+        frame
     }
 
     #[test]
@@ -2295,22 +2413,8 @@ mod privileged_tests {
             .snapshot()
             .expect("snapshot the device")
             .mac
-            .expect("a TAP snapshot carries its MAC")
-            .octets();
-
-        // Ethernet: broadcast destination, our source, EtherType ARP.
-        let mut frame = Vec::with_capacity(42);
-        frame.extend_from_slice(&[0xff; 6]);
-        frame.extend_from_slice(&mac);
-        frame.extend_from_slice(&[0x08, 0x06]);
-        // ARP request: Ethernet/IPv4, sender our MAC at 169.254.0.1, asking
-        // for 169.254.0.2.
-        frame.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]);
-        frame.extend_from_slice(&mac);
-        frame.extend_from_slice(&[169, 254, 0, 1]);
-        frame.extend_from_slice(&[0; 6]);
-        frame.extend_from_slice(&[169, 254, 0, 2]);
-        assert_eq!(frame.len(), 42);
+            .expect("a TAP snapshot carries its MAC");
+        let frame = broadcast_arp_request(mac);
 
         let sent = PacketIo::send(&device, &frame);
         assert!(matches!(sent, Ok(42)), "send of a 42-byte frame: {sent:?}");
@@ -2362,6 +2466,72 @@ mod privileged_tests {
             .expect("the first device is still usable after the refused open");
         assert_eq!(snapshot.name, name);
         assert_eq!(snapshot.id, first.id());
+    }
+
+    /// Disabling a Windows TAP adapter with `Disable-NetAdapter` (what
+    /// [`release_waiting_recv`] does for a failing oversize test) makes a
+    /// `recv` waiting on it return an error within 30 s, so the waiting
+    /// thread lets go of the device and the adapter is removed when the
+    /// device drops (the CI leak check confirms nothing is left). Frames
+    /// that arrive first are skipped. The test prints the error.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_recv_returns_once_the_adapter_is_disabled() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(DeviceKind::Tap))
+                .expect("open a TAP device"),
+        );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let buf_len = snapshot.recv_buffer_len();
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        let receiver = {
+            let device = Arc::clone(&device);
+            #[cfg(feature = "tokio")]
+            let runtime = runtime.handle().clone();
+            std::thread::spawn(move || {
+                #[cfg(feature = "tokio")]
+                let _entered = runtime.enter();
+                let mut buf = vec![0u8; buf_len];
+                let err = loop {
+                    if let Err(err) = PacketIo::recv(&*device, &mut buf) {
+                        break err;
+                    }
+                };
+                let _ = done.send(err);
+            })
+        };
+
+        // Let the receiver reach its wait first.
+        std::thread::sleep(Duration::from_millis(500));
+        release_waiting_recv(&device, &snapshot.name, None);
+        let released = Instant::now();
+        match outcome.recv_timeout(Duration::from_secs(30)) {
+            Ok(err) => {
+                eprintln!(
+                    "windows TAP Disable-NetAdapter: recv returned {err:?} after {:?}",
+                    released.elapsed()
+                );
+            }
+            Err(_) => panic!("recv did not return within 30 s of Disable-NetAdapter"),
+        }
+        receiver.join().expect("the receiver thread does not panic");
+        assert_eq!(
+            Arc::strong_count(&device),
+            1,
+            "the receiver let go of the device"
+        );
     }
 
     /// A TAP device opened with a MAC address reports it, reports
@@ -2421,6 +2591,227 @@ mod privileged_tests {
             "{:?}",
             refused.err()
         );
+    }
+
+    /// A TAP device opened with an MTU reports kind `Tap`, a MAC, that MTU,
+    /// and a receive buffer length of MTU + 18; a patch's MTU is read back
+    /// from the next snapshot. On Linux the device reads `Up` right after
+    /// open (`tun-rs` enables it, and a TAP has carrier while its queue is
+    /// attached). On macOS the name is the `dev` side of a `feth` pair,
+    /// there is no administrative-state read (`Unknown`), and the MTU is
+    /// set on both sides of the pair, so the peer's MTU follows too.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[ignore = "requires CAP_NET_ADMIN/root to open a TAP device"]
+    fn tap_open_reports_kind_mac_and_mtu_and_apply_changes_the_mtu() {
+        #[cfg(target_os = "macos")]
+        let _serial = serialize_feth_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap).with_mtu(1400))
+            .expect("open a TAP device");
+        let snapshot = device.snapshot().expect("snapshot the TAP device");
+        #[cfg(target_os = "macos")]
+        let feth = guard_feth_pair(&snapshot.name);
+        eprintln!("TAP snapshot: {snapshot:?}");
+        assert_eq!(snapshot.kind, DeviceKind::Tap);
+        assert_eq!(snapshot.mtu, 1400);
+        assert!(snapshot.mac.is_some(), "a TAP snapshot carries its MAC");
+        assert!(!snapshot.name.is_empty());
+        assert_ne!(device.id().value(), 0, "an OS interface index is never 0");
+        assert_eq!(snapshot.id, device.id());
+        assert_eq!(snapshot.recv_buffer_len(), 1400 + 18);
+        #[cfg(target_os = "linux")]
+        assert_eq!(snapshot.admin_state, AdminState::Up);
+        #[cfg(target_os = "macos")]
+        {
+            assert!(snapshot.name.starts_with("feth"), "{}", snapshot.name);
+            assert_eq!(snapshot.admin_state, AdminState::Unknown);
+            assert_eq!(interface_mtu(&feth.peer), 1400, "the peer feth's MTU");
+        }
+
+        let patch = DeviceConfigPatch::new(device.id(), None, Some(1300)).expect("build a patch");
+        device.apply(patch).expect("apply the MTU patch");
+        let updated = device.snapshot().expect("snapshot after the patch");
+        assert_eq!(updated.mtu, 1300);
+        assert_eq!(updated.recv_buffer_len(), 1300 + 18);
+        #[cfg(target_os = "macos")]
+        assert_eq!(interface_mtu(&feth.peer), 1300, "the peer feth's MTU");
+    }
+
+    /// A Linux TAP device's administrative state follows `apply`, and
+    /// `send` reports the kernel's refusals as they map today (both through
+    /// the general table, as [`Error::Platform`] with the Linux code):
+    ///
+    /// - a frame shorter than an Ethernet header (14 bytes) is refused with
+    ///   `EINVAL` whether the device is up or down (`tun.c` checks the
+    ///   length before the up flag);
+    /// - a whole frame written while the device is down is refused with
+    ///   `EIO`;
+    /// - once the device is up again, the same frame is accepted.
+    ///
+    /// The first send, while up, also makes sure the `tokio` build's write
+    /// readiness has been observed before the device goes down (a down tun
+    /// file does not report itself writable).
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TAP device"]
+    fn tap_admin_state_toggles_and_send_reports_the_kernel_refusals_on_linux() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = unique_linux_name("tadm");
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap).with_name(name.as_str()))
+            .expect("open a TAP device");
+        let snapshot = device.snapshot().expect("snapshot the TAP device");
+        assert_eq!(snapshot.name, name);
+        assert_eq!(snapshot.admin_state, AdminState::Up);
+        let frame = broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"));
+        let runt = &frame[..13];
+        let refused_with = |result: &Result<usize>, errno: i32| matches!(result, Err(Error::Platform(PlatformErrorCode::Linux(code))) if *code == errno);
+        let set_admin = |state| {
+            let patch =
+                DeviceConfigPatch::new(device.id(), Some(state), None).expect("build a patch");
+            device.apply(patch).expect("apply the admin state");
+            device.snapshot().expect("snapshot after apply").admin_state
+        };
+
+        let sent = PacketIo::send(&device, &frame);
+        assert!(matches!(sent, Ok(42)), "send while up: {sent:?}");
+        let sent = PacketIo::send(&device, runt);
+        eprintln!("TAP 13-byte send while up: {sent:?}");
+        assert!(
+            refused_with(&sent, libc::EINVAL),
+            "13-byte send while up: {sent:?}"
+        );
+
+        assert_eq!(set_admin(DesiredAdminState::Down), AdminState::Down);
+        let sent = PacketIo::send(&device, &frame);
+        eprintln!("TAP send while down: {sent:?}");
+        assert!(refused_with(&sent, libc::EIO), "send while down: {sent:?}");
+        let sent = PacketIo::send(&device, runt);
+        assert!(
+            refused_with(&sent, libc::EINVAL),
+            "13-byte send while down: {sent:?}"
+        );
+
+        assert_eq!(set_admin(DesiredAdminState::Up), AdminState::Up);
+        let sent = PacketIo::send(&device, &frame);
+        assert!(matches!(sent, Ok(42)), "send after up again: {sent:?}");
+    }
+
+    /// A 42-byte broadcast ARP request is written to a macOS `feth` TAP
+    /// whole, on the device exactly as `open` left it: `tun-rs` sends
+    /// through an `AF_NDRV` socket on the peer `feth` and does not bring the
+    /// peer up itself. The test prints the peer's interface flags.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open a feth TAP device"]
+    fn tap_sends_a_broadcast_arp_frame_on_macos() {
+        let _serial = serialize_feth_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(DeviceKind::Tap))
+            .expect("open a feth TAP device");
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let feth = guard_feth_pair(&snapshot.name);
+        let peer = std::process::Command::new("ifconfig")
+            .arg(&feth.peer)
+            .output()
+            .expect("run ifconfig");
+        eprintln!(
+            "feth send: dev {}, peer {}",
+            snapshot.name,
+            String::from_utf8_lossy(&peer.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+        );
+
+        let frame = broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"));
+        let sent = PacketIo::send(&device, &frame);
+        assert!(matches!(sent, Ok(42)), "send of a 42-byte frame: {sent:?}");
+    }
+
+    /// Opening a macOS TAP under the name of an existing `feth` fails with
+    /// `AlreadyExists` (the backend turns `tun-rs`'s interface reuse off),
+    /// and the existing interface survives: both for this backend's own
+    /// device, which stays usable, and for a `feth` created outside it,
+    /// which `tun-rs` would otherwise adopt and destroy on drop. The names
+    /// are unique to this test process; the outside `feth` gets a teardown
+    /// guard, this backend's pair the usual guards.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open a feth TAP device"]
+    fn tap_open_of_an_existing_feth_name_reports_already_exists_on_macos() {
+        let _serial = serialize_feth_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let unit = 1000 + std::process::id() % 9000;
+        let ours = format!("feth{unit}");
+        let foreign = format!("feth{}", unit + 10_000);
+        let backend = TunRsBackend::new();
+
+        let first = backend
+            .open(DeviceConfig::new(DeviceKind::Tap).with_name(ours.as_str()))
+            .expect("open the first feth TAP device");
+        let _first_pair = guard_feth_pair(&ours);
+        assert_eq!(first.snapshot().expect("snapshot the first").name, ours);
+        let second = backend.open(DeviceConfig::new(DeviceKind::Tap).with_name(ours.as_str()));
+        assert!(
+            matches!(second, Err(Error::AlreadyExists)),
+            "second open of an existing feth name should report AlreadyExists, got {:?}",
+            second.err()
+        );
+        let snapshot = first
+            .snapshot()
+            .expect("the first device is still usable after the refused open");
+        assert_eq!(snapshot.name, ours);
+        assert_eq!(snapshot.id, first.id());
+
+        let _foreign_guard = RemoveOnDrop {
+            program: "ifconfig",
+            args: vec![foreign.clone(), "destroy".into()],
+        };
+        run_host_command("ifconfig", &[&foreign, "create"]);
+        let adopted = backend.open(DeviceConfig::new(DeviceKind::Tap).with_name(foreign.as_str()));
+        assert!(
+            matches!(adopted, Err(Error::AlreadyExists)),
+            "opening a feth created outside the backend should report AlreadyExists, got {:?}",
+            adopted.err()
+        );
+        drop(adopted);
+        run_host_command("ifconfig", &[&foreign]);
+    }
+
+    /// The MTU `ifconfig <name>` reports, from its `mtu N` field.
+    #[cfg(target_os = "macos")]
+    fn interface_mtu(name: &str) -> u32 {
+        let output = std::process::Command::new("ifconfig")
+            .arg(name)
+            .output()
+            .unwrap_or_else(|err| panic!("run ifconfig {name}: {err}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .split_whitespace()
+            .skip_while(|word| *word != "mtu")
+            .nth(1)
+            .and_then(|mtu| mtu.parse().ok())
+            .unwrap_or_else(|| panic!("no `mtu` field in `ifconfig {name}`:\n{stdout}"))
     }
 
     /// Runs a host command best-effort on drop: removes the test's own
