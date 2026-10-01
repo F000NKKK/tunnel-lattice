@@ -218,8 +218,21 @@ jobs:
           bcdedit /enum '{current}' | Select-String -Pattern 'testsigning'
           pnputil /add-driver (Join-Path $amd64 'OemVista.inf')
           if ($LASTEXITCODE -notin 0, 3010) { throw "pnputil /add-driver failed with exit code $LASTEXITCODE" }
-          $store = pnputil /enum-drivers | Out-String
-          if ($store -notmatch '(?i)oemvista\.inf') { throw 'tap0901 package not found in the driver store after pnputil /add-driver' }
+          # One `pnputil /enum-drivers` block per package; require the one
+          # this step staged (its original INF name, the provider its INF
+          # declares, and its version), not just any package once called
+          # OemVista.inf.
+          $blocks = (pnputil /enum-drivers | Out-String) -split '\r?\n\s*\r?\n'
+          $staged = @($blocks | Where-Object {
+            $_ -match '(?im)^\s*Original Name:\s*oemvista\.inf\s*$' -and
+            $_ -match '(?im)^\s*Provider Name:\s*TAP-Windows Provider V9\s*$' -and
+            $_ -match "(?im)^\s*Driver Version:.*\b$([regex]::Escape($version))\.0\s*$"
+          })
+          if ($staged.Count -eq 0) {
+            pnputil /enum-drivers /class Net
+            throw "tap-windows6 $version (tap0901) not found in the driver store after pnputil /add-driver"
+          }
+          $staged | Write-Host
           exit 0
 
       # `-p tunnel-lattice-backend-tunrs` only: `privileged_tests` lives
@@ -236,6 +249,21 @@ jobs:
       - name: cargo test -p tunnel-lattice --lib -- --ignored (Linux/macOS, sudo)
         if: matrix.os != 'windows-latest' && matrix.features.name != 'default'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
+
+      # Every Linux TAP device the privileged tests create is non-persistent
+      # and goes away when its handle drops (at the latest when the test
+      # process exits), and the runner starts with none. Fails the job if a
+      # TAP device (`tun type tap` in the link details) is left on the
+      # runner, also after a failed test run.
+      - name: No TAP device left behind (Linux)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: |
+          leftover=$(ip -d -o link show | grep -E '\btun type tap\b' || true)
+          if [ -n "$leftover" ]; then
+            echo "$leftover"
+            echo "::error::TAP devices left behind by the privileged tests: $(echo "$leftover" | awk -F': ' '{print $2}' | tr '\n' ' ')"
+            exit 1
+          fi
 
       # A macOS TAP device is a `feth` interface pair, a cloned interface
       # that outlives the test process, so the privileged tests must tear
