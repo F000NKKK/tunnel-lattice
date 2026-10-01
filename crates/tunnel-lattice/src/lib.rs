@@ -676,12 +676,20 @@ mod stream_tests {
             let mut stream = handle.packet_stream_with_pool(pool.clone());
             let first = futures::executor::block_on(stream.next()).unwrap().unwrap();
             assert_eq!(first, *b"pkt", "native: {native}");
-            assert_eq!(pool.available(), 1);
-            drop(first);
+            // `first` is held across the next item on purpose. The thread
+            // bridge reads ahead: once `first` is queued, its worker takes
+            // the other slot for the next `recv` with no regard to the
+            // consumer, so `available()` right after `first` races it. The
+            // worker releases that slot when its `recv` fails and before it
+            // queues the error, so once the error is received here exactly
+            // `first`'s slot is out, on both branches.
             assert!(matches!(
                 futures::executor::block_on(stream.next()),
                 Some(Err(Error::Disconnected))
             ));
+            assert_eq!(pool.available(), 1, "native: {native}");
+            drop(first);
+            assert_eq!(pool.available(), 2, "native: {native}");
             assert!(futures::executor::block_on(stream.next()).is_none());
         }
     }
