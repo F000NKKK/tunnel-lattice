@@ -1,0 +1,270 @@
+name: Device benchmark
+
+# The privileged real-device benchmark (the `device` bench of the
+# tunnel-lattice facade, crates/tunnel-lattice/benches/device/): round-trip
+# latency and echo throughput of each packet path (sync recv/send, native
+# async packet_stream + send_async, the thread bridge) on a real TUN and TAP
+# device, on Linux, macOS and Windows, in each of the three feature sets.
+#
+# Manual only: it needs root/Administrator, takes a few minutes per job,
+# and its numbers only mean something as a recorded artifact. The ordinary
+# `ci` jobs still build the bench (`clippy --all-targets`); without
+# TUNNEL_LATTICE_PRIVILEGED_BENCH=1 it does nothing.
+#
+# The bench is built unprivileged; only the built binary runs with sudo
+# (Linux, macOS). Windows runners already run as Administrator. Every job
+# uploads its JSON and Markdown results; the `report` job joins the
+# Markdown tables into one file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      secs:
+        description: "Seconds per throughput figure"
+        required: true
+        default: "3"
+      rtts:
+        description: "Round trips per latency figure"
+        required: true
+        default: "2000"
+      window:
+        description: "Datagrams in flight during the throughput phase"
+        required: true
+        default: "64"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: bench (${{ matrix.os }}, ${{ matrix.features.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Never `--all-features`: tun-rs refuses both async runtimes in one
+        # build. The facade's sync path differs once an async feature is
+        # on, so each set is its own build.
+        features:
+          - name: default
+            flags: ""
+          - name: async-io
+            flags: "--no-default-features --features tun-rs,async-io"
+          - name: tokio
+            flags: "--no-default-features --features tun-rs,tokio"
+    steps:
+      - uses: actions/checkout@v7
+
+      # The `runner` context is not available in job-level `env`.
+      - name: Results directory
+        shell: bash
+        run: echo "OUT=$RUNNER_TEMP/bench-device" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: bench-device-${{ matrix.features.name }}
+
+      # The next two steps are copied from ci.yml's `privileged` job (see
+      # the comments there): tun-rs loads wintun.dll at run time for a
+      # Windows TUN device, and a Windows TAP device needs the tap-windows6
+      # (tap0901) driver staged in the driver store.
+      - name: Download wintun.dll (tun-rs's Windows TUN backend)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun
+          echo "$PWD\wintun\wintun\bin\amd64" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Stage the tap-windows6 driver (tap0901) in the driver store (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = '9.27.0'
+          $sha256  = '36E2609B7CEEFEDCB978CE5C48CAF9E0E5AF83423717C4E2E3C1D7EBCA8F62A5'
+          $zip = Join-Path $env:RUNNER_TEMP 'tap-windows6.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'tap-windows6'
+          Invoke-WebRequest -Uri "https://github.com/OpenVPN/tap-windows6/releases/download/$version/dist.win10.zip" -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+          if ($got -ne $sha256) { throw "tap-windows6 $version checksum mismatch: $got" }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $amd64 = Join-Path $dir 'dist.win10\amd64'
+          $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $amd64 'tap0901.cat')
+          if ($sig.Status -ne 'Valid') { throw "tap0901.cat signature is $($sig.Status): $($sig.StatusMessage)" }
+          bcdedit /enum '{current}' | Select-String -Pattern 'testsigning'
+          pnputil /add-driver (Join-Path $amd64 'OemVista.inf')
+          if ($LASTEXITCODE -notin 0, 3010) { throw "pnputil /add-driver failed with exit code $LASTEXITCODE" }
+          $blocks = (pnputil /enum-drivers | Out-String) -split '\r?\n\s*\r?\n'
+          $staged = @($blocks | Where-Object {
+            $_ -match '(?im)^\s*Original Name:\s*oemvista\.inf\s*$' -and
+            $_ -match '(?im)^\s*Provider Name:\s*TAP-Windows Provider V9\s*$' -and
+            $_ -match "(?im)^\s*Driver Version:.*\b$([regex]::Escape($version))\.0\s*$"
+          })
+          if ($staged.Count -eq 0) {
+            pnputil /enum-drivers /class Net
+            throw "tap-windows6 $version (tap0901) not found in the driver store after pnputil /add-driver"
+          }
+          $staged | Write-Host
+          exit 0
+
+      # Baseline for the Linux leak check below.
+      - name: Record existing TUN/TAP devices (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ip -d -o link show | grep -E '\btun type (tun|tap)\b' | awk -F': ' '{print $2}' | sort > "$RUNNER_TEMP/tuntap-before.txt" || true
+          cat "$RUNNER_TEMP/tuntap-before.txt"
+
+      # Unprivileged; records the bench executable's path for the run step.
+      - name: Build the device bench
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench -p tunnel-lattice --bench device ${{ matrix.features.flags }} --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "device" and .executable != null) | .executable' \
+            > "$RUNNER_TEMP/bench-exe.txt"
+          exe="$(tail -n 1 "$RUNNER_TEMP/bench-exe.txt")"
+          if [ -z "$exe" ]; then
+            echo "::error::no executable for the device bench"
+            exit 1
+          fi
+          echo "BENCH_EXE=$exe" >> "$GITHUB_ENV"
+          echo "$exe"
+
+      # sudo resets the environment, so the settings and the runner identity
+      # recorded in the results are passed explicitly.
+      - name: Run the device bench (Linux/macOS, sudo)
+        if: matrix.os != 'windows-latest'
+        env:
+          SECS: ${{ inputs.secs }}
+          RTTS: ${{ inputs.rtts }}
+          WINDOW: ${{ inputs.window }}
+        run: |
+          mkdir -p "$OUT"
+          sudo env "PATH=$PATH" \
+            "TUNNEL_LATTICE_PRIVILEGED_BENCH=1" "TUNNEL_LATTICE_BENCH_OUT=$OUT" \
+            "TUNNEL_LATTICE_BENCH_SECS=$SECS" "TUNNEL_LATTICE_BENCH_RTTS=$RTTS" "TUNNEL_LATTICE_BENCH_WINDOW=$WINDOW" \
+            "GITHUB_SHA=$GITHUB_SHA" "ImageOS=${ImageOS:-}" "ImageVersion=${ImageVersion:-}" \
+            "$BENCH_EXE" --bench
+
+      - name: Run the device bench (Windows, Administrator)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          TUNNEL_LATTICE_PRIVILEGED_BENCH: "1"
+          TUNNEL_LATTICE_BENCH_SECS: ${{ inputs.secs }}
+          TUNNEL_LATTICE_BENCH_RTTS: ${{ inputs.rtts }}
+          TUNNEL_LATTICE_BENCH_WINDOW: ${{ inputs.window }}
+        run: |
+          $env:TUNNEL_LATTICE_BENCH_OUT = $env:OUT
+          New-Item -ItemType Directory -Force -Path $env:OUT | Out-Null
+          & $env:BENCH_EXE --bench
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Take ownership of the results (Linux/macOS)
+        if: ${{ !cancelled() && matrix.os != 'windows-latest' }}
+        run: |
+          if [ -d "$OUT" ]; then sudo chown -R "$(id -u):$(id -g)" "$OUT"; fi
+
+      - name: Results table (job summary) and JSON check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          for md in "$OUT"/*.md; do
+            [ -f "$md" ] && cat "$md" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for json in "$OUT"/*.json; do
+            [ -f "$json" ] && jq empty "$json"
+          done
+          true
+
+      # The bench drops every device it opens; fail the job if one is left
+      # anyway (same checks as ci.yml's `privileged` job).
+      - name: No TUN/TAP device left behind (Linux)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: |
+          touch "$RUNNER_TEMP/tuntap-before.txt"
+          ip -d -o link show | grep -E '\btun type (tun|tap)\b' | awk -F': ' '{print $2}' | sort > "$RUNNER_TEMP/tuntap-after.txt" || true
+          leftover=$(comm -13 "$RUNNER_TEMP/tuntap-before.txt" "$RUNNER_TEMP/tuntap-after.txt")
+          if [ -n "$leftover" ]; then
+            ip -d link show
+            echo "::error::TUN/TAP devices left behind by the device bench: $(echo $leftover)"
+            exit 1
+          fi
+
+      - name: No feth interface left behind (macOS)
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        run: |
+          leftover=$(ifconfig -l | tr ' ' '\n' | grep '^feth' || true)
+          if [ -n "$leftover" ]; then
+            echo "::error::feth interfaces left behind by the device bench: $(echo $leftover)"
+            exit 1
+          fi
+
+      - name: No TAP-Windows adapter or firewall rule left behind (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $left = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { @($_.HardwareID) -match '(?i)^(root\\)?tap0901$' })
+          if ($left.Count -gt 0) {
+            $left | Format-Table Status, FriendlyName, InstanceId -AutoSize | Out-String | Write-Host
+            Write-Host "::error::TAP-Windows adapters left behind by the device bench"
+            exit 1
+          }
+          $rules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'tunnel-lattice-device-bench-*' })
+          if ($rules.Count -gt 0) {
+            $rules | Format-Table DisplayName -AutoSize | Out-String | Write-Host
+            Write-Host "::error::firewall rules left behind by the device bench"
+            exit 1
+          }
+
+      - name: Upload results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-device-${{ matrix.os }}-${{ matrix.features.name }}
+          path: ${{ env.OUT }}
+          if-no-files-found: error
+
+  report:
+    name: report (all platforms)
+    needs: bench
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-device-*
+          path: results
+          merge-multiple: true
+
+      # One file with every table, Linux, macOS, Windows, each in the
+      # default, async-io and tokio builds; a missing job is listed.
+      - name: Join the tables
+        run: |
+          {
+            echo "## Real-device benchmark, run ${GITHUB_RUN_ID} (${GITHUB_SHA::7})"
+            echo
+            for os in linux macos windows; do
+              for build in default async-io tokio; do
+                md="results/device-$os-$build.md"
+                if [ -f "$md" ]; then cat "$md"; else echo "### $os, \`$build\` build: no results"; fi
+                echo
+              done
+            done
+          } > results/device-bench.md
+          cat results/device-bench.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the joined report
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-device-report
+          path: results
+          if-no-files-found: error
