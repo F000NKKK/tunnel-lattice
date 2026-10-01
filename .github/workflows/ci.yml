@@ -117,6 +117,69 @@ jobs:
       - name: cargo +nightly miri test -p tunnel-lattice-async --lib pool
         run: cargo +nightly miri test -p tunnel-lattice-async --lib pool
 
+  # Keeps the iperf3 forwarder benchmark (bench/forwarder,
+  # scripts/bench-forward.sh) building, linted and tested on every push and
+  # pull request. bench/forwarder is a standalone workspace, not a root
+  # workspace member, so the `ci` job's `--workspace` steps do not cover it.
+  # It runs unfiltered (no `paths:`), so it can be a required check; the
+  # benchmark itself runs only on demand, in bench-forward.yml.
+  bench-forwarder:
+    name: bench-forwarder (check)
+    runs-on: ubuntu-latest
+    # The standalone workspace would otherwise build into
+    # bench/forwarder/target/, which the root .gitignore does not cover.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/forwarder
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
+
+      # rust-cache's workspace mapping is `<workspace> -> <target dir>`,
+      # relative to the workspace, so it saves the directory set above.
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: bench-forwarder
+          workspaces: bench/forwarder -> ../../target/forwarder
+
+      - name: cargo fmt --check
+        run: cargo fmt --check --manifest-path bench/forwarder/Cargo.toml
+
+      # One build set per invocation: the facade's blocking path differs
+      # once an async feature is on, and tun-rs refuses two async runtimes
+      # in one build (src/lib.rs has a compile_error! for more than one).
+      - name: cargo clippy -- -D warnings (sync, tokio, async-io)
+        run: |
+          for set in sync tokio async-io; do
+            cargo clippy --manifest-path bench/forwarder/Cargo.toml \
+              --no-default-features --features "$set" --all-targets -- -D warnings
+          done
+
+      # Report parsing/aggregation tests on fixtures: no privilege, no
+      # device.
+      - name: cargo test
+        run: cargo test --manifest-path bench/forwarder/Cargo.toml --no-default-features --features sync
+
+      # The forwarders are Linux-only; elsewhere they compile to a stub.
+      # `check` needs no linker for the foreign targets.
+      - name: cargo check (Windows and macOS targets)
+        run: |
+          for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
+            for set in sync tokio async-io; do
+              cargo check --manifest-path bench/forwarder/Cargo.toml \
+                --no-default-features --features "$set" --all-targets --target "$target"
+            done
+          done
+
+      - name: bash -n and shellcheck scripts/bench-forward.sh
+        run: |
+          bash -n scripts/bench-forward.sh
+          shellcheck scripts/bench-forward.sh
+
   privileged:
     name: privileged (${{ matrix.os }}, ${{ matrix.features.name }})
     runs-on: ${{ matrix.os }}
@@ -325,6 +388,25 @@ jobs:
             exit 1
           }
 
+      # The same for Wintun (hardware id `Wintun`): an adapter is removed
+      # when the handle that created it drops; one that adopted an existing
+      # adapter leaves it to its creator. Fails the job if a Wintun adapter
+      # is still present, also after a failed test run.
+      - name: No Wintun adapter left behind (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          # Removed adapters can stay enumerated as non-present devices;
+          # listed for the log, but only present ones fail the check.
+          $all = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { @($_.HardwareID) -match '(?i)^wintun$' })
+          Write-Host "Wintun devices known to PnP (present or not): $($all.Count)"
+          $left = @($all | Where-Object { $_.Present })
+          if ($left.Count -gt 0) {
+            $left | Format-Table Status, FriendlyName, InstanceId -AutoSize | Out-String | Write-Host
+            Write-Host "::error::Wintun adapters left behind by the privileged tests"
+            exit 1
+          }
+
       # The facade's Windows concurrency test adds an inbound ICMP echo
       # firewall rule named `tunnel-lattice-test-echo-<address>` (netsh's
       # `name=` is the rule's display name) and removes it on every exit
@@ -386,9 +468,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Its own key: this job builds only the backend's unit tests, not the
+      # `privileged` job's backend and facade test binaries.
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          key: privileged-${{ matrix.features.name }}
+          key: persistence-${{ matrix.features.name }}
 
       # Built unprivileged first, so the two `sudo` runs below only execute.
       - name: Build the backend's unit-test binary
