@@ -39,9 +39,7 @@
 //! and the thread then exits, Windows cancels the read, and the next
 //! `recv` collects the 995. While the adapter reads `Up`, the first 995 in
 //! a call is retried with a fresh read, which waits as usual, so the
-//! caller sees nothing. A read pending when `apply(Down)` disconnects the
-//! media can report 995 before the status reads `Down`; its retry then
-//! fails at once with a second 995, which is reported. The status is read
+//! caller sees nothing. The status is read
 //! at most once per call, and a call retries at most once, so it never
 //! spins. One case remains: a single `recv` call that meets two reads
 //! cancelled this way (for example, it collects one left by an earlier
@@ -155,9 +153,8 @@ pub(crate) fn is_transient(os: HostOs, err: &io::Error) -> bool {
 /// A healthy adapter reports 995 when a read was cancelled because the
 /// thread that issued it exited (an async `recv` issues its read on the
 /// thread that polls it); the retry issues a fresh read, which waits as
-/// usual. A read pending while `apply(Down)` disconnects the media can
-/// report 995 before the operational status reads `Down`; its retry
-/// fails at once with a second 995, which is reported.
+/// usual. A call that already retried reports its next 995, so a read
+/// that fails again at once is reported instead of retried forever.
 pub(crate) fn tap_abort_retries(
     retried: bool,
     oper: impl FnOnce() -> io::Result<AdminState>,

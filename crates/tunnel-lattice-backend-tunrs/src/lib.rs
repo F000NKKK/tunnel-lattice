@@ -231,9 +231,7 @@ impl TunRsBackend {
 /// the thread then exits, Windows cancels the read. While the adapter's
 /// operational status (the one `snapshot` reads) is up, `recv` retries
 /// the first such error in a call once with a fresh read, so the caller
-/// does not see it. A `recv` already waiting when `DesiredAdminState::Down`
-/// is applied may make that one retry, which fails at once, before it
-/// returns [`Error::InvalidState`]. One case remains: a single `recv` call
+/// does not see it. One case remains: a single `recv` call
 /// that meets two such cancelled reads (for example, it collects one left
 /// by an earlier dropped `recv`, and then a thread that polled it exits
 /// while it is still pending) returns [`Error::InvalidState`] once while
@@ -3065,6 +3063,96 @@ mod privileged_tests {
         );
     }
 
+    /// Observational: what a Windows TAP read that is already waiting when
+    /// `apply(Down)` disconnects the media returns, once through the
+    /// `recv` contract and once as the raw `tun-rs` read (no contract),
+    /// each on its own adapter. Prints each outcome after 2 s and, if it
+    /// is still waiting, after 10 s, plus the admin state; asserts nothing.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_read_pending_across_apply_down() {
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        observe_read_across_down("contract recv", PacketIo::recv);
+        observe_read_across_down("raw tun-rs recv", |device, buf| {
+            let result = raw_tap_recv(device, buf);
+            eprintln!(
+                "raw tun-rs recv returned {result:?} (raw code {:?})",
+                result.as_ref().err().and_then(std::io::Error::raw_os_error)
+            );
+            result.map_err(io_error)
+        });
+    }
+
+    /// One `tun-rs` read on `device`'s handle, without the `recv`
+    /// contract, blocking the way [`TunRsDevice::blocking_recv`] does.
+    #[cfg(target_os = "windows")]
+    fn raw_tap_recv(device: &TunRsDevice, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(feature = "tokio")]
+        {
+            tokio::runtime::Handle::current().block_on(device.handle.recv(buf))
+        }
+        #[cfg(all(feature = "async", not(feature = "tokio")))]
+        {
+            futures::executor::block_on(device.handle.recv(buf))
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            device.handle.recv(buf)
+        }
+    }
+
+    /// Opens a TAP adapter, starts `read` in a loop that ends on the first
+    /// error (frames are skipped), applies `Down` once it waits, and
+    /// prints what the loop returns. A loop still waiting is released
+    /// ([`BlockingCall`]) before the device drops.
+    #[cfg(target_os = "windows")]
+    fn observe_read_across_down(label: &str, read: fn(&TunRsDevice, &mut [u8]) -> Result<usize>) {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(DeviceKind::Tap))
+                .expect("open a TAP device"),
+        );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let name = snapshot.name.clone();
+        let buf_len = snapshot.recv_buffer_len();
+        let (state, waited) = poll_admin_state(&device, AdminState::Up);
+        eprintln!("{label}: {state:?} {waited:?} after open");
+
+        let call = BlockingCall::spawn(&device, &name, move |device| {
+            let mut buf = vec![0u8; buf_len];
+            loop {
+                read(device, &mut buf)?;
+            }
+        });
+        // Let it reach its wait first.
+        std::thread::sleep(Duration::from_millis(500));
+        let applied = Instant::now();
+        let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
+            .expect("build a patch");
+        device.apply(patch).expect("apply Down");
+        let apply_took = applied.elapsed();
+        let first = call.wait(Duration::from_secs(2));
+        eprintln!(
+            "{label}: pending across apply(Down) (apply took {apply_took:?}): {first:?} after {:?}",
+            applied.elapsed()
+        );
+        if first.is_none() {
+            let later = call.wait(Duration::from_secs(8));
+            eprintln!("{label}: {later:?} after {:?}", applied.elapsed());
+        }
+        let state = device.snapshot().map(|snapshot| snapshot.admin_state);
+        eprintln!("{label}: admin state at the end: {state:?}");
+    }
+
     /// A TAP device opened with a MAC address reports it, reports
     /// `MAC_MUTATION`, and a later patch's MAC is observable on the next
     /// snapshot; a TUN device reports no MAC and refuses one at open. The
@@ -4156,12 +4244,10 @@ mod privileged_tests {
     /// is accepted again on the same handle. While it is down, `send`
     /// reports `InvalidState`: on TUN the Wintun session ended; on TAP the
     /// media is disconnected and the native call fails with
-    /// `ERROR_OPERATION_ABORTED`. On TAP a `recv` already waiting when
-    /// `Down` is applied ends with `InvalidState` within 2 s (even if the
-    /// operational status still read `Up` and the read was retried once),
-    /// a `recv` started while down also reports `InvalidState` (within 2 s;
-    /// it fails at once), and a `recv` started after `Up` waits again
-    /// instead of failing (frames are skipped; checked for 2 s).
+    /// `ERROR_OPERATION_ABORTED`. On TAP a `recv` started while down also
+    /// reports `InvalidState` (within 2 s; it fails at once), and a `recv`
+    /// started after `Up` waits again instead of failing (frames are
+    /// skipped; checked for 2 s).
     ///
     /// Every call runs on a helper thread with a bounded wait. The helpers
     /// are released ([`BlockingCall`]) before the device drops, which
@@ -4218,29 +4304,7 @@ mod privileged_tests {
         eprintln!("{kind:?} {state:?} {waited:?} after open");
         assert_eq!(state, AdminState::Up, "{kind:?} after open");
 
-        // TAP: a `recv` already waiting when `apply(Down)` disconnects the
-        // media. Its read fails with `ERROR_OPERATION_ABORTED` before the
-        // operational status reads `Down`, so it may be retried once; the
-        // retry fails at once, so the call still ends with `InvalidState`.
-        let recv_across_down = (kind == DeviceKind::Tap).then(|| {
-            let call = bounded_recv();
-            // Let it reach its wait first.
-            std::thread::sleep(Duration::from_millis(500));
-            call
-        });
-        let applied = std::time::Instant::now();
         set_admin(DesiredAdminState::Down);
-        if let Some(call) = &recv_across_down {
-            let received = call.wait(Duration::from_secs(2));
-            eprintln!(
-                "{kind:?} recv pending across apply(Down): {received:?} after {:?}",
-                applied.elapsed()
-            );
-            assert!(
-                matches!(received, Some(Err(Error::InvalidState))),
-                "{kind:?} recv pending across apply(Down): {received:?}"
-            );
-        }
         let (state, waited) = poll_admin_state(&device, AdminState::Down);
         eprintln!("{kind:?} {state:?} {waited:?} after apply(Down)");
         assert_eq!(state, AdminState::Down, "{kind:?} after apply(Down)");

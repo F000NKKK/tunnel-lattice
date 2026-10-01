@@ -165,9 +165,7 @@ thread that started it exited (an async `recv` starts its read on the
 polling thread, so a dropped `recv` whose thread then exits leaves one
 behind). On `recv`, the first 995 in a call is therefore retried once with
 a fresh read if the adapter's operational status reads up; the status is
-read at most once per call. A read pending across `apply(Down)` can see
-995 before the status reads down; its retry fails at once and reports
-`InvalidState`. A single call that meets two cancelled reads reports
+read at most once per call. A single call that meets two cancelled reads reports
 `InvalidState` once on a healthy adapter. `send` is not retried, because
 `tun-rs` discards a cancelled pending write.
 `InvalidState` from `recv`/`send` means "the device exists but is not

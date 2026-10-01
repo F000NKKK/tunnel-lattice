@@ -273,9 +273,7 @@ read on the thread that polls it, and if that `recv` is dropped while
 waiting and the thread then exits, Windows cancels the read. While the
 adapter's operational status (the one `snapshot()` reads) is up, `recv`
 retries the first such error in a call once with a fresh read, so the
-caller does not see it and a `PacketStream` keeps going. A `recv` already
-waiting when `DesiredAdminState::Down` is applied may make that one
-retry, which fails at once, before it returns `InvalidState`. The status
+caller does not see it and a `PacketStream` keeps going. The status
 is read at most once per call and a call retries at most once, so it
 never spins; `send` has no such retry, because `tun-rs` discards a
 cancelled pending write. One case remains: a single `recv` call that
