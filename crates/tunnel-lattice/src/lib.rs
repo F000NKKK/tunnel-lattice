@@ -163,6 +163,22 @@ impl Tunnel<TunRsBackend> {
     /// analogous to `net_lattice::Lattice::connect`'s Netlink/WFP/
     /// route-socket handshake — the privileged step is opening a device,
     /// not connecting the backend.
+    ///
+    /// [`Tunnel::capabilities`] then reports what this host supports
+    /// without opening anything or needing privilege. `TAP_DEVICES` is
+    /// always reported on Linux and macOS, and on Windows only if the
+    /// tap-windows6 driver is installed (detected once per process; see
+    /// `TunRsBackend`'s `CapabilityProvider` impl):
+    ///
+    /// ```
+    /// use tunnel_lattice::{Capability, Tunnel};
+    ///
+    /// let tunnel = Tunnel::connect();
+    /// let host = tunnel.capabilities();
+    /// assert!(host.contains(Capability::DEVICE_MUTATION));
+    /// // Per-handle flags appear only on an open device's own answer.
+    /// assert!(!host.contains(Capability::MAC_MUTATION));
+    /// ```
     pub fn connect() -> Self {
         Self::new(TunRsBackend::new())
     }

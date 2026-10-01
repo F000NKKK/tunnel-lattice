@@ -64,6 +64,11 @@ public API. The workspace
   `DEVICE_MUTATION`, `PERSISTENT_DEVICES`, `TAP_DEVICES`, `MULTI_QUEUE`,
   `NATIVE_ASYNC`, `MAC_MUTATION`.
 - 🧩 **`CapabilityProvider`**: reports which of them a connected device has.
+  A backend may implement it too, answering for the host before any device
+  is opened (for example whether a TAP driver is installed); an open
+  device then adds the flags that exist only per handle. The answer is
+  infallible and advisory: a flag the backend cannot confirm is absent, and
+  `open` stays the authoritative check.
 
 ## 📦 Installation
 

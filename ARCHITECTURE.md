@@ -432,3 +432,25 @@ Administrator on Windows, or root on macOS/BSD. `Capability` flags describe
 implemented surfaces, not proof the current process is authorized — callers
 should still handle a permission error from `DeviceProvider::open` even when
 a capability is reported as available.
+
+Capabilities are answered at two levels. The backend itself
+(`TunRsBackend`, surfaced as `Tunnel::capabilities()`) reports what the
+host supports before any device is opened; an open device's handle reports
+that same answer plus flags that only exist per handle (`MAC_MUTATION` on a
+TAP handle on Linux and macOS). `CapabilityProvider::capabilities()` stays
+infallible: a capability the backend cannot confirm is simply absent.
+`TAP_DEVICES` is per OS:
+
+| OS | How `TAP_DEVICES` is determined |
+|---|---|
+| Linux | always reported (the `tun` driver serves TUN and TAP alike) |
+| macOS | always reported (`feth` is built into the kernel) |
+| Windows | reported only if the tap-windows6 driver (hardware id `tap0901`) is installed |
+
+The Windows answer comes from a SetupAPI driver lookup that repeats the one
+`tun-rs` performs before creating a TAP adapter and stops before anything is
+registered: it creates no adapter, needs no elevation, runs once per process
+on the first call, and is cached (a driver installed later is noticed after
+a restart). Either answer is advisory: `open` is never refused because of
+it, and a missing driver is still reported by `open` as
+`Error::DriverUnavailable`.

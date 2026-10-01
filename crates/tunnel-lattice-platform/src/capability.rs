@@ -20,6 +20,10 @@ bitflags::bitflags! {
         const PERSISTENT_DEVICES = 1 << 1;
         /// The backend can open a TAP (Ethernet-framed) device, not only TUN.
         /// Some platforms/drivers support TUN only.
+        ///
+        /// Where TAP depends on a separately installed driver, a backend
+        /// reports this only if it detected that driver. The flag is
+        /// advisory: opening a TAP device remains the authoritative check.
         const TAP_DEVICES = 1 << 2;
         /// The backend implements [`crate::MultiQueueProvider`]: it can
         /// duplicate a hardware-scheduled queue on the same device for

@@ -68,6 +68,12 @@ blocking = { version = "1.7.0", optional = true }
 # `cargo tree --target x86_64-pc-windows-msvc -i libloading`.
 [target.'cfg(target_os = "windows")'.dependencies]
 libloading = "0.9.0"
+# `TunRsBackend::capabilities` probes for the tap-windows6 (`tap0901`)
+# driver through SetupAPI (see `src/windows_tap_probe.rs`), repeating the
+# driver lookup tun-rs's own `open(Tap)` performs, without creating a
+# device. Already locked at 0.61.2 via tun-rs 2.8.11; adds no package to
+# Cargo.lock.
+windows-sys = { version = "0.61.2", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation"] }
 
 # Test-only: the privileged teardown tests drive a real device through
 # `tunnel-lattice-async`'s `PacketStream` (the native adapter in async

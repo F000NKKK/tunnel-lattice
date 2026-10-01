@@ -256,6 +256,9 @@ A missing `tun` module is reported as `Error::DriverUnavailable`.
   or on `PATH`.
 - **TAP**: install the
   [tap-windows6](https://build.openvpn.net/downloads/releases/) driver.
+  `Tunnel::capabilities()` reports `Capability::TAP_DEVICES` on Windows
+  only when this driver is installed; the check needs no Administrator
+  rights, creates no adapter, and runs once per process.
 - Run as Administrator. Without the DLL or driver, `open` returns
   `Error::DriverUnavailable`.
 

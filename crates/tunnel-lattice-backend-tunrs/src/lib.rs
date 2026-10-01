@@ -24,6 +24,8 @@ mod open_contract;
 mod recv_contract;
 #[cfg(all(target_os = "linux", feature = "tokio"))]
 mod tokio_linux;
+#[cfg(target_os = "windows")]
+mod windows_tap_probe;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
@@ -743,27 +745,138 @@ impl MultiQueueProvider for TunRsDevice {
     }
 }
 
+/// The host-level capabilities shared by [`TunRsBackend`] and every
+/// [`TunRsDevice`]; see [`TunRsBackend`]'s [`CapabilityProvider`] impl.
+fn host_capabilities() -> Capability {
+    let base = Capability::DEVICE_MUTATION;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let base = base | Capability::TAP_DEVICES;
+    #[cfg(target_os = "linux")]
+    let base = base | Capability::PERSISTENT_DEVICES | Capability::MULTI_QUEUE;
+    #[cfg(target_os = "windows")]
+    let base = if windows_tap_probe::tap_driver_installed() {
+        base | Capability::TAP_DEVICES
+    } else {
+        base
+    };
+    #[cfg(feature = "async")]
+    {
+        base | Capability::NATIVE_ASYNC
+    }
+    #[cfg(not(feature = "async"))]
+    {
+        base
+    }
+}
+
+/// What this host supports before any device is opened (exposed by the
+/// facade as `Tunnel::capabilities()`).
+///
+/// | Flag | Reported |
+/// |---|---|
+/// | `DEVICE_MUTATION` | always |
+/// | `TAP_DEVICES` | Linux and macOS always; Windows only if the tap-windows6 driver (hardware id `tap0901`) is installed |
+/// | `PERSISTENT_DEVICES`, `MULTI_QUEUE` | Linux |
+/// | `NATIVE_ASYNC` | with the `async-io` or `tokio` feature |
+///
+/// `MAC_MUTATION` is never part of this answer: it is a property of an open
+/// TAP handle, reported by [`TunRsDevice`]'s own `capabilities()` (Linux and
+/// macOS only).
+///
+/// On Windows the driver is detected on the first call with the same
+/// SetupAPI driver lookup `tun-rs` performs before creating a TAP adapter,
+/// stopping before anything is registered: no device or adapter is created
+/// and no elevation is needed. The answer is cached for the life of the
+/// process, so a driver installed or removed later is not noticed until
+/// the process restarts. A failed lookup reports the flag as absent.
+///
+/// This answer is advisory: [`DeviceProvider::open`] never refuses a
+/// request because of it, and a missing driver is still reported by `open`
+/// itself (as [`Error::DriverUnavailable`]). Neither does any flag prove
+/// the process is privileged enough to open a device.
+///
+/// ```
+/// use tunnel_lattice_backend_tunrs::TunRsBackend;
+/// use tunnel_lattice_platform::{Capability, CapabilityProvider};
+///
+/// let capabilities = TunRsBackend::new().capabilities();
+/// assert!(capabilities.contains(Capability::DEVICE_MUTATION));
+/// assert!(!capabilities.contains(Capability::MAC_MUTATION));
+/// ```
+impl CapabilityProvider for TunRsBackend {
+    fn capabilities(&self) -> Capability {
+        host_capabilities()
+    }
+}
+
+/// The backend's host-level answer (see [`TunRsBackend`]'s
+/// [`CapabilityProvider`] impl) plus what depends on this handle:
+/// `MAC_MUTATION` on a TAP handle on Linux and macOS, and `TAP_DEVICES` on
+/// any TAP handle, since its successful open proves TAP works here even if
+/// the Windows driver lookup did not find the driver.
 impl CapabilityProvider for TunRsDevice {
     fn capabilities(&self) -> Capability {
-        let base = Capability::DEVICE_MUTATION | Capability::TAP_DEVICES;
-        #[cfg(target_os = "linux")]
-        let base = base | Capability::PERSISTENT_DEVICES | Capability::MULTI_QUEUE;
+        let base = host_capabilities();
+        if self.kind != DeviceKind::Tap {
+            return base;
+        }
+        let base = base | Capability::TAP_DEVICES;
         // The Windows TAP driver takes a MAC only at creation; `tun-rs`
         // returns `Unsupported` for a later change there.
         #[cfg(not(target_os = "windows"))]
-        let base = if self.kind == DeviceKind::Tap {
+        {
             base | Capability::MAC_MUTATION
+        }
+        #[cfg(target_os = "windows")]
+        {
+            base
+        }
+    }
+}
+
+/// Ordinary tests of the backend's host-level capability answer (no device
+/// is opened; the Windows driver lookup needs no elevation).
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn backend_reports_host_flags_and_never_per_handle_ones() {
+        let capabilities = TunRsBackend::new().capabilities();
+        assert!(capabilities.contains(Capability::DEVICE_MUTATION));
+        assert!(!capabilities.contains(Capability::MAC_MUTATION));
+        assert_eq!(capabilities, host_capabilities());
+        assert_eq!(
+            capabilities.contains(Capability::NATIVE_ASYNC),
+            cfg!(feature = "async")
+        );
+        let linux_only = Capability::PERSISTENT_DEVICES | Capability::MULTI_QUEUE;
+        if cfg!(target_os = "linux") {
+            assert!(capabilities.contains(linux_only));
         } else {
-            base
-        };
-        #[cfg(feature = "async")]
-        {
-            base | Capability::NATIVE_ASYNC
+            assert!(!capabilities.intersects(linux_only));
         }
-        #[cfg(not(feature = "async"))]
-        {
-            base
-        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn backend_reports_tap_devices_statically_on_linux_and_macos() {
+        assert!(
+            TunRsBackend::new()
+                .capabilities()
+                .contains(Capability::TAP_DEVICES)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn backend_reports_tap_devices_on_windows_only_with_the_driver() {
+        assert_eq!(
+            TunRsBackend::new()
+                .capabilities()
+                .contains(Capability::TAP_DEVICES),
+            windows_tap_probe::tap_driver_installed()
+        );
     }
 }
 
@@ -1984,6 +2097,14 @@ mod privileged_tests {
         #[cfg(feature = "tokio")]
         let _entered = _runtime.enter();
 
+        // The driver lookup behind the host-level answer agrees with what
+        // `open` is about to find.
+        assert!(
+            !TunRsBackend::new()
+                .capabilities()
+                .contains(Capability::TAP_DEVICES),
+            "TAP_DEVICES reported on a host without the tap-windows6 driver"
+        );
         let result = TunRsBackend::new().open(DeviceConfig::new(DeviceKind::Tap));
         assert!(
             matches!(result, Err(Error::DriverUnavailable)),
@@ -2023,6 +2144,13 @@ mod privileged_tests {
         let _feth = guard_feth_pair(&snapshot.name);
         assert_eq!(snapshot.mac, Some(initial));
         assert!(device.capabilities().contains(Capability::MAC_MUTATION));
+        // The host-level answer is the handle's minus the per-handle flag,
+        // and it promised TAP before this open succeeded.
+        assert_eq!(
+            device.capabilities() - Capability::MAC_MUTATION,
+            backend.capabilities()
+        );
+        assert!(backend.capabilities().contains(Capability::TAP_DEVICES));
 
         device
             .apply(DeviceConfigPatch::new_mac(device.id(), changed))
@@ -2035,6 +2163,7 @@ mod privileged_tests {
             .expect("open a TUN device");
         assert_eq!(tun.snapshot().expect("snapshot the TUN device").mac, None);
         assert!(!tun.capabilities().contains(Capability::MAC_MUTATION));
+        assert_eq!(tun.capabilities(), backend.capabilities());
         let refused = backend.open(DeviceConfig::new(DeviceKind::Tun).with_mac(initial));
         assert!(
             matches!(refused, Err(Error::InvalidState)),

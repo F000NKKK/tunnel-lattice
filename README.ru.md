@@ -258,6 +258,9 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
   файлом или в `PATH`.
 - **TAP**: установите драйвер
   [tap-windows6](https://build.openvpn.net/downloads/releases/).
+  `Tunnel::capabilities()` сообщает `Capability::TAP_DEVICES` на Windows,
+  только если этот драйвер установлен; проверка не требует прав
+  администратора, не создаёт адаптер и выполняется один раз за процесс.
 - Запускайте от администратора. Без DLL или драйвера `open` вернёт
   `Error::DriverUnavailable`.
 

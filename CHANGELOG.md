@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Host-level capabilities from the `tun-rs` backend, with an honest
+  `TAP_DEVICES` on Windows.** `TunRsBackend` now implements
+  `CapabilityProvider`, so `Tunnel::connect().capabilities()` reports what
+  the host supports before any device is opened: `DEVICE_MUTATION`,
+  `TAP_DEVICES` on Linux and macOS, `PERSISTENT_DEVICES` and `MULTI_QUEUE`
+  on Linux, and `NATIVE_ASYNC` with an async feature. It never includes
+  `MAC_MUTATION`, which stays a per-handle flag of an open TAP device.
+  - On Windows, `TAP_DEVICES` is reported only if the tap-windows6 driver
+    (hardware id `tap0901`) is installed. Previously it was reported
+    unconditionally, on every device handle. The driver is detected on the
+    first call with the same SetupAPI driver lookup `tun-rs` performs
+    before creating a TAP adapter, stopping before anything is registered:
+    no adapter is created and no elevation is needed. The answer is cached
+    for the life of the process.
+  - An open device's `capabilities()` is now the backend's host-level
+    answer plus its per-handle flags (`MAC_MUTATION` on a TAP handle on
+    Linux and macOS; `TAP_DEVICES` on any TAP handle).
+  - `open` stays authoritative: it is never refused because of this answer,
+    and a missing driver is still reported by `open` as
+    `Error::DriverUnavailable`.
+  - `tunnel-lattice-backend-tunrs` gains a Windows-only `windows-sys`
+    dependency, already in the dependency graph through `tun-rs`.
+
 - **TAP MAC address.** Added `MacAddress`, a six-octet value shaped like
   `net-lattice-model`'s own so the two convert through `[u8; 6]`; the
   facade re-exports it.

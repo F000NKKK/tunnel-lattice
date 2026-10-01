@@ -47,6 +47,8 @@ error into a typed `tunnel_lattice_core::Error`.
 - ✅ `TunRsBackend`, a stateless handle whose `DeviceProvider::open` builds a
   device via `tun_rs::DeviceBuilder`, mapping `DeviceKind::Tun`/`Tap` to
   `tun_rs::Layer::L3`/`L2`;
+- ✅ `TunRsBackend`'s own `CapabilityProvider`: what the host supports
+  before any device is opened (see "Host-level capabilities" below);
 - ✅ `TunRsDevice`, the open-device handle implementing `PacketIo`,
   `DeviceObserver`, `DeviceMutator` (MTU, TAP MAC address, and
   administrative state), and
@@ -91,6 +93,41 @@ error into a typed `tunnel_lattice_core::Error`.
 ✅ tested in CI on real devices. ⚠️ supported, but only the missing-driver
 path is tested in CI so far. Administrative-state read-back is exact only
 on Linux; elsewhere `snapshot()` reports `AdminState::Unknown`.
+
+## 🧩 Host-level capabilities
+
+`TunRsBackend` implements `CapabilityProvider` itself, answering before any
+device is opened (the `tunnel-lattice` facade exposes it as
+`Tunnel::capabilities()`):
+
+| Flag                                 | Reported                                                     |
+|--------------------------------------|--------------------------------------------------------------|
+| `DEVICE_MUTATION`                    | always                                                       |
+| `TAP_DEVICES`                        | Linux and macOS always; Windows only if the tap-windows6 driver (hardware id `tap0901`) is installed |
+| `PERSISTENT_DEVICES`, `MULTI_QUEUE`  | Linux                                                        |
+| `NATIVE_ASYNC`                       | with the `async-io` or `tokio` feature                       |
+
+`MAC_MUTATION` is never in this answer: it belongs to an open TAP handle,
+whose `TunRsDevice::capabilities()` reports the backend's answer plus
+`MAC_MUTATION` (Linux and macOS) and `TAP_DEVICES`.
+
+On Windows the driver is detected with the same SetupAPI driver lookup
+`tun-rs` performs before creating a TAP adapter, stopping before anything is
+registered: no adapter is created and no Administrator rights are needed.
+It runs on the first call and is cached for the life of the process, so a
+driver installed later is noticed only after a restart; a failed lookup
+leaves the flag out. The answer is advisory: `open` is never refused because
+of it, and still reports a missing driver as `Error::DriverUnavailable`.
+
+```rust
+use tunnel_lattice_backend_tunrs::TunRsBackend;
+use tunnel_lattice_platform::{Capability, CapabilityProvider};
+
+let host = TunRsBackend::new().capabilities();
+if host.contains(Capability::TAP_DEVICES) {
+    // a TAP device can be requested on this host
+}
+```
 
 ## 📦 Installation
 

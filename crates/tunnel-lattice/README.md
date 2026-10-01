@@ -223,6 +223,11 @@ Administrator on Windows, or root on macOS. Runtime `Capability` flags
 describe implemented surfaces, not a guarantee the current process is
 authorized.
 
+`Tunnel::connect().capabilities()` needs no privilege and opens nothing.
+It reports `Capability::TAP_DEVICES` on Linux and macOS, and on Windows
+only when the tap-windows6 driver is installed (detected once per process
+without creating an adapter). `open` stays authoritative either way.
+
 On Windows, `TunRsBackend::open` for a TUN device also requires
 `wintun.dll` to be present next to your application's executable or on
 `PATH` — `tun-rs` loads it at runtime rather than linking it at build time,
