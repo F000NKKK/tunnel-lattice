@@ -70,7 +70,8 @@ Lattice; адреса и маршруты настраиваются через
   принимают `&self` — одно устройство можно использовать из многих потоков
 
 ### Платформенные возможности
-- 🐧 **Персистентность на Linux**: устройство переживает завершение процесса
+- 🐧 **Персистентность на Linux**: устройство переживает завершение процесса,
+  к нему можно позже подключиться по имени и снять персистентность
 - 🔀 **Multi-queue на Linux**: независимые очереди ядра на одном устройстве
 - 🍎 **TAP на macOS**: пары `feth` с ограниченным ожиданием, чтобы
   уничтоженный интерфейс завершал `recv`
@@ -209,6 +210,25 @@ fn main() -> tunnel_lattice::Result<()> {
 }
 ```
 
+Другой процесс позже подключается к нему, открыв устройство с тем же
+именем, типом и настройкой multi-queue, и может снять персистентность,
+чтобы устройство исчезло вместе с последним дескриптором:
+
+```rust,no_run
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+fn main() -> tunnel_lattice::Result<()> {
+    let device = Tunnel::connect()
+        .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
+    device.unpersist()?; // удалится, когда будут закрыты все его дескрипторы
+    Ok(())
+}
+```
+
+`open` не сообщает, подключился ли он к существующему устройству или
+создал новое, а несовпадение типа или настройки multi-queue завершается
+ошибкой `Error::AlreadyExists`.
+
 ### Назначение адреса через net-lattice
 
 Tunnel Lattice создаёт интерфейс, `net-lattice` его настраивает. У крейтов
@@ -309,7 +329,7 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 | `Handle::snapshot` | Текущие имя, MTU, административное состояние и MAC-адрес TAP |
 | `Handle::apply(DeviceConfigPatch)` | Изменить MTU, MAC-адрес TAP (Linux, macOS) или up/down |
 | `Handle::capabilities` | Что устройство поддерживает в рантайме |
-| `Handle::persist` / `additional_queue` | Персистентность и multi-queue на Linux |
+| `Handle::persist` / `unpersist` / `additional_queue` | Персистентность и multi-queue на Linux |
 | `Handle::packet_stream` | Асинхронный `Stream` пакетов из пула (`tokio` / `async-io`) |
 | `Handle::send_async` | Неблокирующая отправка для асинхронного кода (`tokio` / `async-io`) |
 

@@ -47,8 +47,11 @@ public API. The workspace
   open without a native call.
 - ✅ **`DeviceMutator: DeviceObserver`**: changes an open device's MTU or
   administrative state, gated by `Capability::DEVICE_MUTATION`.
-- ✅ **`PersistentDevice`**: marks an open device to survive process exit,
-  gated by `Capability::PERSISTENT_DEVICES`.
+- ✅ **`PersistentDevice`**: `persist` marks an open device to survive
+  process exit, and `unpersist` clears that again so the device is
+  destroyed when its last handle closes; gated by
+  `Capability::PERSISTENT_DEVICES`. A later process re-attaches by opening
+  the same name, kind, and multi-queue setting.
 - ✅ **`MultiQueueProvider`**: duplicates a kernel-scheduled queue on the
   same device for another thread, gated by `Capability::MULTI_QUEUE`. This
   is separate from ordinary multi-threaded use of `PacketIo`, which is

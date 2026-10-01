@@ -73,7 +73,8 @@ error into a typed `tunnel_lattice_core::Error`.
   implements them on Linux and does not implement them at all elsewhere
   (verified in `tun-rs`'s source — the underlying `persist`/`multi_queue`/
   `try_clone` methods are `#[cfg(target_os = "linux")]` there too, not
-  merely no-ops off Linux). See "Persistent devices and multi-queue" below.
+  merely no-ops off Linux). `PersistentDevice` covers both `persist` and
+  `unpersist`. See "Persistent devices and multi-queue" below.
 - ✅ A TAP device's MAC address: `DeviceConfig::with_mac` sets it at open
   on every platform, and the backend reads it back, returning
   `Unsupported` and tearing the device down if it was not applied.
@@ -347,7 +348,7 @@ such end-to-end check.
 | OS / kind          | Existing interface with the requested name                         | Result |
 |--------------------|--------------------------------------------------------------------|--------|
 | Linux TUN/TAP      | other kind, multi-queue mismatch, or a non-multi-queue device that already has a queue attached | `AlreadyExists` |
-| Linux TUN/TAP      | a persistent same-kind device with no queue attached               | re-attached; not deleted on drop |
+| Linux TUN/TAP      | a persistent same-kind, same-multi-queue device with no queue attached | re-attached; not deleted on drop |
 | Linux, `multi_queue = true` | a same-kind multi-queue device, including a live one opened by another process | a queue is attached; not deleted on drop |
 | macOS TAP (`feth`) | any                                                                | `AlreadyExists`; the existing `feth` survives |
 | macOS TUN (`utun`) | the unit is in use                                                 | `AlreadyExists` |
@@ -361,7 +362,11 @@ TAP interface and, on macOS, destroy it when the handle drops. The two
 attach cases (Linux, Windows TUN) are documented rather than refused: a
 check before opening would race with other processes, and neither case
 deletes the interface. On Linux, joining a multi-queue device owned by
-another user requires `CAP_NET_ADMIN` in the device's network namespace.
+another user requires `CAP_NET_ADMIN` in the device's network namespace;
+use a name nobody else uses if sharing is not intended. A successful
+`open` does not report whether it attached to an existing device or
+created a new one: the kernel's `TUNSETIFF` has no create-only flag that
+`tun-rs` passes.
 Re-attaching to an existing persistent Linux device with an MTU the kernel
 rejects (`EINVAL` from setting the MTU) is reported as `AlreadyExists`,
 because the name exists — the same limitation as the other Linux `EINVAL`
@@ -443,9 +448,23 @@ details neither this crate nor `tunnel-lattice` re-derives.
 Both gated by `Capability::PERSISTENT_DEVICES`/`Capability::MULTI_QUEUE`,
 Linux-only:
 
-- `Handle::persist` marks an open device to survive process exit
-  (`TUNSETPERSIST`). There is no un-persist — `tun-rs` only exposes setting
-  the flag.
+- `PersistentDevice::persist` (`Handle::persist` in the facade) marks an
+  open device to survive its last handle closing, including process exit;
+  `PersistentDevice::unpersist` (`Handle::unpersist`) clears that again, so
+  the device is destroyed once its last handle in any process closes. Both
+  are the kernel's `TUNSETPERSIST` ioctl, which sets `IFF_PERSIST` for a
+  non-zero argument and clears it for zero. `persist` goes through
+  `tun-rs`; `tun-rs` cannot clear the flag, so `unpersist` issues
+  `TUNSETPERSIST(0)` on the handle's descriptor itself, passing the zero by
+  value. Both are idempotent and work from any queue of the device. The
+  kernel checks no capability for this ioctl; holding an attached handle
+  is enough.
+- A later process re-attaches to a persistent device by opening the same
+  name, kind, and multi-queue setting (see "Existing interface names"
+  above); there is no separate attach call, and `open` does not report
+  whether it attached or created a new device. CI checks the cycle across
+  two processes: one creates and persists a device and exits, a second
+  re-attaches by name, unpersists, and closes it, and the device is gone.
 - `DeviceConfig::with_multi_queue(true)` requests `IFF_MULTI_QUEUE` at open
   time; `Handle::additional_queue` then duplicates a genuinely independent,
   hardware-scheduled queue on the same device (`tun-rs`'s `try_clone`).

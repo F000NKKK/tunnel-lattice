@@ -260,12 +260,30 @@ Both platform traits are still declared unconditionally in
 `tunnel-lattice-backend-tunrs` implementation is `#[cfg(target_os =
 "linux")]`-gated, the same pattern as `AdminState` read-back.
 
-- **Persistence** (`Handle::persist`) marks an open device to survive
-  process exit. Attaching to an existing persistent device by name needs no
-  code here: it's ordinary Linux `TUNSETIFF`-by-name kernel behavior, not
-  something `DeviceProvider::open` implements specially — request the same
-  `DeviceConfig::name` and the kernel does the rest. There is no
-  "un-persist": `tun-rs` only exposes setting the flag, never clearing it.
+- **Persistence** (`Handle::persist`, `Handle::unpersist`) marks an open
+  device to survive its last handle closing (including process exit), and
+  clears that again so the device is destroyed once its last handle, in
+  any process, closes. Both are the kernel's `TUNSETPERSIST` ioctl, which
+  takes its argument by value: non-zero sets `IFF_PERSIST`, zero clears it.
+  `persist` goes through `tun-rs`; `tun-rs` has no way to clear the flag,
+  so `unpersist` issues `TUNSETPERSIST(0)` on the handle's descriptor
+  itself, in one documented `unsafe` call, passing the zero as
+  an integer, never a pointer (a pointer to zero is non-zero and would set
+  the flag). The kernel performs no capability check on this ioctl:
+  holding a handle attached to the device is enough, and getting one
+  normally required `CAP_NET_ADMIN` or ownership of the device. Both calls
+  work from any queue. Re-attaching to an existing persistent device by
+  name needs no extra API: it's ordinary Linux `TUNSETIFF`-by-name kernel
+  behavior — open with the same `DeviceConfig::name`, kind, and
+  `multi_queue`. The kernel attaches to any existing device of the same
+  type and multi-queue setting (including, with multi-queue, a live device
+  another process has open), refuses a type or multi-queue mismatch with
+  `EINVAL` and a non-multi-queue device that already has a queue with
+  `EBUSY` (both reported as `Error::AlreadyExists`), and `open` cannot
+  tell whether it attached or created. A dedicated CI job checks the whole
+  cycle across two processes: one creates and persists a device and exits,
+  a second re-attaches by name, unpersists, and closes it, and the device
+  is gone.
 - **Multi-queue** (`DeviceConfig::with_multi_queue`, `Handle::
   additional_queue`) requests `IFF_MULTI_QUEUE` at open time and, once
   granted, duplicates a genuinely independent, hardware-scheduled queue on

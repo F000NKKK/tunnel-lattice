@@ -70,7 +70,8 @@ addresses and routes.
   so one device can be used from many threads
 
 ### Platform-Specific Features
-- 🐧 **Linux persistence**: keep a device after the process exits
+- 🐧 **Linux persistence**: keep a device after the process exits,
+  re-attach to it by name later, and un-persist it
 - 🔀 **Linux multi-queue**: independent kernel-scheduled queues on one device
 - 🍎 **macOS TAP**: `feth` pairs, with a bounded wait so a destroyed
   interface ends `recv`
@@ -207,6 +208,24 @@ fn main() -> tunnel_lattice::Result<()> {
 }
 ```
 
+A later process re-attaches by opening the same name, kind, and
+multi-queue setting, and can clear persistence so the device goes away
+with its last handle:
+
+```rust,no_run
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+fn main() -> tunnel_lattice::Result<()> {
+    let device = Tunnel::connect()
+        .open(DeviceConfig::new(DeviceKind::Tun).with_name("tl0").with_multi_queue(true))?;
+    device.unpersist()?; // removed once every handle to it is closed
+    Ok(())
+}
+```
+
+`open` does not report whether it attached or created a new device, and a
+kind or multi-queue mismatch fails with `Error::AlreadyExists`.
+
 ### Assigning an Address with net-lattice
 
 Tunnel Lattice creates the interface; `net-lattice` configures it. The two
@@ -307,7 +326,7 @@ Tunnel Lattice layer adds and what it does not have yet.
 | `Handle::snapshot` | Current name, MTU, administrative state, and TAP MAC address |
 | `Handle::apply(DeviceConfigPatch)` | Change MTU, TAP MAC address (Linux, macOS), or up/down |
 | `Handle::capabilities` | What this device supports at runtime |
-| `Handle::persist` / `additional_queue` | Linux persistence and multi-queue |
+| `Handle::persist` / `unpersist` / `additional_queue` | Linux persistence and multi-queue |
 | `Handle::packet_stream` | Async `Stream` of pooled packets (`tokio` / `async-io`) |
 | `Handle::send_async` | Non-blocking send for async code (`tokio` / `async-io`) |
 

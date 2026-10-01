@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking: `PersistentDevice` gains a required `unpersist()` method,
+  and persistent devices work end to end on Linux.** `unpersist` clears
+  persistence, so the device is destroyed when its last handle, in any
+  process, closes. It is idempotent and works from any queue of the
+  device. A `PersistentDevice` implemented outside this workspace must add
+  the method. The facade adds `Handle::unpersist()` next to
+  `Handle::persist()`.
+  - `tunnel-lattice-backend-tunrs` implements it on Linux with the
+    kernel's `TUNSETPERSIST` ioctl and a zero argument passed by value
+    (`tun-rs` can only set the flag). The kernel checks no capability for
+    this ioctl; an attached handle is enough. Other platforms still do not
+    implement `PersistentDevice`.
+  - Corrected the documentation that said persistence cannot be cleared
+    (`PersistentDevice`, `Capability::PERSISTENT_DEVICES`, the
+    architecture documents and READMEs): `TUNSETPERSIST` clears the flag
+    when given zero.
+  - Documented re-attaching: a later process opens the same name, kind,
+    and multi-queue setting; there is no separate attach call, a kind or
+    multi-queue mismatch fails with `Error::AlreadyExists`, and `open` does
+    not report whether it attached or created a device
+    (`DeviceConfig::name`, `DeviceConfig::multi_queue`, the backend
+    README).
+  - Tests: Linux privileged tests read `IFF_PERSIST` back from
+    `/sys/class/net/<name>/tun_flags` after `persist` and `unpersist`
+    (including a repeated `unpersist`), re-attach a persistent multi-queue
+    device and unpersist it from an added queue, and check that
+    re-attaching with the wrong kind or multi-queue setting reports
+    `AlreadyExists`. Each checks the device is gone after its last handle
+    and deletes it on every unwinding exit path. The existing persistence
+    test no longer leaves a persistent device behind.
+  - CI: a separate Linux `persistence` job, in every feature set, runs
+    process A (create, persist, exit), checks the device survived with
+    `IFF_PERSIST` set, runs process B (re-attach by name with the same
+    interface index, unpersist, close), checks the device is gone, and
+    always deletes it at the end. The privileged job's Linux leftover
+    check now fails on any TUN or TAP device the tests left behind, not
+    only TAP.
+
 - **iperf3 forwarder benchmark (unpublished, Linux).** `bench/forwarder/`
   forwards packets between two TUN devices (one in a network namespace)
   while `iperf3` measures TCP throughput across them, the method of tun-rs's

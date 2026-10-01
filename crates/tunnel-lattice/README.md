@@ -51,7 +51,7 @@ configuration once a device exists.
   administrative state, or TAP MAC address (the last where the handle
   reports `Capability::MAC_MUTATION`: Linux and macOS; on Windows a TAP
   MAC address can only be requested at open with `DeviceConfig::with_mac`);
-- 🐧 `Handle::persist`/`Handle::additional_queue`, on backends that implement
+- 🐧 `Handle::persist`/`Handle::unpersist`/`Handle::additional_queue`, on backends that implement
   `PersistentDevice`/`MultiQueueProvider` (Linux only, via
   `tunnel-lattice-backend-tunrs` — see
   [Persistent devices and multi-queue](#-persistent-devices-and-multi-queue));
@@ -245,6 +245,26 @@ fn main() -> tunnel_lattice::Result<()> {
     let device = tunnel.open(DeviceConfig::new(DeviceKind::Tun).with_multi_queue(true))?;
     device.persist()?;                             // survives this process exiting
     let second_queue = device.additional_queue()?; // independent hardware queue
+    Ok(())
+}
+```
+
+A persistent device stays after its last handle closes. A later process
+re-attaches by opening the same name, kind, and multi-queue setting (there
+is no separate attach call, and `open` does not report whether it attached
+or created a new device; a kind or multi-queue mismatch fails with
+`Error::AlreadyExists`). `Handle::unpersist` clears persistence from any
+handle or queue, so the device is removed once every handle to it, in any
+process, is closed:
+
+```rust,no_run
+use tunnel_lattice::{DeviceConfig, DeviceKind, Tunnel};
+
+fn main() -> tunnel_lattice::Result<()> {
+    let config = DeviceConfig::new(DeviceKind::Tun).with_name("tl0");
+    let device = Tunnel::connect().open(config)?; // re-attaches if tl0 persists
+    device.unpersist()?;                          // idempotent
+    drop(device);                                 // removed if this was the last handle
     Ok(())
 }
 ```
