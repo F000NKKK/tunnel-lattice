@@ -203,7 +203,8 @@ impl TunRsBackend {
 /// | Windows TUN (`send`) | Wintun reports the adapter terminating (`tun-rs` returns `WriteZero`) | [`Error::Disconnected`] |
 /// | Windows TUN | `"The interface has been disabled"`: the adapter was disabled, for example by applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
 /// | Linux (`send`) | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
-/// | Windows TAP | `ERROR_OPERATION_ABORTED` (995): the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this API | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers the first case only |
+/// | Windows TAP (`recv`) | `ERROR_OPERATION_ABORTED` (995) while the adapter's operational status reads up: a read cancelled because the thread that started it exited | not reported: retried once with a fresh read, which waits as usual |
+/// | Windows TAP | `ERROR_OPERATION_ABORTED` (995) otherwise: the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this API | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers the first case only |
 ///
 /// So on Linux, deleting the device (for example with `ip link del`) ends
 /// a pending or later `recv` with [`Error::Disconnected`] in every feature
@@ -213,16 +214,30 @@ impl TunRsBackend {
 /// these errors (every error except [`Error::BufferTooSmall`] ends it).
 ///
 /// [`Error::InvalidState`] from `recv` or `send` means the device exists
-/// but is down or disabled. When applying `DesiredAdminState::Down` made it
-/// so, applying `DesiredAdminState::Up` on the same handle recovers it. A
-/// down Linux device does not fail `recv`: the call waits until a packet
-/// arrives, the device comes up, or it is deleted. On Windows TAP, after
-/// applying `DesiredAdminState::Down`, `send` and `recv` fail at once with
+/// but is not passing packets because it is down or disabled. When
+/// applying `DesiredAdminState::Down` caused it, applying
+/// `DesiredAdminState::Up` on the same handle recovers it. A down Linux
+/// device does not fail `recv`: the call waits until a packet arrives, the
+/// device comes up, or it is deleted. On Windows TAP, after applying
+/// `DesiredAdminState::Down`, `send` and `recv` fail at once with
 /// [`Error::InvalidState`] until `DesiredAdminState::Up` is applied.
-/// Disabling the TAP adapter
-/// outside this API (for example with `Disable-NetAdapter`) fails them with
-/// the same native code and so the same error, but only re-enabling the
-/// adapter the same way recovers it.
+/// Disabling the TAP adapter outside this API (for example with
+/// `Disable-NetAdapter`) fails them with the same native code and so the
+/// same error, but only re-enabling the adapter the same way recovers it.
+///
+/// A Windows TAP adapter also reports that native code for a read that was
+/// cancelled on a healthy adapter: an async `recv` starts its read on the
+/// thread that polls it, and if that `recv` is dropped while waiting and
+/// the thread then exits, Windows cancels the read. While the adapter's
+/// operational status (the one `snapshot` reads) is up, `recv` retries
+/// the first such error in a call once with a fresh read, so the caller
+/// does not see it. A `recv` already waiting when `DesiredAdminState::Down`
+/// is applied may make that one retry, which fails at once, before it
+/// returns [`Error::InvalidState`]. One case remains: a single `recv` call
+/// that meets two such cancelled reads (for example, it collects one left
+/// by an earlier dropped `recv`, and then a thread that polled it exits
+/// while it is still pending) returns [`Error::InvalidState`] once while
+/// the adapter is up, and the next call works.
 ///
 /// `snapshot` reads the administrative state on every call, on Linux,
 /// macOS, and Windows; its documentation in the `DeviceObserver`
@@ -491,9 +506,29 @@ impl TunRsDevice {
         }
         #[cfg(not(feature = "async"))]
         {
-            recv_contract::recv_blocking(open_contract::HOST_OS, self.kind, buf, |buf| {
-                sentinel_recv(&self.handle, buf)
-            })
+            recv_contract::recv_blocking(
+                open_contract::HOST_OS,
+                self.kind,
+                buf,
+                &|| self.oper_state(),
+                |buf| sentinel_recv(&self.handle, buf),
+            )
+        }
+    }
+
+    /// The operational-status read the `recv` contract uses to tell a
+    /// Windows TAP read cancelled on a healthy adapter from a disconnected
+    /// one (see `recv_contract::tap_abort_retries`): the same read as
+    /// `snapshot`'s admin state. The contract never calls it on other
+    /// hosts, where it reports `Unknown`.
+    fn oper_state(&self) -> std::io::Result<tunnel_lattice_model::AdminState> {
+        #[cfg(target_os = "windows")]
+        {
+            admin_state::windows_admin_state(self.handle.if_luid()?)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(tunnel_lattice_model::AdminState::Unknown)
         }
     }
 
@@ -528,14 +563,27 @@ impl TunRsDevice {
                 handle: &self.handle,
                 wait,
             };
-            return recv_contract::recv_async(open_contract::HOST_OS, self.kind, &source, buf)
-                .await;
+            return recv_contract::recv_async(
+                open_contract::HOST_OS,
+                self.kind,
+                &source,
+                &|| self.oper_state(),
+                buf,
+            )
+            .await;
         }
         #[cfg(all(target_os = "linux", feature = "tokio"))]
         let source = &self.reader;
         #[cfg(not(all(target_os = "linux", feature = "tokio")))]
         let source = &self.handle;
-        recv_contract::recv_async(open_contract::HOST_OS, self.kind, source, buf).await
+        recv_contract::recv_async(
+            open_contract::HOST_OS,
+            self.kind,
+            source,
+            &|| self.oper_state(),
+            buf,
+        )
+        .await
     }
 
     /// Async send, retrying transient errors.
@@ -2844,9 +2892,11 @@ mod privileged_tests {
     /// media disconnect by `apply(Down)` gives, although `apply(Up)` does
     /// not undo `Disable-NetAdapter`), so the waiting thread lets go of
     /// the device and the adapter is removed when the device drops (the CI
-    /// leak check confirms nothing is left). Frames that arrive first are
-    /// skipped. The test prints the time from the start of the
-    /// `Disable-NetAdapter` call to the error.
+    /// leak check confirms nothing is left). This holds with the `recv`
+    /// retry of a 995 on an adapter that still reads `Up`: the call must
+    /// not wait on a retried read. Frames that arrive first are skipped.
+    /// The test prints the time from the start of the `Disable-NetAdapter`
+    /// call to the error.
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Administrator and the tap-windows6 driver"]
@@ -2923,10 +2973,13 @@ mod privileged_tests {
     /// `recv` future once (until it is pending, draining any queued
     /// frame), drops it, and exits, which makes Windows cancel that read.
     /// The next `recv` then collects the cancelled read's
-    /// `ERROR_OPERATION_ABORTED`.
-    ///
-    /// Observational: prints the outcome of the next `recv` (2 s bound),
-    /// the snapshot's admin state, and a `send`, without asserting them.
+    /// `ERROR_OPERATION_ABORTED` (before the retry existed, CI showed it
+    /// as `InvalidState` in both async feature sets). Because the adapter
+    /// still reads `Up`, `recv` retries once with a fresh read, which waits
+    /// as usual: no error within 2 s (frames are skipped), the snapshot
+    /// reads `Up`, and a `send` is accepted. The sync build issues and
+    /// waits for each read on one thread, so nothing is orphaned there and
+    /// the test is async-only.
     #[test]
     #[cfg(all(target_os = "windows", feature = "async"))]
     #[ignore = "requires Administrator and the tap-windows6 driver"]
@@ -2979,6 +3032,10 @@ mod privileged_tests {
                 .expect("the orphaning thread does not panic")
         });
         eprintln!("windows TAP recv left pending on attempt {orphaned:?}");
+        assert!(
+            orphaned.is_some(),
+            "no recv was left pending, so no read was orphaned"
+        );
         std::thread::sleep(Duration::from_millis(100));
 
         let next_recv = BlockingCall::spawn(&device, &name, move |device| {
@@ -2990,10 +3047,22 @@ mod privileged_tests {
         });
         let received = next_recv.wait(Duration::from_secs(2));
         eprintln!("windows TAP recv after an orphaned read, after 2 s: {received:?}");
+        assert!(
+            received.is_none(),
+            "recv after an orphaned read keeps waiting: {received:?}"
+        );
         let state = device.snapshot().map(|snapshot| snapshot.admin_state);
         eprintln!("windows TAP admin state after an orphaned read: {state:?}");
+        assert!(
+            matches!(state, Ok(AdminState::Up)),
+            "admin state after an orphaned read: {state:?}"
+        );
         let sent = PacketIo::send(&*device, &frame);
         eprintln!("windows TAP send after an orphaned read: {sent:?}");
+        assert!(
+            matches!(sent, Ok(42)),
+            "send after an orphaned read: {sent:?}"
+        );
     }
 
     /// A TAP device opened with a MAC address reports it, reports
@@ -4087,10 +4156,12 @@ mod privileged_tests {
     /// is accepted again on the same handle. While it is down, `send`
     /// reports `InvalidState`: on TUN the Wintun session ended; on TAP the
     /// media is disconnected and the native call fails with
-    /// `ERROR_OPERATION_ABORTED`. On TAP a `recv` started while down also
-    /// reports `InvalidState` (within 2 s; it fails at once), and a `recv`
-    /// started after `Up` waits again instead of failing (frames are
-    /// skipped; checked for 2 s).
+    /// `ERROR_OPERATION_ABORTED`. On TAP a `recv` already waiting when
+    /// `Down` is applied ends with `InvalidState` within 2 s (even if the
+    /// operational status still read `Up` and the read was retried once),
+    /// a `recv` started while down also reports `InvalidState` (within 2 s;
+    /// it fails at once), and a `recv` started after `Up` waits again
+    /// instead of failing (frames are skipped; checked for 2 s).
     ///
     /// Every call runs on a helper thread with a bounded wait. The helpers
     /// are released ([`BlockingCall`]) before the device drops, which
@@ -4147,7 +4218,29 @@ mod privileged_tests {
         eprintln!("{kind:?} {state:?} {waited:?} after open");
         assert_eq!(state, AdminState::Up, "{kind:?} after open");
 
+        // TAP: a `recv` already waiting when `apply(Down)` disconnects the
+        // media. Its read fails with `ERROR_OPERATION_ABORTED` before the
+        // operational status reads `Down`, so it may be retried once; the
+        // retry fails at once, so the call still ends with `InvalidState`.
+        let recv_across_down = (kind == DeviceKind::Tap).then(|| {
+            let call = bounded_recv();
+            // Let it reach its wait first.
+            std::thread::sleep(Duration::from_millis(500));
+            call
+        });
+        let applied = std::time::Instant::now();
         set_admin(DesiredAdminState::Down);
+        if let Some(call) = &recv_across_down {
+            let received = call.wait(Duration::from_secs(2));
+            eprintln!(
+                "{kind:?} recv pending across apply(Down): {received:?} after {:?}",
+                applied.elapsed()
+            );
+            assert!(
+                matches!(received, Some(Err(Error::InvalidState))),
+                "{kind:?} recv pending across apply(Down): {received:?}"
+            );
+        }
         let (state, waited) = poll_admin_state(&device, AdminState::Down);
         eprintln!("{kind:?} {state:?} {waited:?} after apply(Down)");
         assert_eq!(state, AdminState::Down, "{kind:?} after apply(Down)");

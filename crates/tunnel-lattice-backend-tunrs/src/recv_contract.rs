@@ -24,7 +24,8 @@
 //! | Windows (send) | code-less `WriteZero` (Wintun `ERROR_HANDLE_EOF`: the adapter is terminating) | [`Error::Disconnected`] |
 //! | Windows | code-less `Other`, message exactly `"The interface has been disabled"` (Wintun session ended by `apply(Down)`; `apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | Linux (send) | raw `EIO` (5): the device is administratively down (`apply(Up)` recovers it) | [`Error::InvalidState`] |
-//! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`): the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it) | [`Error::InvalidState`] |
+//! | Windows, TAP only (recv) | the first raw 995 (`ERROR_OPERATION_ABORTED`) in a call while the adapter's operational status reads `Up`: a read cancelled because the thread that issued it exited, on a healthy adapter | retried once ([`tap_abort_retries`]) |
+//! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`) otherwise (on `recv`: the status is not `Up`, the status read fails, or the call already retried): the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
 //!
 //! `WriteZero` and `EIO` are remapped on `send` only, so the same signal
@@ -32,14 +33,33 @@
 //! takes the [`DeviceKind`] as well: it applies to a TAP handle only, on
 //! both directions, and a Wintun (TUN) 995 keeps its generic meaning.
 //!
+//! The Windows TAP `recv` retry exists because a healthy adapter also
+//! reports 995: an async `recv` issues its overlapped read on the thread
+//! that polls it, and if that future is dropped while the read is pending
+//! and the thread then exits, Windows cancels the read, and the next
+//! `recv` collects the 995. While the adapter reads `Up`, the first 995 in
+//! a call is retried with a fresh read, which waits as usual, so the
+//! caller sees nothing. A read pending when `apply(Down)` disconnects the
+//! media can report 995 before the status reads `Down`; its retry then
+//! fails at once with a second 995, which is reported. The status is read
+//! at most once per call, and a call retries at most once, so it never
+//! spins. One case remains: a single `recv` call that meets two reads
+//! cancelled this way (for example, it collects one left by an earlier
+//! dropped `recv`, and then a thread that polled it exits while it is
+//! still pending) reports [`Error::InvalidState`] once while the adapter
+//! is up, and the next call works. `send` has no
+//! such retry: `tun-rs` discards a cancelled pending write, so a `send`
+//! 995 always comes from the driver refusing a fresh write.
+//!
 //! [`Error::InvalidState`] from `recv`/`send` means the device exists but
-//! is down or disabled. When this API made it so (`apply` with
-//! `DesiredAdminState::Down`), applying `DesiredAdminState::Up` on the same
-//! handle recovers it. A down Linux device does not fail `recv` at all:
-//! the read waits until the device is up and traffic arrives. A Windows TAP
-//! adapter disabled outside this API (`Disable-NetAdapter`) also fails with
-//! raw 995 and so also reads as [`Error::InvalidState`], but only
-//! re-enabling the adapter outside this API recovers that one.
+//! is not passing packets because it is down or disabled. When applying
+//! `DesiredAdminState::Down` caused it, applying `DesiredAdminState::Up`
+//! on the same handle recovers it. A down Linux device does not fail
+//! `recv` at all: the read waits until the device is up and traffic
+//! arrives. A Windows TAP adapter disabled outside this API
+//! (`Disable-NetAdapter`) also fails with raw 995 and so also reads as
+//! [`Error::InvalidState`], but only re-enabling the adapter outside this
+//! API recovers that one.
 //!
 //! Linux TUN/TAP and macOS utun truncate an oversize packet silently, so on
 //! unix the backend reads into `[buf, 1-byte sentinel]` with `readv`: a
@@ -56,7 +76,7 @@ use std::future::Future;
 use std::io;
 
 use tunnel_lattice_core::{Error, Result};
-use tunnel_lattice_model::DeviceKind;
+use tunnel_lattice_model::{AdminState, DeviceKind};
 
 use crate::io_error;
 use crate::open_contract::HostOs;
@@ -125,14 +145,47 @@ pub(crate) fn is_transient(os: HostOs, err: &io::Error) -> bool {
     eintr || feth_empty_read
 }
 
+/// Whether a Windows TAP `recv` retries a raw 995 instead of reporting
+/// [`Error::InvalidState`]: only the first 995 within one call (`retried`
+/// is still `false`), and only when the adapter's operational status,
+/// read by `oper`, is `Up`. A status that is not `Up`, or a failed read,
+/// is not retried, so a vanished or disabled adapter never leads to a
+/// retry. Once the call has retried, `oper` is not called again.
+///
+/// A healthy adapter reports 995 when a read was cancelled because the
+/// thread that issued it exited (an async `recv` issues its read on the
+/// thread that polls it); the retry issues a fresh read, which waits as
+/// usual. A read pending while `apply(Down)` disconnects the media can
+/// report 995 before the operational status reads `Down`; its retry
+/// fails at once with a second 995, which is reported.
+pub(crate) fn tap_abort_retries(
+    retried: bool,
+    oper: impl FnOnce() -> io::Result<AdminState>,
+) -> bool {
+    !retried && matches!(oper(), Ok(AdminState::Up))
+}
+
 /// Maps one native `recv` attempt on a `kind` handle that read into a
-/// `buf_len`-byte buffer.
+/// `buf_len`-byte buffer. `retried` is the call's state for the Windows
+/// TAP 995 retry (see [`tap_abort_retries`], which `oper` feeds); it is
+/// `false` at the start of each call and set when that retry is taken.
 pub(crate) fn recv_step(
     os: HostOs,
     kind: DeviceKind,
     buf_len: usize,
     result: io::Result<usize>,
+    retried: &mut bool,
+    oper: impl FnOnce() -> io::Result<AdminState>,
 ) -> Step {
+    if let Err(err) = &result
+        && os == HostOs::Windows
+        && kind == DeviceKind::Tap
+        && err.raw_os_error() == Some(ERROR_OPERATION_ABORTED)
+        && tap_abort_retries(*retried, oper)
+    {
+        *retried = true;
+        return Step::Retry;
+    }
     match result {
         Ok(n) if n > buf_len => Step::Done(Err(Error::BufferTooSmall)),
         Ok(n) => Step::Done(Ok(n)),
@@ -222,7 +275,14 @@ fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Erro
     // adapter disabled outside this API fails the same way, so it reads as
     // `InvalidState` too. Wintun never reports this code for a disabled
     // adapter (it uses `WINDOWS_TUN_DISABLED_MESSAGE`), so the rule is
-    // limited to TAP.
+    // limited to TAP. A healthy adapter also reports 995 for a read that
+    // was cancelled because the thread that issued it exited; on `recv`
+    // that case never gets here while the adapter reads `Up`, because
+    // `recv_step` retries it first (`tap_abort_retries`). On `send` a 995
+    // is never such a cancellation: `tun-rs` 2.8.11 logs and discards a
+    // cancelled pending write (`platform/windows/tap/overlapped.rs`, the
+    // `finish_pending_*` path), so a `send` 995 comes from a fresh write
+    // the driver refused.
     let tap_media_down = os == HostOs::Windows && kind == DeviceKind::Tap;
     match err.raw_os_error() {
         Some(ENXIO) if unix => Some(Error::Disconnected),
@@ -237,20 +297,27 @@ fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Erro
 }
 
 /// Blocking `recv`: calls `read(buf)` until it returns something other
-/// than a transient error.
+/// than a transient error. `oper` reads the adapter's operational status
+/// for the Windows TAP 995 retry (see [`tap_abort_retries`]); it is
+/// called at most once per call, and never on other hosts or kinds.
 #[cfg_attr(
     all(feature = "async", not(test)),
     expect(dead_code, reason = "async builds block on `recv_async` instead")
 )]
-pub(crate) fn recv_blocking(
+pub(crate) fn recv_blocking<O>(
     os: HostOs,
     kind: DeviceKind,
     buf: &mut [u8],
+    oper: &O,
     mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
-) -> Result<usize> {
+) -> Result<usize>
+where
+    O: Fn() -> io::Result<AdminState>,
+{
     let buf_len = buf.len();
+    let mut retried = false;
     loop {
-        if let Step::Done(result) = recv_step(os, kind, buf_len, read(buf)) {
+        if let Step::Done(result) = recv_step(os, kind, buf_len, read(buf), &mut retried, oper) {
             return result;
         }
     }
@@ -284,20 +351,28 @@ pub(crate) trait AsyncRecvSource {
 
 /// Async `recv`: re-awaits `source.recv_native(buf)` until it returns
 /// something other than a transient error. Each retry re-enters the native
-/// readiness wait, so it never spins.
+/// readiness wait, so it never spins. `oper` is the status read of
+/// [`recv_blocking`]; it is `Sync` so the returned future stays `Send`.
 #[cfg_attr(
     all(not(feature = "async"), not(test)),
     expect(dead_code, reason = "only async builds hold an async handle")
 )]
-pub(crate) async fn recv_async<S: AsyncRecvSource + ?Sized>(
+pub(crate) async fn recv_async<S, O>(
     os: HostOs,
     kind: DeviceKind,
     source: &S,
+    oper: &O,
     buf: &mut [u8],
-) -> Result<usize> {
+) -> Result<usize>
+where
+    S: AsyncRecvSource + ?Sized,
+    O: Fn() -> io::Result<AdminState> + Sync,
+{
     let buf_len = buf.len();
+    let mut retried = false;
     loop {
-        if let Step::Done(result) = recv_step(os, kind, buf_len, source.recv_native(buf).await) {
+        let result = source.recv_native(buf).await;
+        if let Step::Done(result) = recv_step(os, kind, buf_len, result, &mut retried, oper) {
             return result;
         }
     }
@@ -357,16 +432,69 @@ mod tests {
         recv_result_on(os, TUN, buf_len, result)
     }
 
+    /// One `recv_step` at the start of a call, with a status read that
+    /// must not be called.
     fn recv_result_on(
         os: HostOs,
         kind: DeviceKind,
         buf_len: usize,
         result: io::Result<usize>,
     ) -> Option<Result<usize>> {
-        match recv_step(os, kind, buf_len, result) {
+        match recv_step(os, kind, buf_len, result, &mut false, no_status) {
             Step::Retry => None,
             Step::Done(result) => Some(result),
         }
+    }
+
+    /// A status read for a path that must never read the status.
+    fn no_status() -> io::Result<AdminState> {
+        panic!("the status is read only for a Windows TAP 995 on recv")
+    }
+
+    fn aborted() -> io::Error {
+        io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED)
+    }
+
+    /// A scripted operational-status read that counts its calls.
+    struct Status {
+        result: fn() -> io::Result<AdminState>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Status {
+        fn new(result: fn() -> io::Result<AdminState>) -> Self {
+            Self {
+                result,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn read(&self) -> io::Result<AdminState> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (self.result)()
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn up() -> io::Result<AdminState> {
+        Ok(AdminState::Up)
+    }
+
+    fn down() -> io::Result<AdminState> {
+        Ok(AdminState::Down)
+    }
+
+    fn unknown() -> io::Result<AdminState> {
+        Ok(AdminState::Unknown)
+    }
+
+    fn status_failed() -> io::Result<AdminState> {
+        // `ERROR_NOT_FOUND`: `GetIfEntry2` on a vanished interface.
+        Err(io::Error::from_raw_os_error(1168))
     }
 
     /// Drives a future that is ready without a real waker (every mock
@@ -446,14 +574,21 @@ mod tests {
 
     /// Windows raw 995 (`ERROR_OPERATION_ABORTED`, a tap-windows adapter
     /// whose media `apply(Down)` disconnected) is `InvalidState` on both
-    /// directions of a Windows TAP handle only. On a Windows TUN handle and
-    /// on every other host it stays a generic platform error.
+    /// directions of a Windows TAP handle only (on `recv`, once the status
+    /// reads `Down`). On a Windows TUN handle and on every other host it
+    /// stays a generic platform error, and the status is never read.
     #[test]
     fn raw_operation_aborted_is_invalid_state_on_windows_tap_only() {
-        let aborted = || io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED);
         let tap = DeviceKind::Tap;
-        let recv = recv_err_on(HostOs::Windows, tap, aborted());
-        assert!(matches!(recv, Err(Error::InvalidState)), "{recv:?}");
+        let status = Status::new(down);
+        let recv = recv_step(HostOs::Windows, tap, 64, Err(aborted()), &mut false, || {
+            status.read()
+        });
+        assert!(
+            matches!(recv, Step::Done(Err(Error::InvalidState))),
+            "{recv:?}"
+        );
+        assert_eq!(status.calls(), 1);
         let send = send_result_on(HostOs::Windows, tap, aborted());
         assert!(matches!(send, Err(Error::InvalidState)), "{send:?}");
         for os in ALL_OSES {
@@ -461,6 +596,7 @@ mod tests {
                 if os == HostOs::Windows && kind == DeviceKind::Tap {
                     continue;
                 }
+                // `recv_err_on` panics if the status is read.
                 let recv = recv_err_on(os, kind, aborted());
                 assert!(
                     matches!(recv, Err(Error::Platform(_))),
@@ -475,16 +611,174 @@ mod tests {
         }
     }
 
-    /// The Windows TAP 995 rule ends the blocking and async loops after
-    /// one native call.
+    /// The retry decision: only a call that has not retried yet, and only
+    /// while the status reads `Up`. A call that already retried does not
+    /// read the status.
     #[test]
-    fn windows_tap_media_down_ends_the_loops_after_one_call() {
-        let aborted = || io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED);
-        let script = Script::new(vec![Err(aborted()), Ok(3)], b"abc");
+    fn tap_abort_retries_only_the_first_995_of_a_call_while_up() {
+        for (result, expected) in [
+            (up as fn() -> io::Result<AdminState>, true),
+            (down, false),
+            (unknown, false),
+            (status_failed, false),
+        ] {
+            let status = Status::new(result);
+            assert_eq!(
+                tap_abort_retries(false, || status.read()),
+                expected,
+                "{:?}",
+                result()
+            );
+            assert_eq!(status.calls(), 1);
+        }
+        for result in [up as fn() -> io::Result<AdminState>, down, status_failed] {
+            let status = Status::new(result);
+            assert!(!tap_abort_retries(true, || status.read()));
+            assert_eq!(status.calls(), 0, "a retried call does not read the status");
+        }
+    }
+
+    /// A Windows TAP 995 on `recv`, through `recv_step`: retried once
+    /// while the status reads `Up` (marking the call), `InvalidState` on
+    /// the call's second 995 without a status read.
+    #[test]
+    fn recv_step_retries_a_windows_tap_995_once_per_call() {
+        let status = Status::new(up);
+        let mut retried = false;
+        let step = |retried: &mut bool| {
+            recv_step(
+                HostOs::Windows,
+                DeviceKind::Tap,
+                64,
+                Err(aborted()),
+                retried,
+                || status.read(),
+            )
+        };
+        assert!(matches!(step(&mut retried), Step::Retry));
+        assert!(retried);
+        assert!(matches!(
+            step(&mut retried),
+            Step::Done(Err(Error::InvalidState))
+        ));
+        assert_eq!(status.calls(), 1);
+    }
+
+    /// The blocking and async loops on Windows TAP: a 995 then data is
+    /// one transparent retry; two 995s, a `Down` status or a failed status
+    /// read end the call with `InvalidState`. The status is read at most
+    /// once per call.
+    #[test]
+    fn windows_tap_recv_loops_retry_one_995_while_up() {
+        type Case = (
+            Vec<io::Result<usize>>,
+            fn() -> io::Result<AdminState>,
+            Option<usize>,
+            usize,
+        );
+        let cases = || -> Vec<Case> {
+            vec![
+                (vec![Err(aborted()), Ok(5)], up, Some(5), 2),
+                (vec![Err(aborted()), Err(aborted()), Ok(5)], up, None, 2),
+                (vec![Err(aborted()), Ok(5)], down, None, 1),
+                (vec![Err(aborted()), Ok(5)], unknown, None, 1),
+                (vec![Err(aborted()), Ok(5)], status_failed, None, 1),
+            ]
+        };
+        for (results, result, expected, reads) in cases() {
+            let script = Script::new(results, b"abcde");
+            let status = Status::new(result);
+            let mut buf = [0u8; 8];
+            let got = recv_blocking(
+                HostOs::Windows,
+                DeviceKind::Tap,
+                &mut buf,
+                &|| status.read(),
+                |buf| script.read(buf),
+            );
+            check_tap_recv(&got, expected);
+            assert_eq!(script.calls(), reads, "blocking reads, {expected:?}");
+            assert_eq!(status.calls(), 1, "blocking status reads, {expected:?}");
+        }
+        for (results, result, expected, reads) in cases() {
+            let source = AsyncScript(std::sync::Mutex::new(Script::new(results, b"abcde")));
+            let status = Status::new(result);
+            let mut buf = [0u8; 8];
+            let got = ready(recv_async(
+                HostOs::Windows,
+                DeviceKind::Tap,
+                &source,
+                &|| status.read(),
+                &mut buf,
+            ));
+            check_tap_recv(&got, expected);
+            let calls = source.0.lock().unwrap().calls();
+            assert_eq!(calls, reads, "async reads, {expected:?}");
+            assert_eq!(status.calls(), 1, "async status reads, {expected:?}");
+        }
+    }
+
+    /// `Some(n)` expects `Ok(n)`; `None` expects `InvalidState`.
+    fn check_tap_recv(got: &Result<usize>, expected: Option<usize>) {
+        match expected {
+            Some(n) => assert!(matches!(got, Ok(m) if *m == n), "{got:?}"),
+            None => assert!(matches!(got, Err(Error::InvalidState)), "{got:?}"),
+        }
+    }
+
+    /// A 995 that is not a Windows TAP `recv` 995 leaves the loops' result
+    /// as it was and never reads the status: Windows TUN and every other
+    /// host, TUN and TAP.
+    #[test]
+    fn other_995s_do_not_read_the_status() {
+        for os in ALL_OSES {
+            for kind in [DeviceKind::Tun, DeviceKind::Tap] {
+                if os == HostOs::Windows && kind == DeviceKind::Tap {
+                    continue;
+                }
+                let script = Script::new(vec![Err(aborted()), Ok(3)], b"abc");
+                let mut buf = [0u8; 8];
+                let got = recv_blocking(os, kind, &mut buf, &no_status, |buf| script.read(buf));
+                assert!(matches!(got, Err(Error::Platform(_))), "{os:?} {kind:?}");
+                assert_eq!(script.calls(), 1);
+                let source = AsyncScript(std::sync::Mutex::new(Script::new(
+                    vec![Err(aborted()), Ok(3)],
+                    b"abc",
+                )));
+                let got = ready(recv_async(os, kind, &source, &no_status, &mut buf));
+                assert!(matches!(got, Err(Error::Platform(_))), "{os:?} {kind:?}");
+                assert_eq!(source.0.lock().unwrap().calls(), 1);
+            }
+        }
+    }
+
+    /// The Windows TAP 995 rule ends the loops: `recv` after its one
+    /// retry (status `Up`) or at once (status `Down`), `send` after one
+    /// native call (it never retries a 995).
+    #[test]
+    fn windows_tap_media_down_ends_the_loops() {
+        let script = Script::new(vec![Err(aborted()), Err(aborted()), Ok(3)], b"abc");
+        let status = Status::new(up);
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Windows, DeviceKind::Tap, &mut buf, |buf| {
-            script.read(buf)
-        });
+        let result = recv_blocking(
+            HostOs::Windows,
+            DeviceKind::Tap,
+            &mut buf,
+            &|| status.read(),
+            |buf| script.read(buf),
+        );
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert_eq!(script.calls(), 2);
+
+        let script = Script::new(vec![Err(aborted()), Ok(3)], b"abc");
+        let status = Status::new(down);
+        let result = recv_blocking(
+            HostOs::Windows,
+            DeviceKind::Tap,
+            &mut buf,
+            &|| status.read(),
+            |buf| script.read(buf),
+        );
         assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
         assert_eq!(script.calls(), 1);
 
@@ -493,6 +787,11 @@ mod tests {
             let result = script.read(&mut []);
             async move { result }
         }));
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert_eq!(script.calls(), 1);
+
+        let script = Script::new(vec![Err(aborted()), Ok(5)], b"");
+        let result = send_blocking(HostOs::Windows, DeviceKind::Tap, || script.read(&mut []));
         assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
         assert_eq!(script.calls(), 1);
     }
@@ -672,7 +971,9 @@ mod tests {
             b"abc",
         );
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf));
+        let result = recv_blocking(HostOs::Linux, TUN, &mut buf, &no_status, |buf| {
+            script.read(buf)
+        });
         assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
         assert_eq!(script.calls(), 1);
 
@@ -680,7 +981,13 @@ mod tests {
             vec![Err(wintun_disabled()), Ok(3)],
             b"abc",
         )));
-        let result = ready(recv_async(HostOs::Windows, TUN, &source, &mut buf));
+        let result = ready(recv_async(
+            HostOs::Windows,
+            TUN,
+            &source,
+            &no_status,
+            &mut buf,
+        ));
         assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
         assert_eq!(source.0.lock().unwrap().calls(), 1);
 
@@ -900,7 +1207,10 @@ mod tests {
     fn blocking_recv_retries_eintr_and_the_caller_sees_only_the_data() {
         let script = Script::new(vec![Err(eintr()), Ok(3)], b"abc");
         let mut buf = [0u8; 8];
-        let n = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf)).unwrap();
+        let n = recv_blocking(HostOs::Linux, TUN, &mut buf, &no_status, |buf| {
+            script.read(buf)
+        })
+        .unwrap();
         assert_eq!(&buf[..n], b"abc");
         assert_eq!(script.calls(), 2);
     }
@@ -912,7 +1222,9 @@ mod tests {
             b"",
         );
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Macos, TUN, &mut buf, |buf| script.read(buf));
+        let result = recv_blocking(HostOs::Macos, TUN, &mut buf, &no_status, |buf| {
+            script.read(buf)
+        });
         assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
         assert_eq!(script.calls(), 3);
     }
@@ -921,7 +1233,9 @@ mod tests {
     fn blocking_recv_does_not_retry_code_less_interrupted() {
         let script = Script::new(vec![Err(cancel()), Ok(3)], b"abc");
         let mut buf = [0u8; 8];
-        let result = recv_blocking(HostOs::Macos, TUN, &mut buf, |buf| script.read(buf));
+        let result = recv_blocking(HostOs::Macos, TUN, &mut buf, &no_status, |buf| {
+            script.read(buf)
+        });
         assert!(matches!(
             result,
             Err(Error::Platform(PlatformErrorCode::Unknown))
@@ -935,9 +1249,13 @@ mod tests {
     fn blocking_recv_reports_an_oversize_packet_and_stays_usable() {
         let script = Script::new(vec![Ok(9), Ok(3)], b"abcdefghi");
         let mut buf = [0u8; 8];
-        let first = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf));
+        let first = recv_blocking(HostOs::Linux, TUN, &mut buf, &no_status, |buf| {
+            script.read(buf)
+        });
         assert!(matches!(first, Err(Error::BufferTooSmall)));
-        let second = recv_blocking(HostOs::Linux, TUN, &mut buf, |buf| script.read(buf));
+        let second = recv_blocking(HostOs::Linux, TUN, &mut buf, &no_status, |buf| {
+            script.read(buf)
+        });
         assert_eq!(second.unwrap(), 3);
     }
 
@@ -960,7 +1278,14 @@ mod tests {
             b"abc",
         )));
         let mut buf = [0u8; 8];
-        let n = ready(recv_async(HostOs::Macos, TUN, &source, &mut buf)).unwrap();
+        let n = ready(recv_async(
+            HostOs::Macos,
+            TUN,
+            &source,
+            &no_status,
+            &mut buf,
+        ))
+        .unwrap();
         assert_eq!(&buf[..n], b"abc");
         assert_eq!(source.0.lock().unwrap().calls(), 3);
     }
@@ -973,7 +1298,13 @@ mod tests {
                 b"abc",
             )));
             let mut buf = [0u8; 8];
-            let result = ready(recv_async(HostOs::Linux, TUN, &source, &mut buf));
+            let result = ready(recv_async(
+                HostOs::Linux,
+                TUN,
+                &source,
+                &no_status,
+                &mut buf,
+            ));
             assert_eq!(
                 matches!(result, Err(Error::Disconnected)),
                 expected_disconnected,
@@ -991,9 +1322,21 @@ mod tests {
             b"abcdefghi",
         )));
         let mut buf = [0u8; 8];
-        let first = ready(recv_async(HostOs::Linux, TUN, &source, &mut buf));
+        let first = ready(recv_async(
+            HostOs::Linux,
+            TUN,
+            &source,
+            &no_status,
+            &mut buf,
+        ));
         assert!(matches!(first, Err(Error::BufferTooSmall)));
-        let second = ready(recv_async(HostOs::Linux, TUN, &source, &mut buf));
+        let second = ready(recv_async(
+            HostOs::Linux,
+            TUN,
+            &source,
+            &no_status,
+            &mut buf,
+        ));
         assert_eq!(second.unwrap(), 3);
     }
 
