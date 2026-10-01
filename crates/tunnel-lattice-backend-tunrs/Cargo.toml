@@ -72,9 +72,17 @@ libloading = "0.9.0"
 # `TunRsBackend::capabilities` probes for the tap-windows6 (`tap0901`)
 # driver through SetupAPI (see `src/windows_tap_probe.rs`), following the
 # driver lookup tun-rs's own `open(Tap)` performs, without creating a
-# device. Already locked at 0.61.2 via tun-rs 2.8.11; adds no package to
+# device. `snapshot` reads the administrative state with `GetIfEntry2`
+# (`Win32_NetworkManagement_IpHelper`, keyed by a `NET_LUID_LH` from
+# `Win32_NetworkManagement_Ndis`); tun-rs 2.8.11 already enables both
+# features. Already locked at 0.61.2 via tun-rs 2.8.11; adds no package to
 # Cargo.lock.
-windows-sys = { version = "0.61.2", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
 
 # Test-only: the privileged teardown tests drive a real device through
 # `tunnel-lattice-async`'s `PacketStream` (the native adapter in async

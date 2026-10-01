@@ -23,10 +23,20 @@
 //! | Linux (recv) | raw `EFAULT` (14): a read already blocked when the device was deleted | [`Error::Disconnected`] |
 //! | Windows (send) | code-less `WriteZero` (Wintun `ERROR_HANDLE_EOF`: the adapter is terminating) | [`Error::Disconnected`] |
 //! | Windows | code-less `Other`, message exactly `"The interface has been disabled"` (Wintun session ended by `apply(Down)`; `apply(Up)` recovers it) | [`Error::InvalidState`] |
+//! | Linux (send) | raw `EIO` (5): the device is administratively down (`apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
 //!
-//! `WriteZero` is remapped on `send` only, so the same kind from any other
-//! operation keeps its generic meaning.
+//! `WriteZero` and `EIO` are remapped on `send` only, so the same signal
+//! from any other operation keeps its generic meaning.
+//!
+//! [`Error::InvalidState`] from `recv`/`send` always means the device
+//! exists but is down or disabled in a way that applying
+//! `DesiredAdminState::Up` on the same handle recovers. A down Linux
+//! device does not fail `recv` at all: the read waits until the device is
+//! up and traffic arrives. A Windows TAP `recv` that fails with raw 995
+//! (`ERROR_OPERATION_ABORTED`) is not remapped: the same code comes from
+//! an adapter disabled outside this API (which `apply` cannot undo) and
+//! from a cancelled read on a healthy adapter.
 //!
 //! Linux TUN/TAP and macOS utun truncate an oversize packet silently, so on
 //! unix the backend reads into `[buf, 1-byte sentinel]` with `readv`: a
@@ -77,6 +87,10 @@ const EBADFD: i32 = 77;
 /// Linux `EFAULT` (asserted against `libc` by the unit tests on Linux).
 /// Mapped on Linux `recv` only; see [`recv_error`].
 const EFAULT: i32 = 14;
+
+/// Linux `EIO` (asserted against `libc` by the unit tests on Linux).
+/// Mapped on Linux `send` only; see [`send_error`].
+const EIO: i32 = 5;
 
 /// What a `recv`/`send` loop does with one native attempt's result.
 #[derive(Debug)]
@@ -152,8 +166,8 @@ fn recv_error(os: HostOs, err: io::Error) -> Error {
 }
 
 /// Maps a non-transient `send` error: Wintun's send-side end-of-life
-/// signal, then the device-lifecycle rules shared with `recv`, then
-/// [`io_error`].
+/// signal, then the Linux send-only `EIO` rule, then the device-lifecycle
+/// rules shared with `recv`, then [`io_error`].
 fn send_error(os: HostOs, err: io::Error) -> Error {
     // `tun-rs` reports Wintun `ERROR_HANDLE_EOF` as `WriteZero` on send
     // (and as `UnexpectedEof`, already `Disconnected`, on receive).
@@ -162,6 +176,19 @@ fn send_error(os: HostOs, err: io::Error) -> Error {
         && err.kind() == io::ErrorKind::WriteZero;
     if wintun_send_eof {
         return Error::Disconnected;
+    }
+    // Linux `tun.c` has exactly one `EIO` on its write path: `tun_get_user`
+    // refuses a packet while the device is administratively down (the
+    // `!(dev->flags & IFF_UP)` check, `tun.c:1895` in Linux 7.0). The check
+    // is on the common path, so TUN and TAP behave alike, and applying `Up`
+    // on the same handle makes it send again: `InvalidState`, like a
+    // disabled Wintun adapter. Re-examine this rule if the virtio-net
+    // header, napi frags or an XDP program is ever enabled, or a kernel adds
+    // another `EIO` to that path. Matched on the raw code only; never on
+    // `recv` (the read path has no `EIO`: a down device makes `recv` wait)
+    // nor on macOS (where `EIO` has unrelated meanings).
+    if os == HostOs::Linux && err.raw_os_error() == Some(EIO) {
+        return Error::InvalidState;
     }
     lifecycle_error(os, &err).unwrap_or_else(|| io_error(err))
 }
@@ -337,6 +364,45 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn efault_matches_libc_on_linux() {
         assert_eq!(EFAULT, libc::EFAULT);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn eio_matches_libc_on_linux() {
+        assert_eq!(EIO, libc::EIO);
+    }
+
+    /// A send to an administratively down Linux device fails with raw
+    /// `EIO`: `InvalidState` on Linux `send` only. The same raw code on
+    /// Linux `recv` or on any other host is not remapped to it.
+    #[test]
+    fn raw_eio_is_invalid_state_on_linux_send_only() {
+        let eio = || io::Error::from_raw_os_error(EIO);
+        assert!(matches!(
+            send_result(HostOs::Linux, eio()),
+            Err(Error::InvalidState)
+        ));
+        let recv = recv_err(HostOs::Linux, eio());
+        assert!(!matches!(recv, Err(Error::InvalidState)), "{recv:?}");
+        for os in [HostOs::Macos, HostOs::Windows, HostOs::Other] {
+            let send = send_result(os, eio());
+            assert!(!matches!(send, Err(Error::InvalidState)), "{os:?} {send:?}");
+            let recv = recv_err(os, eio());
+            assert!(!matches!(recv, Err(Error::InvalidState)), "{os:?} {recv:?}");
+        }
+    }
+
+    /// Windows raw 995 (`ERROR_OPERATION_ABORTED`) is not remapped on
+    /// either direction: it stays a platform error (a Windows TAP adapter
+    /// disabled outside this API, or a cancelled read on a healthy one).
+    #[test]
+    fn raw_operation_aborted_stays_a_platform_error_on_windows() {
+        const ERROR_OPERATION_ABORTED: i32 = 995;
+        let aborted = || io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED);
+        let recv = recv_err(HostOs::Windows, aborted());
+        assert!(matches!(recv, Err(Error::Platform(_))), "{recv:?}");
+        let send = send_result(HostOs::Windows, aborted());
+        assert!(matches!(send, Err(Error::Platform(_))), "{send:?}");
     }
 
     /// A read blocked across the Linux device deletion fails with raw

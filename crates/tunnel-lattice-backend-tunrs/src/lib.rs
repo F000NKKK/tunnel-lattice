@@ -18,6 +18,7 @@
 
 #![warn(missing_docs)]
 
+mod admin_state;
 #[cfg(any(all(target_os = "macos", feature = "async"), all(test, unix)))]
 mod macos_tap;
 mod open_contract;
@@ -29,7 +30,7 @@ mod windows_tap_probe;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
-    AdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
+    Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
 };
 #[cfg(feature = "async")]
 use tunnel_lattice_platform::AsyncPacketIo;
@@ -197,6 +198,7 @@ impl TunRsBackend {
 /// | Linux (`recv`) | `EFAULT`: a blocking read already waiting when the device was deleted | [`Error::Disconnected`] |
 /// | Windows TUN (`send`) | Wintun reports the adapter terminating (`tun-rs` returns `WriteZero`) | [`Error::Disconnected`] |
 /// | Windows TUN | `"The interface has been disabled"`: the adapter was disabled, for example by applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
+/// | Linux (`send`) | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
 ///
 /// So on Linux, deleting the device (for example with `ip link del`) ends
 /// a pending or later `recv` with [`Error::Disconnected`] in every feature
@@ -204,6 +206,20 @@ impl TunRsBackend {
 /// `async-io` or `tokio`, a pending `recv` notices within about 250 ms).
 /// A `PacketStream` from `tunnel-lattice-async` ends after any of
 /// these errors (every error except [`Error::BufferTooSmall`] ends it).
+///
+/// [`Error::InvalidState`] from `recv` or `send` always means the device
+/// is down or disabled and applying `DesiredAdminState::Up` on the same
+/// handle recovers it. A down Linux device does not fail `recv`: the call
+/// waits until a packet arrives, the device comes up, or it is deleted.
+/// On Windows TAP, disabling the adapter (for example with
+/// `Disable-NetAdapter`) ends a waiting `recv` with
+/// `Platform(Windows(995))` (`ERROR_OPERATION_ABORTED`), which is not
+/// remapped: a healthy adapter can report it too, and applying
+/// `DesiredAdminState::Up` does not undo `Disable-NetAdapter`.
+///
+/// `snapshot` reads the administrative state on every call, on Linux,
+/// macOS, and Windows; its documentation in the `DeviceObserver`
+/// implementation below says what `AdminState::Up` means on each.
 pub struct TunRsDevice {
     kind: DeviceKind,
     /// The interface index read once at open; see [`DeviceObserver::id`].
@@ -589,23 +605,43 @@ impl DeviceObserver for TunRsDevice {
 
     /// The returned record's `id` is the identity captured at open
     /// ([`DeviceObserver::id`]), not a fresh index read.
+    ///
+    /// Its administrative state is read from the host on every call, and
+    /// means "administratively up and able to pass packets":
+    ///
+    /// | OS | `AdminState::Up` iff |
+    /// |---|---|
+    /// | Linux | the interface flags carry `IFF_UP` and `IFF_RUNNING` |
+    /// | macOS (`utun`, `feth`) | the interface flags carry `IFF_UP` and `IFF_RUNNING` (`SIOCGIFFLAGS`) |
+    /// | Windows (Wintun, tap-windows6) | the operational status is `IfOperStatusUp` (`GetIfEntry2`) |
+    /// | other targets | never: the state is [`AdminState::Unknown`](tunnel_lattice_model::AdminState::Unknown) |
+    ///
+    /// On Windows the change an `apply` of `DesiredAdminState` makes
+    /// reaches the operational status asynchronously, so a `snapshot`
+    /// taken right after it can still report the previous state for a
+    /// moment.
     fn snapshot(&self) -> Result<Device> {
         let id = self.id;
         let name = self.handle.name().map_err(io_error)?;
         let mtu = u32::from(self.handle.mtu().map_err(io_error)?);
-        // `is_running` (IFF_UP | IFF_RUNNING) is a Linux-only read on
-        // `tun_rs::DeviceImpl`; macOS/Windows/BSD only expose a write-only
-        // `enabled(bool)` setter, with no corresponding getter to read
-        // administrative state back. Report `Unknown` there rather than
-        // guessing from `enabled`'s absence.
+        // `is_running` (IFF_UP | IFF_RUNNING) is the only admin-state read
+        // `tun_rs::DeviceImpl` has, and it is Linux-only; macOS and Windows
+        // are read natively with the same meaning (see `admin_state`).
+        // Other targets report `Unknown` rather than guessing.
         #[cfg(target_os = "linux")]
         let admin_state = if self.handle.is_running().map_err(io_error)? {
-            AdminState::Up
+            tunnel_lattice_model::AdminState::Up
         } else {
-            AdminState::Down
+            tunnel_lattice_model::AdminState::Down
         };
-        #[cfg(not(target_os = "linux"))]
-        let admin_state = AdminState::Unknown;
+        #[cfg(target_os = "macos")]
+        let admin_state = admin_state::macos_admin_state(&name).map_err(io_error)?;
+        #[cfg(target_os = "windows")]
+        let admin_state =
+            admin_state::windows_admin_state(self.handle.if_luid().map_err(io_error)?)
+                .map_err(io_error)?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let admin_state = tunnel_lattice_model::AdminState::Unknown;
 
         let device = Device::new(id, name, self.kind, mtu, admin_state);
         if self.kind != DeviceKind::Tap {
@@ -709,9 +745,9 @@ fn apply_patch(
         return Err(Error::Unsupported);
     }
 
-    // Administrative state goes last: it cannot be read back off Linux, so
-    // it cannot be reverted. A step's previous value is read first, before
-    // any change, and only when a later step could need it reverted.
+    // Administrative state goes last, so no later step can fail after it
+    // and it never needs reverting. A step's previous value is read first,
+    // before any change, and only when a later step could need it reverted.
     let previous_mtu = match mtu {
         Some(_) if mac.is_some() || enable.is_some() => Some(steps.mtu()?),
         _ => None,
@@ -1587,9 +1623,7 @@ mod io_error_tests {
 /// guards.
 #[cfg(test)]
 mod privileged_tests {
-    #[cfg(target_os = "linux")]
-    use tunnel_lattice_model::DesiredAdminState;
-    use tunnel_lattice_model::DeviceConfigPatch;
+    use tunnel_lattice_model::{AdminState, DesiredAdminState, DeviceConfigPatch};
     use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
 
     use super::*;
@@ -2293,35 +2327,51 @@ mod privileged_tests {
             })
         };
 
-        let first = outcome.recv_timeout(Duration::from_secs(60));
-        stop.store(true, Ordering::Release);
-        sender.join().expect("the sender thread does not panic");
-        let (failure, receiver_returned) = match first {
+        // The receiver is released (when it timed out) before anything
+        // else can fail, and the sender is joined last: a failure there is
+        // recorded, not raised, so it cannot skip the release or the
+        // device's teardown.
+        let (mut failure, receiver_returned) = match outcome.recv_timeout(Duration::from_secs(60)) {
             Ok(Ok(())) => (None, true),
             Ok(Err(message)) => (Some(message), true),
-            Err(_) => {
+            // The thread ended without sending: it panicked, and its
+            // reference to the device is already gone.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                (Some("the receiver thread panicked".to_owned()), true)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 #[cfg(target_os = "macos")]
                 let feth_peer = feth_pair.as_ref().map(|feth| feth.peer.as_str());
                 #[cfg(not(target_os = "macos"))]
                 let feth_peer = None;
                 release_waiting_recv(&device, &snapshot.name, feth_peer);
-                let returned = outcome.recv_timeout(Duration::from_secs(30)).is_ok();
+                // Any outcome, including the thread ending without one,
+                // means the receiver let go of the device.
+                let returned = !matches!(
+                    outcome.recv_timeout(Duration::from_secs(30)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
                 let message = if returned {
                     "no packet arrived within 60 s".to_owned()
                 } else {
                     "no packet arrived within 60 s, and the receiver did not return once \
-                     released: the device may outlive the test"
+                         released: the device may outlive the test"
                         .to_owned()
                 };
                 (Some(message), returned)
             }
         };
         if receiver_returned {
-            // It has sent its result; joining waits for its reference to
-            // the device to drop, so the `drop` below tears the device down.
-            receiver.join().expect("the receiver thread does not panic");
+            // It has finished; joining waits for its reference to the
+            // device to drop, so the `drop` below tears the device down. A
+            // panic was already recorded above.
+            let _ = receiver.join();
         }
         drop(device);
+        stop.store(true, Ordering::Release);
+        if sender.join().is_err() && failure.is_none() {
+            failure = Some("the sender thread panicked".to_owned());
+        }
         if let Some(message) = failure {
             panic!("{kind:?}: {message}");
         }
@@ -2779,10 +2829,14 @@ mod privileged_tests {
 
     /// Disabling a Windows TAP adapter with `Disable-NetAdapter` (what
     /// [`release_waiting_recv`] does for a failing oversize test) makes a
-    /// `recv` waiting on it return an error within 30 s, so the waiting
-    /// thread lets go of the device and the adapter is removed when the
-    /// device drops (the CI leak check confirms nothing is left). Frames
-    /// that arrive first are skipped. The test prints the error.
+    /// `recv` waiting on it return within 30 s with exactly
+    /// `Platform(Windows(995))` (`ERROR_OPERATION_ABORTED`, deliberately
+    /// not remapped: a healthy adapter can report it too, and `apply(Up)`
+    /// does not undo `Disable-NetAdapter`), so the waiting thread lets go of
+    /// the device and the adapter is removed when the device drops (the CI
+    /// leak check confirms nothing is left). Frames that arrive first are
+    /// skipped. The test prints the time from the start of the
+    /// `Disable-NetAdapter` call to the error.
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Administrator and the tap-windows6 driver"]
@@ -2824,18 +2878,28 @@ mod privileged_tests {
 
         // Let the receiver reach its wait first.
         std::thread::sleep(Duration::from_millis(500));
-        release_waiting_recv(&device, &snapshot.name, None);
         let released = Instant::now();
-        match outcome.recv_timeout(Duration::from_secs(30)) {
+        release_waiting_recv(&device, &snapshot.name, None);
+        let err = match outcome.recv_timeout(Duration::from_secs(30)) {
             Ok(err) => {
                 eprintln!(
                     "windows TAP Disable-NetAdapter: recv returned {err:?} after {:?}",
                     released.elapsed()
                 );
+                err
             }
-            Err(_) => panic!("recv did not return within 30 s of Disable-NetAdapter"),
-        }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the receiver thread panicked")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("recv did not return within 30 s of Disable-NetAdapter")
+            }
+        };
         receiver.join().expect("the receiver thread does not panic");
+        assert!(
+            matches!(err, Error::Platform(PlatformErrorCode::Windows(995))),
+            "recv on a disabled TAP adapter: {err:?}"
+        );
         assert_eq!(
             Arc::strong_count(&device),
             1,
@@ -2904,11 +2968,11 @@ mod privileged_tests {
 
     /// A TAP device opened with an MTU reports kind `Tap`, a MAC, that MTU,
     /// and a receive buffer length of MTU + 18; a patch's MTU is read back
-    /// from the next snapshot. On Linux the device reads `Up` right after
-    /// open (`tun-rs` enables it, and a TAP has carrier while its queue is
-    /// attached). On macOS the name is the `dev` side of a `feth` pair,
-    /// there is no administrative-state read (`Unknown`), and the MTU is
-    /// set on both sides of the pair, so the peer's MTU follows too.
+    /// from the next snapshot. The device reads `Up` right after open
+    /// (`tun-rs` enables it; on Linux a TAP has carrier while its queue is
+    /// attached). On macOS the name is the `dev` side of a `feth` pair, and
+    /// the MTU is set on both sides of the pair, so the peer's MTU follows
+    /// too.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[ignore = "requires CAP_NET_ADMIN/root to open a TAP device"]
@@ -2934,12 +2998,10 @@ mod privileged_tests {
         assert_ne!(device.id().value(), 0, "an OS interface index is never 0");
         assert_eq!(snapshot.id, device.id());
         assert_eq!(snapshot.recv_buffer_len(), 1400 + 18);
-        #[cfg(target_os = "linux")]
         assert_eq!(snapshot.admin_state, AdminState::Up);
         #[cfg(target_os = "macos")]
         {
             assert!(snapshot.name.starts_with("feth"), "{}", snapshot.name);
-            assert_eq!(snapshot.admin_state, AdminState::Unknown);
             assert_eq!(interface_mtu(&feth.peer), 1400, "the peer feth's MTU");
         }
 
@@ -2952,39 +3014,170 @@ mod privileged_tests {
         assert_eq!(interface_mtu(&feth.peer), 1300, "the peer feth's MTU");
     }
 
-    /// A Linux TAP device's administrative state follows `apply`, and
-    /// `send` reports the kernel's refusals as they map today (both through
-    /// the general table, as [`Error::Platform`] with the Linux code):
-    ///
-    /// - a frame shorter than an Ethernet header (14 bytes) is refused with
-    ///   `EINVAL` whether the device is up or down (`tun.c` checks the
-    ///   length before the up flag);
-    /// - a whole frame written while the device is down is refused with
-    ///   `EIO`;
-    /// - once the device is up again, the same frame is accepted.
-    ///
-    /// The first send, while up, also makes sure the `tokio` build's write
-    /// readiness has been observed before the device goes down (a down tun
-    /// file does not report itself writable).
+    /// A 28-byte IPv4/UDP packet (headers only) from 192.0.2.2 to
+    /// 192.0.2.1 (TEST-NET-1, never routed) at the discard port, with a
+    /// valid IPv4 header checksum and no UDP checksum.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn ipv4_udp_packet() -> Vec<u8> {
+        #[rustfmt::skip]
+        let mut packet = vec![
+            0x45, 0x00, 0x00, 28, // IPv4, header length 5; total length 28
+            0x00, 0x00, 0x40, 0x00, // identification; don't fragment
+            64, 17, 0x00, 0x00, // TTL; UDP; header checksum (below)
+            192, 0, 2, 2, // source
+            192, 0, 2, 1, // destination
+            0x30, 0x39, 0x00, 9, // UDP source port 12345, destination port 9
+            0x00, 8, 0x00, 0x00, // UDP length 8, no checksum
+        ];
+        let sum: u32 = packet[..20]
+            .chunks_exact(2)
+            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+            .sum();
+        let folded = (sum & 0xffff) + (sum >> 16);
+        let folded = (folded & 0xffff) + (folded >> 16);
+        let checksum = !u16::try_from(folded).expect("folded into 16 bits");
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        packet
+    }
+
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn the_test_ipv4_packet_has_a_valid_header_checksum() {
+        let packet = ipv4_udp_packet();
+        assert_eq!(packet.len(), 28);
+        // A header with a valid checksum sums to 0xffff.
+        let sum: u32 = packet[..20]
+            .chunks_exact(2)
+            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+            .sum();
+        let folded = (sum & 0xffff) + (sum >> 16);
+        assert_eq!((folded & 0xffff) + (folded >> 16), 0xffff);
+    }
+
+    /// One `PacketIo` call run on its own thread, so a call that blocks
+    /// cannot hang the test. Dropping it, on every exit path including a
+    /// panic, makes a call still running return with
+    /// [`release_waiting_recv`] (which tears the device down or disables
+    /// it), waits up to 30 s for its thread to finish, and joins it, so the
+    /// thread's reference to the device is gone before the device drops.
+    /// Declare it after the device, so it drops first.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    struct BlockingCall {
+        device: std::sync::Arc<TunRsDevice>,
+        name: String,
+        outcome: std::sync::mpsc::Receiver<Result<usize>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl BlockingCall {
+        /// Runs `call` on a new thread (inside the test's Tokio runtime,
+        /// under the `tokio` feature).
+        fn spawn(
+            device: &std::sync::Arc<TunRsDevice>,
+            name: &str,
+            call: impl FnOnce(&TunRsDevice) -> Result<usize> + Send + 'static,
+        ) -> Self {
+            let (done, outcome) = std::sync::mpsc::channel();
+            #[cfg(feature = "tokio")]
+            let runtime = tokio::runtime::Handle::current();
+            let thread = {
+                let device = std::sync::Arc::clone(device);
+                std::thread::spawn(move || {
+                    #[cfg(feature = "tokio")]
+                    let _entered = runtime.enter();
+                    let _ = done.send(call(&device));
+                })
+            };
+            Self {
+                device: std::sync::Arc::clone(device),
+                name: name.to_owned(),
+                outcome,
+                thread: Some(thread),
+            }
+        }
+
+        /// The call's result if it returned within `timeout`, or `None` if
+        /// it is still running. Panics if the call panicked.
+        fn wait(&self, timeout: std::time::Duration) -> Option<Result<usize>> {
+            match self.outcome.recv_timeout(timeout) {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the call's thread panicked")
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl Drop for BlockingCall {
+        fn drop(&mut self) {
+            let Some(thread) = self.thread.take() else {
+                return;
+            };
+            if !thread.is_finished() {
+                release_waiting_recv(&self.device, &self.name, None);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !thread.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                eprintln!(
+                    "a call on {} did not return once released: the device may outlive the test",
+                    self.name
+                );
+            }
+        }
+    }
+
+    /// A Linux TUN or TAP device's administrative state follows `apply`,
+    /// and `send` reports the kernel's refusals:
+    ///
+    /// - a whole packet written while the device is down is refused with
+    ///   `EIO`, reported as [`Error::InvalidState`];
+    /// - once the device is up again, the same packet is accepted on the
+    ///   same handle;
+    /// - TAP only: a frame shorter than an Ethernet header (14 bytes) is
+    ///   refused with `EINVAL`, reported through the general table as
+    ///   [`Error::Platform`], whether the device is up or down (`tun.c`
+    ///   checks the length before the up flag).
+    ///
+    /// The packet is a 28-byte IPv4/UDP packet for TUN and a 42-byte ARP
+    /// request for TAP. The first send, while up, also makes sure the
+    /// `tokio` build's write readiness has been observed before the device
+    /// goes down (a down tun file does not report itself writable).
     #[cfg(target_os = "linux")]
-    #[ignore = "requires CAP_NET_ADMIN to open a TAP device"]
-    fn tap_admin_state_toggles_and_send_reports_the_kernel_refusals_on_linux() {
+    fn assert_admin_state_follows_apply_and_send_while_down_on_linux(kind: DeviceKind, tag: &str) {
         #[cfg(feature = "tokio")]
         let _runtime = enter_tokio_runtime();
         #[cfg(feature = "tokio")]
         let _entered = _runtime.enter();
 
-        let name = unique_linux_name("tadm");
+        let name = unique_linux_name(tag);
         let device = TunRsBackend::new()
-            .open(DeviceConfig::new(DeviceKind::Tap).with_name(name.as_str()))
-            .expect("open a TAP device");
-        let snapshot = device.snapshot().expect("snapshot the TAP device");
+            .open(DeviceConfig::new(kind).with_name(name.as_str()))
+            .expect("open a device");
+        let snapshot = device.snapshot().expect("snapshot the device");
         assert_eq!(snapshot.name, name);
-        assert_eq!(snapshot.admin_state, AdminState::Up);
-        let frame = broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"));
-        let runt = &frame[..13];
-        let refused_with = |result: &Result<usize>, errno: i32| matches!(result, Err(Error::Platform(PlatformErrorCode::Linux(code))) if *code == errno);
+        assert_eq!(snapshot.admin_state, AdminState::Up, "{kind:?} after open");
+        let packet = match kind {
+            DeviceKind::Tap => {
+                broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"))
+            }
+            _ => ipv4_udp_packet(),
+        };
+        let len = packet.len();
+        let runt = &packet[..13];
+        let is_einval = |result: &Result<usize>| {
+            matches!(
+                result,
+                Err(Error::Platform(PlatformErrorCode::Linux(libc::EINVAL)))
+            )
+        };
         let set_admin = |state| {
             let patch =
                 DeviceConfigPatch::new(device.id(), Some(state), None).expect("build a patch");
@@ -2992,28 +3185,102 @@ mod privileged_tests {
             device.snapshot().expect("snapshot after apply").admin_state
         };
 
-        let sent = PacketIo::send(&device, &frame);
-        assert!(matches!(sent, Ok(42)), "send while up: {sent:?}");
-        let sent = PacketIo::send(&device, runt);
-        eprintln!("TAP 13-byte send while up: {sent:?}");
+        let sent = PacketIo::send(&device, &packet);
         assert!(
-            refused_with(&sent, libc::EINVAL),
-            "13-byte send while up: {sent:?}"
+            matches!(sent, Ok(n) if n == len),
+            "{kind:?} send while up: {sent:?}"
         );
+        if kind == DeviceKind::Tap {
+            let sent = PacketIo::send(&device, runt);
+            assert!(is_einval(&sent), "TAP 13-byte send while up: {sent:?}");
+        }
 
         assert_eq!(set_admin(DesiredAdminState::Down), AdminState::Down);
-        let sent = PacketIo::send(&device, &frame);
-        eprintln!("TAP send while down: {sent:?}");
-        assert!(refused_with(&sent, libc::EIO), "send while down: {sent:?}");
-        let sent = PacketIo::send(&device, runt);
+        let sent = PacketIo::send(&device, &packet);
+        eprintln!("{kind:?} send while down: {sent:?}");
         assert!(
-            refused_with(&sent, libc::EINVAL),
-            "13-byte send while down: {sent:?}"
+            matches!(sent, Err(Error::InvalidState)),
+            "{kind:?} send while down: {sent:?}"
         );
+        if kind == DeviceKind::Tap {
+            let sent = PacketIo::send(&device, runt);
+            assert!(is_einval(&sent), "TAP 13-byte send while down: {sent:?}");
+        }
 
         assert_eq!(set_admin(DesiredAdminState::Up), AdminState::Up);
-        let sent = PacketIo::send(&device, &frame);
-        assert!(matches!(sent, Ok(42)), "send after up again: {sent:?}");
+        let sent = PacketIo::send(&device, &packet);
+        assert!(
+            matches!(sent, Ok(n) if n == len),
+            "{kind:?} send after up again: {sent:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn tun_admin_state_follows_apply_and_send_while_down_is_invalid_state_on_linux() {
+        assert_admin_state_follows_apply_and_send_while_down_on_linux(DeviceKind::Tun, "tadmu");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TAP device"]
+    fn tap_admin_state_follows_apply_and_send_while_down_is_invalid_state_on_linux() {
+        assert_admin_state_follows_apply_and_send_while_down_on_linux(DeviceKind::Tap, "tadmp");
+    }
+
+    /// A `recv` on an administratively down Linux device does not fail: it
+    /// waits (the kernel's read path has no up check). It has not returned
+    /// after 1 s, and deleting the device with `ip link del` then ends it
+    /// with `Disconnected`. Packets that were already queued are skipped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN to open a TUN device"]
+    fn recv_waits_while_the_device_is_down_on_linux() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = unique_linux_name("rdwn");
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str()))
+                .expect("open a TUN device"),
+        );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
+            .expect("build a patch");
+        device.apply(patch).expect("bring the device down");
+        assert_eq!(
+            device.snapshot().expect("snapshot after down").admin_state,
+            AdminState::Down
+        );
+
+        let buf_len = snapshot.recv_buffer_len();
+        let recv = BlockingCall::spawn(&device, &name, move |device| {
+            let mut buf = vec![0u8; buf_len];
+            // Skips packets until the first error.
+            loop {
+                PacketIo::recv(device, &mut buf)?;
+            }
+        });
+        let early = recv.wait(Duration::from_secs(1));
+        assert!(
+            early.is_none(),
+            "recv on a down device returned {early:?} instead of waiting"
+        );
+
+        release_waiting_recv(&device, &name, None);
+        let released = recv.wait(Duration::from_secs(30));
+        eprintln!("recv on a down device after ip link del: {released:?}");
+        assert!(
+            matches!(released, Some(Err(Error::Disconnected))),
+            "recv on a down device after ip link del: {released:?}"
+        );
     }
 
     /// A 42-byte broadcast ARP request is written to a macOS `feth` TAP
@@ -3602,5 +3869,394 @@ mod privileged_tests {
             matches!(drained.errors[0], Error::InvalidState),
             "{drained:?}"
         );
+    }
+
+    /// The first line of `ifconfig <name>` (the interface flags), for
+    /// diagnostics.
+    #[cfg(target_os = "macos")]
+    fn ifconfig_flags_line(name: &str) -> String {
+        std::process::Command::new("ifconfig")
+            .arg(name)
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .unwrap_or_else(|err| format!("ifconfig {name}: {err}"))
+    }
+
+    /// A macOS device's administrative state, read from its interface
+    /// flags, follows `apply`: `Up` after open, `Down` after applying
+    /// `Down`, `Up` again after applying `Up`. While it is down, `send`
+    /// still accepts a whole packet (a 28-byte IPv4 packet for `utun`, a
+    /// 42-byte ARP request for `feth`, which `tun-rs` sends through the
+    /// peer). The test prints the interface flags at each step. A `feth`
+    /// pair gets the teardown guards; a `utun` goes away with its handle.
+    #[cfg(target_os = "macos")]
+    fn assert_admin_state_follows_apply_on_macos(kind: DeviceKind) {
+        let _serial = (kind == DeviceKind::Tap).then(serialize_feth_tests);
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let device = TunRsBackend::new()
+            .open(DeviceConfig::new(kind))
+            .expect("open a device");
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let _feth = (kind == DeviceKind::Tap).then(|| guard_feth_pair(&snapshot.name));
+        let name = snapshot.name.clone();
+        let set_admin = |state| {
+            let patch =
+                DeviceConfigPatch::new(device.id(), Some(state), None).expect("build a patch");
+            device.apply(patch).expect("apply the admin state");
+            let state = device.snapshot().expect("snapshot after apply").admin_state;
+            eprintln!("{kind:?} {state:?}: {}", ifconfig_flags_line(&name));
+            state
+        };
+        eprintln!(
+            "{kind:?} {:?} after open: {}",
+            snapshot.admin_state,
+            ifconfig_flags_line(&name)
+        );
+        assert_eq!(snapshot.admin_state, AdminState::Up, "{kind:?} after open");
+        let packet = match kind {
+            DeviceKind::Tap => {
+                broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"))
+            }
+            _ => ipv4_udp_packet(),
+        };
+        let len = packet.len();
+
+        assert_eq!(set_admin(DesiredAdminState::Down), AdminState::Down);
+        let sent = PacketIo::send(&device, &packet);
+        eprintln!("{kind:?} send while down: {sent:?}");
+        assert!(
+            matches!(sent, Ok(n) if n == len),
+            "{kind:?} send while down: {sent:?}"
+        );
+
+        assert_eq!(set_admin(DesiredAdminState::Up), AdminState::Up);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open a utun device"]
+    fn tun_admin_state_follows_apply_on_macos() {
+        assert_admin_state_follows_apply_on_macos(DeviceKind::Tun);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires root to open a feth TAP device"]
+    fn tap_admin_state_follows_apply_on_macos() {
+        assert_admin_state_follows_apply_on_macos(DeviceKind::Tap);
+    }
+
+    /// Polls the device's administrative state for up to 5 s until it is
+    /// `expected`, and returns the last state read and how long it took.
+    /// Windows applies a change to the operational status asynchronously.
+    #[cfg(target_os = "windows")]
+    fn poll_admin_state(
+        device: &TunRsDevice,
+        expected: AdminState,
+    ) -> (AdminState, std::time::Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            let state = device.snapshot().expect("snapshot the device").admin_state;
+            if state == expected || start.elapsed() >= std::time::Duration::from_secs(5) {
+                return (state, start.elapsed());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// A Windows device's administrative state, read from its operational
+    /// status, follows `apply` within 5 s: `Up` after open, `Down` after
+    /// applying `Down`, `Up` again after applying `Up`, after which `send`
+    /// is accepted again on the same handle. While it is down:
+    ///
+    /// - TUN: `send` reports `InvalidState` (the Wintun session ended);
+    /// - TAP: `send` still accepts the frame, and a `recv` waiting on a
+    ///   helper thread does not fail within 2 s (frames are skipped). The
+    ///   media-disconnected adapter does not report
+    ///   `ERROR_OPERATION_ABORTED`; only disabling the adapter does (see
+    ///   `windows_tap_recv_returns_once_the_adapter_is_disabled`).
+    ///
+    /// Every `send` runs on a helper thread bounded to 5 s. The helpers are
+    /// released ([`BlockingCall`]) before the device drops, which removes
+    /// the adapter. The test prints each state with the time it took.
+    #[cfg(target_os = "windows")]
+    fn assert_admin_state_follows_apply_on_windows(kind: DeviceKind) {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _serial = (kind == DeviceKind::Tap).then(serialize_windows_tap_tests);
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(kind))
+                .expect("open a device"),
+        );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let name = snapshot.name.clone();
+        let packet = match kind {
+            DeviceKind::Tap => {
+                broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"))
+            }
+            _ => ipv4_udp_packet(),
+        };
+        let len = packet.len();
+        let set_admin = |state| {
+            let patch =
+                DeviceConfigPatch::new(device.id(), Some(state), None).expect("build a patch");
+            device.apply(patch).expect("apply the admin state");
+        };
+        let bounded_send = || {
+            let packet = packet.clone();
+            BlockingCall::spawn(&device, &name, move |device| {
+                PacketIo::send(device, &packet)
+            })
+        };
+
+        let (state, waited) = poll_admin_state(&device, AdminState::Up);
+        eprintln!("{kind:?} {state:?} {waited:?} after open");
+        assert_eq!(state, AdminState::Up, "{kind:?} after open");
+
+        set_admin(DesiredAdminState::Down);
+        let (state, waited) = poll_admin_state(&device, AdminState::Down);
+        eprintln!("{kind:?} {state:?} {waited:?} after apply(Down)");
+        assert_eq!(state, AdminState::Down, "{kind:?} after apply(Down)");
+
+        let send_while_down = bounded_send();
+        let sent = send_while_down.wait(Duration::from_secs(5));
+        eprintln!("{kind:?} send while down: {sent:?}");
+        let recv_while_down = (kind == DeviceKind::Tap).then(|| {
+            let buf_len = snapshot.recv_buffer_len();
+            BlockingCall::spawn(&device, &name, move |device| {
+                let mut buf = vec![0u8; buf_len];
+                // Skips frames until the first error.
+                loop {
+                    PacketIo::recv(device, &mut buf)?;
+                }
+            })
+        });
+        match &recv_while_down {
+            None => assert!(
+                matches!(sent, Some(Err(Error::InvalidState))),
+                "{kind:?} send while down: {sent:?}"
+            ),
+            Some(recv) => {
+                assert!(
+                    matches!(sent, Some(Ok(n)) if n == len),
+                    "{kind:?} send while down: {sent:?}"
+                );
+                let received = recv.wait(Duration::from_secs(2));
+                eprintln!("{kind:?} recv while down, after 2 s: {received:?}");
+                assert!(
+                    received.is_none(),
+                    "{kind:?} recv while down returned {received:?}"
+                );
+            }
+        }
+
+        set_admin(DesiredAdminState::Up);
+        let (state, waited) = poll_admin_state(&device, AdminState::Up);
+        eprintln!("{kind:?} {state:?} {waited:?} after apply(Up)");
+        assert_eq!(state, AdminState::Up, "{kind:?} after apply(Up)");
+        let send_after_up = bounded_send();
+        let sent = send_after_up.wait(Duration::from_secs(5));
+        assert!(
+            matches!(sent, Some(Ok(n)) if n == len),
+            "{kind:?} send after up again: {sent:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and wintun.dll to open a TUN device"]
+    fn tun_admin_state_follows_apply_on_windows() {
+        assert_admin_state_follows_apply_on_windows(DeviceKind::Tun);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_admin_state_follows_apply() {
+        assert_admin_state_follows_apply_on_windows(DeviceKind::Tap);
+    }
+
+    /// A free, valid requested name comes back exactly as the snapshot's
+    /// name, for TUN and for TAP. The names are unique to this test
+    /// process: `tl…` with the process id on Linux and Windows; on macOS a
+    /// high `utun` unit and a `feth` unit outside the range the other
+    /// `feth` tests use (the pair gets the teardown guards).
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root (and on Windows wintun.dll and the tap-windows6 driver) to open TUN and TAP devices"]
+    fn requested_name_is_honored_exactly() {
+        #[cfg(target_os = "macos")]
+        let _serial = serialize_feth_tests();
+        #[cfg(target_os = "windows")]
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        #[cfg(not(target_os = "linux"))]
+        let pid = std::process::id();
+        #[cfg(target_os = "linux")]
+        let names = [unique_linux_name("namu"), unique_linux_name("namp")];
+        #[cfg(target_os = "macos")]
+        let names = [
+            format!("utun{}", 200 + pid % 50),
+            format!("feth{}", 20_000 + pid % 9000),
+        ];
+        #[cfg(target_os = "windows")]
+        let names = [
+            format!("tltun{}", pid % 100_000),
+            format!("tlntap{}", pid % 100_000),
+        ];
+
+        let backend = TunRsBackend::new();
+        for (kind, name) in [DeviceKind::Tun, DeviceKind::Tap].into_iter().zip(names) {
+            let device = backend
+                .open(DeviceConfig::new(kind).with_name(name.as_str()))
+                .unwrap_or_else(|err| panic!("open {kind:?} named {name}: {err:?}"));
+            #[cfg(target_os = "macos")]
+            let _feth = (kind == DeviceKind::Tap).then(|| guard_feth_pair(&name));
+            let snapshot = device.snapshot().expect("snapshot the device");
+            assert_eq!(snapshot.name, name, "{kind:?}");
+            assert_eq!(snapshot.kind, kind);
+        }
+    }
+
+    /// Whether `Get-NetAdapter` finds an adapter named `name`.
+    #[cfg(target_os = "windows")]
+    fn windows_adapter_exists(name: &str) -> bool {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Get-NetAdapter -Name '{name}' -ErrorAction Stop | Out-Null"),
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Opening the name of an existing Wintun adapter adopts it, and
+    /// dropping the adopting handle does not delete it: the first handle
+    /// ends its session (`apply(Down)`), a second handle adopts the adapter
+    /// by name (same interface index) and is dropped, the adapter is still
+    /// there, and the first handle restarts its session with `apply(Up)`.
+    /// Dropping the first handle, which created the adapter, removes it
+    /// (polled for up to 5 s).
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and wintun.dll to open a TUN device"]
+    fn wintun_adopted_adapter_survives_the_handle_drop() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = format!("tlwta{}", std::process::id() % 100_000);
+        let backend = TunRsBackend::new();
+        let config = DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str());
+        let first = backend
+            .open(config.clone())
+            .expect("create the Wintun adapter");
+        let set_admin = |state| {
+            let patch =
+                DeviceConfigPatch::new(first.id(), Some(state), None).expect("build a patch");
+            first.apply(patch).expect("apply the admin state");
+        };
+        set_admin(DesiredAdminState::Down);
+
+        let adopting = backend
+            .open(config)
+            .expect("adopt the existing Wintun adapter by name");
+        assert_eq!(adopting.id(), first.id(), "the same adapter was adopted");
+        assert_eq!(
+            adopting.snapshot().expect("snapshot the adopter").name,
+            name
+        );
+        drop(adopting);
+        assert!(
+            windows_adapter_exists(&name),
+            "dropping the adopting handle deleted the adapter"
+        );
+
+        set_admin(DesiredAdminState::Up);
+        let snapshot = first
+            .snapshot()
+            .expect("the first handle still works after the adopter dropped");
+        assert_eq!(snapshot.name, name);
+        drop(first);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exists = windows_adapter_exists(&name);
+        while exists && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            exists = windows_adapter_exists(&name);
+        }
+        assert!(
+            !exists,
+            "{name} survived the drop of the handle that created it"
+        );
+    }
+
+    /// Opening the name of a Wintun adapter whose session another handle
+    /// still holds: the test prints the outcome. The existing handle is
+    /// untouched either way and still sends; if the open succeeds, both
+    /// handles survive each other's drop.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Administrator and wintun.dll to open a TUN device"]
+    fn second_concurrent_wintun_session_is_refused() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let name = format!("tlwts{}", std::process::id() % 100_000);
+        let backend = TunRsBackend::new();
+        let config = DeviceConfig::new(DeviceKind::Tun).with_name(name.as_str());
+        let first = backend
+            .open(config.clone())
+            .expect("create the Wintun adapter");
+
+        let second = backend.open(config);
+        match &second {
+            Ok(device) => eprintln!(
+                "second concurrent Wintun session: open succeeded (index {})",
+                device.id().value()
+            ),
+            Err(err) => eprintln!("second concurrent Wintun session: open failed with {err:?}"),
+        }
+        if let Ok(second) = second {
+            drop(second);
+            assert!(
+                windows_adapter_exists(&name),
+                "dropping the second handle deleted the adapter"
+            );
+        }
+
+        let packet = ipv4_udp_packet();
+        let sent = PacketIo::send(&first, &packet);
+        assert!(
+            matches!(sent, Ok(28)),
+            "the first handle's send after the second open: {sent:?}"
+        );
+        assert_eq!(first.snapshot().expect("snapshot the first").name, name);
     }
 }
