@@ -3074,12 +3074,17 @@ mod privileged_tests {
     /// [`release_waiting_recv`] (which tears the device down or disables
     /// it), waits up to 30 s for its thread to finish, and joins it, so the
     /// thread's reference to the device is gone before the device drops.
+    /// A call whose result [`BlockingCall::wait`] already returned is only
+    /// joined, never released: its thread sends the result just before it
+    /// finishes, so it may not have finished yet when the drop runs.
     /// Declare it after the device, so it drops first.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     struct BlockingCall {
         device: std::sync::Arc<TunRsDevice>,
         name: String,
         outcome: std::sync::mpsc::Receiver<Result<usize>>,
+        /// Set once `wait` has returned the call's result.
+        returned: std::cell::Cell<bool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -3107,6 +3112,7 @@ mod privileged_tests {
                 device: std::sync::Arc::clone(device),
                 name: name.to_owned(),
                 outcome,
+                returned: std::cell::Cell::new(false),
                 thread: Some(thread),
             }
         }
@@ -3115,7 +3121,10 @@ mod privileged_tests {
         /// it is still running. Panics if the call panicked.
         fn wait(&self, timeout: std::time::Duration) -> Option<Result<usize>> {
             match self.outcome.recv_timeout(timeout) {
-                Ok(result) => Some(result),
+                Ok(result) => {
+                    self.returned.set(true);
+                    Some(result)
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("the call's thread panicked")
@@ -3130,6 +3139,11 @@ mod privileged_tests {
             let Some(thread) = self.thread.take() else {
                 return;
             };
+            if self.returned.get() {
+                // The call returned; its thread is only finishing up.
+                let _ = thread.join();
+                return;
+            }
             if !thread.is_finished() {
                 release_waiting_recv(&self.device, &self.name, None);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
