@@ -4,15 +4,14 @@ Thank you for your interest in contributing to Tunnel Lattice.
 
 ## Project Status
 
-Tunnel Lattice has a working crate architecture (see
-[ARCHITECTURE.md](ARCHITECTURE.md)) but no published release yet — nothing in
-the public API is frozen. The most valuable contributions right now are:
+Tunnel Lattice has published releases (see [CHANGELOG.md](CHANGELOG.md)) but
+is still pre-1.0 — nothing in the public API is frozen. The most valuable
+contributions right now are:
 
 - Feedback on the crate architecture and API shape (see
   [ARCHITECTURE.md](ARCHITECTURE.md))
-- Verifying `tunnel-lattice-backend-tunrs`'s `tun-rs` usage on Windows and
-  macOS (developed and CI-checked so far without a native build on every
-  platform — see that crate's README)
+- Real-device reports for `tunnel-lattice-backend-tunrs` on Windows and
+  macOS beyond what the privileged CI jobs cover (see that crate's README)
 - Documentation and tooling improvements
 
 Please check open issues and discussions before starting significant work, to
@@ -44,6 +43,27 @@ Tunnel Lattice follows standard Rust ecosystem conventions:
   `cargo +nightly miri test -p tunnel-lattice-async --lib pool`. CI runs
   this as a non-blocking job.
 - Commit messages should be clear and descriptive.
+
+## Throughput Benchmarks
+
+`bench/forwarder/` holds an unpublished iperf3 forwarder benchmark (Linux
+only): raw `tun-rs` baselines and `tunnel-lattice` forwarding between two
+TUN devices, measured in the same run. It is a standalone Cargo workspace,
+not part of the root workspace, so check it with
+`--manifest-path bench/forwarder/Cargo.toml` and one build set (`sync`,
+`tokio` or `async-io`) per invocation. Running it needs root and `iperf3`:
+
+```sh
+scripts/bench-forward.sh build
+sudo scripts/bench-forward.sh run
+scripts/bench-forward.sh report target/bench-forward/runs/<UTC time>
+```
+
+The `Forwarder benchmark` workflow runs the same commands when started
+manually and uploads the results as an artifact. Throughput numbers in the
+documentation must be copied from such a recorded `results.md`, with its
+footer, never typed in by hand. See `bench/forwarder/README.md` for the
+method and the variants.
 
 ## Reporting Issues
 

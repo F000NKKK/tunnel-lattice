@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **iperf3 forwarder benchmark (unpublished, Linux).** `bench/forwarder/`
+  forwards packets between two TUN devices (one in a network namespace)
+  while `iperf3` measures TCP throughput across them, the method of tun-rs's
+  tun-benchmark2. Each run measures raw `tun-rs` baselines (sync, Tokio,
+  async-io) and the `tunnel-lattice` facade (`Handle::recv`/`send`;
+  `packet_stream` or a shared `PacketPool` with `send_async`) in the same
+  repetitions, and reports throughput, the paired per-repetition ratio to
+  the baseline, forwarder CPU and RSS, and TCP retransmissions as
+  `results.json` plus a Markdown table. `scripts/bench-forward.sh`
+  builds unprivileged, runs as root with cleanup of the devices, namespace
+  and route on every exit path, and reports; a manual `Forwarder benchmark`
+  GitHub Actions workflow runs it and uploads the results. A standalone
+  Cargo workspace, so no published crate or root-workspace build changes.
+
 - **Windows TAP is now tested on real devices in CI.** The privileged CI
   job stages the tap-windows6 9.27.0 driver package (SHA-256 and catalog
   signature checked, `pnputil /add-driver`, no adapter created in advance)
