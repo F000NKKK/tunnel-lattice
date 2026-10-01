@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Exact capability sets checked on real devices, test-only.** New
+  privileged facade tests assert, on Linux, macOS, and Windows and in every
+  feature set, that `Tunnel::capabilities()` and a real TUN handle's
+  `capabilities()` are exactly the expected host set, and that a real TAP
+  handle adds `MAC_MUTATION` on Linux and macOS only. The expected sets are
+  written out per OS in the test: `DEVICE_MUTATION` and `TAP_DEVICES`
+  everywhere (on Windows with the tap-windows6 driver staged),
+  `PERSISTENT_DEVICES` and `MULTI_QUEUE` on Linux only, and `NATIVE_ASYNC`
+  exactly in the `async-io` and `tokio` builds. An ordinary test checks
+  that the tun-rs device implements `PersistentDevice` and
+  `MultiQueueProvider` on Linux only and that both flags are absent
+  elsewhere.
+  - CI: the privileged job now runs the facade's ignored tests in the
+    default feature set too, not only with `async-io` or `tokio`.
+  - Documented on `Handle::persist`, `Handle::unpersist`, and
+    `Handle::additional_queue` that off Linux these methods do not exist
+    with the tun-rs backend (a compile error), rather than returning
+    `Error::Unsupported`.
+
 - **Breaking: `PersistentDevice` gains a required `unpersist()` method,
   and persistent devices work end to end on Linux.** `unpersist` clears
   persistence, so the device is destroyed when its last handle, in any

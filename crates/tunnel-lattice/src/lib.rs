@@ -333,6 +333,14 @@ where
     }
 }
 
+/// Persistence, available only when the device type implements
+/// [`PersistentDevice`].
+///
+/// With the tun-rs backend that is Linux only. On macOS and Windows
+/// `TunRsDevice` does not implement [`PersistentDevice`], so `persist` and
+/// `unpersist` do not exist on its `Handle`: calling them is a compile
+/// error, not a runtime `Error::Unsupported`. `Capability::PERSISTENT_DEVICES`
+/// is absent there to match.
 impl<D> Handle<D>
 where
     D: PersistentDevice,
@@ -341,7 +349,9 @@ where
     /// (including this process exiting) — see [`PersistentDevice`]'s docs.
     /// A later process re-attaches by opening the same name, kind, and
     /// multi-queue setting. Requires `Capability::PERSISTENT_DEVICES`; only
-    /// `TunRsDevice` on Linux implements this today.
+    /// `TunRsDevice` on Linux implements this today, and on other targets
+    /// the method does not exist (a compile error, not
+    /// `Error::Unsupported`).
     pub fn persist(&self) -> Result<()> {
         self.device.persist()
     }
@@ -351,12 +361,22 @@ where
     /// Idempotent, and works from any handle or queue attached to the
     /// device, including one re-attached by name in another process.
     /// Requires `Capability::PERSISTENT_DEVICES`; only `TunRsDevice` on
-    /// Linux implements this today.
+    /// Linux implements this today, and on other targets the method does
+    /// not exist (a compile error, not `Error::Unsupported`).
     pub fn unpersist(&self) -> Result<()> {
         self.device.unpersist()
     }
 }
 
+/// Multi-queue, available only when the device type implements
+/// [`MultiQueueProvider`].
+///
+/// With the tun-rs backend that is Linux only. On macOS and Windows
+/// `TunRsDevice` does not implement [`MultiQueueProvider`], so
+/// `additional_queue` does not exist on its `Handle`: calling it is a
+/// compile error, not a runtime `Error::Unsupported`.
+/// `Capability::MULTI_QUEUE` is absent there to match. Sharing one device
+/// across threads needs no multi-queue at all; clone the `Handle` instead.
 impl<D> Handle<D>
 where
     D: MultiQueueProvider,
@@ -364,8 +384,10 @@ where
     /// Duplicates this device's hardware-scheduled queue for use from
     /// another thread — see [`MultiQueueProvider`]'s docs. Requires
     /// `Capability::MULTI_QUEUE` and that the device was opened with
-    /// `DeviceConfig::with_multi_queue(true)`; only `TunRsDevice` on Linux
-    /// implements this today.
+    /// `DeviceConfig::with_multi_queue(true)` (otherwise
+    /// `Error::Unsupported`); only `TunRsDevice` on Linux implements this
+    /// today, and on other targets the method does not exist (a compile
+    /// error).
     pub fn additional_queue(&self) -> Result<Handle<D>> {
         Ok(Handle {
             device: std::sync::Arc::new(self.device.additional_queue()?),
@@ -661,15 +683,76 @@ mod stream_tests {
     }
 }
 
-/// Privileged, `async`-feature-only tests exercising `Handle::packet_stream`
-/// and `Handle::send_async` against a real device (run in CI with
-/// `cargo test -p tunnel-lattice --lib` plus an async feature and
-/// `-- --ignored`) — see `tunnel-lattice-backend-tunrs`'s
-/// `privileged_tests` module for why these are `#[ignore]`d and how to run
-/// them, and `tunnel-lattice-async`'s own unit tests for the
-/// cancellation-semantics proof against a mock (no privilege needed there).
-#[cfg(all(test, feature = "async", feature = "tun-rs"))]
+/// Ordinary tests of which platform-specific surfaces the tun-rs backend
+/// exposes through the facade on this target (no privilege, no device).
+#[cfg(all(test, feature = "tun-rs"))]
+mod platform_surface_tests {
+    use super::*;
+
+    /// Answers "does `T` implement this trait?" at compile time, for a
+    /// concrete `T`: the inherent constant applies only when the bound
+    /// holds, and path resolution prefers it over the [`Fallback`] trait's
+    /// constant, which applies to every type.
+    struct Implements<T>(std::marker::PhantomData<T>);
+
+    #[allow(dead_code)]
+    impl<T: PersistentDevice> Implements<T> {
+        const PERSISTENT: bool = true;
+    }
+
+    #[allow(dead_code)]
+    impl<T: MultiQueueProvider> Implements<T> {
+        const MULTI_QUEUE: bool = true;
+    }
+
+    #[allow(dead_code)]
+    trait Fallback {
+        const PERSISTENT: bool = false;
+        const MULTI_QUEUE: bool = false;
+    }
+
+    impl<T> Fallback for T {}
+
+    /// `Handle::persist`/`unpersist` and `Handle::additional_queue` exist
+    /// exactly where `TunRsDevice` implements the trait behind them: on
+    /// Linux. Elsewhere they are absent at compile time, not methods that
+    /// return `Error::Unsupported`.
+    #[test]
+    fn persistence_and_multi_queue_are_implemented_only_on_linux() {
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(Implements::<TunRsDevice>::PERSISTENT, linux);
+        assert_eq!(Implements::<TunRsDevice>::MULTI_QUEUE, linux);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn persistence_and_multi_queue_flags_are_absent_off_linux() {
+        let host = Tunnel::connect().capabilities();
+        assert!(!host.contains(Capability::PERSISTENT_DEVICES), "{host:?}");
+        assert!(!host.contains(Capability::MULTI_QUEUE), "{host:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn persistence_and_multi_queue_flags_are_present_on_linux() {
+        let host = Tunnel::connect().capabilities();
+        assert!(host.contains(Capability::PERSISTENT_DEVICES), "{host:?}");
+        assert!(host.contains(Capability::MULTI_QUEUE), "{host:?}");
+    }
+}
+
+/// Privileged tests against a real device through the facade (run in CI
+/// with `cargo test -p tunnel-lattice --lib` in each feature set and
+/// `-- --ignored`): the exact capability sets per OS, concurrent `recv` and
+/// `send` through cloned `Handle`s, and, with an async feature,
+/// `Handle::packet_stream` and `Handle::send_async`. See
+/// `tunnel-lattice-backend-tunrs`'s `privileged_tests` module for why these
+/// are `#[ignore]`d and how to run them, and `tunnel-lattice-async`'s own
+/// unit tests for the cancellation-semantics proof against a mock (no
+/// privilege needed there).
+#[cfg(all(test, feature = "tun-rs"))]
 mod privileged_tests {
+    #[cfg(feature = "async")]
     use futures::FutureExt;
 
     use super::*;
@@ -682,6 +765,7 @@ mod privileged_tests {
             .expect("build a Tokio runtime")
     }
 
+    #[cfg(feature = "async")]
     #[test]
     #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
     fn packet_stream_dispatches_to_the_native_no_thread_path() {
@@ -730,6 +814,7 @@ mod privileged_tests {
     /// addresses (192.0.2.1 -> 192.0.2.2, port 9 "discard"), with a valid
     /// header checksum and the UDP checksum left at zero (allowed for
     /// IPv4). The host drops it after routing; the write itself succeeds.
+    #[cfg(feature = "async")]
     fn ipv4_udp_packet() -> [u8; 32] {
         let mut packet = [0u8; 32];
         packet[0] = 0x45; // version 4, header length 5 words
@@ -748,6 +833,7 @@ mod privileged_tests {
     }
 
     /// The 16-bit one's-complement sum of `bytes` (RFC 1071).
+    #[cfg(feature = "async")]
     fn ones_complement_sum(bytes: &[u8]) -> u16 {
         let (words, rest) = bytes.as_chunks::<2>();
         assert!(rest.is_empty(), "an even number of bytes");
@@ -761,6 +847,7 @@ mod privileged_tests {
         u16::try_from(sum).expect("folded into 16 bits")
     }
 
+    #[cfg(feature = "async")]
     #[test]
     fn the_test_packet_has_a_valid_ipv4_header_checksum() {
         let packet = ipv4_udp_packet();
@@ -776,6 +863,7 @@ mod privileged_tests {
     }
 
     /// Opens a TUN device and sends one packet through `send_async`.
+    #[cfg(feature = "async")]
     async fn open_and_send_async() -> Result<usize> {
         let device = Tunnel::connect().open(DeviceConfig::new(DeviceKind::Tun).with_mtu(1400))?;
         device.send_async(&ipv4_udp_packet()).await
@@ -808,11 +896,95 @@ mod privileged_tests {
         assert!(matches!(sent, Ok(32)), "send_async: {sent:?}");
     }
 
-    #[cfg(not(feature = "tokio"))]
+    #[cfg(all(feature = "async-io", not(feature = "tokio")))]
     #[test]
     #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device"]
     fn send_async_works_under_a_foreign_executor_with_async_io() {
         let sent = futures::executor::block_on(open_and_send_async());
         assert!(matches!(sent, Ok(32)), "send_async: {sent:?}");
+    }
+
+    /// The exact host-level set the tun-rs backend reports on this OS and
+    /// feature set, written out per OS rather than derived from the
+    /// backend's own code. On Windows it assumes the tap-windows6 driver is
+    /// staged, as the privileged CI job does before running these tests.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn expected_host_capabilities() -> Capability {
+        #[cfg(target_os = "linux")]
+        let host = Capability::DEVICE_MUTATION
+            | Capability::TAP_DEVICES
+            | Capability::PERSISTENT_DEVICES
+            | Capability::MULTI_QUEUE;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let host = Capability::DEVICE_MUTATION | Capability::TAP_DEVICES;
+        if cfg!(any(feature = "async-io", feature = "tokio")) {
+            host | Capability::NATIVE_ASYNC
+        } else {
+            host
+        }
+    }
+
+    /// `Tunnel::capabilities()` and a real TUN handle's `capabilities()`
+    /// are both exactly the expected host set: no per-handle flag on TUN,
+    /// `NATIVE_ASYNC` exactly in the async builds, the Linux-only flags
+    /// exactly on Linux.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TUN device, and on Windows the tap-windows6 driver staged"]
+    fn tun_capabilities_are_exactly_the_host_set_on_a_real_device() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let expected = expected_host_capabilities();
+        let tunnel = Tunnel::connect();
+        let host = tunnel.capabilities();
+        eprintln!("host capabilities: {host:?}");
+        assert_eq!(host, expected, "Tunnel::capabilities()");
+
+        let device = tunnel
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .expect("open a TUN device");
+        let handle = device.capabilities();
+        eprintln!("TUN handle capabilities: {handle:?}");
+        assert_eq!(handle, expected, "a TUN handle's capabilities()");
+        assert_eq!(
+            device.clone().capabilities(),
+            handle,
+            "a clone reports the same set"
+        );
+        assert_eq!(tunnel.capabilities(), expected, "unchanged by an open");
+    }
+
+    /// A real TAP handle reports the expected host set plus
+    /// `MAC_MUTATION` on Linux and macOS, and exactly the host set on
+    /// Windows, where the driver takes a MAC only at creation.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[ignore = "requires CAP_NET_ADMIN/Administrator/root to open a TAP device, and on Windows the tap-windows6 driver staged"]
+    fn tap_capabilities_are_exactly_the_host_set_plus_mac_mutation_where_supported() {
+        #[cfg(feature = "tokio")]
+        let _runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = _runtime.enter();
+
+        let host = expected_host_capabilities();
+        let expected = if cfg!(target_os = "windows") {
+            host
+        } else {
+            host | Capability::MAC_MUTATION
+        };
+        let tunnel = Tunnel::connect();
+        assert_eq!(tunnel.capabilities(), host, "Tunnel::capabilities()");
+
+        let device = tunnel
+            .open(DeviceConfig::new(DeviceKind::Tap))
+            .expect("open a TAP device");
+        assert_eq!(device.kind(), DeviceKind::Tap);
+        let handle = device.capabilities();
+        eprintln!("TAP handle capabilities: {handle:?}");
+        assert_eq!(handle, expected, "a TAP handle's capabilities()");
+        assert_eq!(tunnel.capabilities(), host, "unchanged by an open");
     }
 }
