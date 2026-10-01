@@ -156,10 +156,14 @@ on Windows. A Wintun adapter that was disabled (for example by applying
 `Up` recovers the same handle, and so does Linux `send` on an
 administratively down TUN/TAP device: the tun driver returns raw `EIO`
 from a write only for that case. On a Windows TAP handle, applying
-`Down` disconnects the adapter's media, and tap-windows then fails both
-`send` and `recv` at once with raw `ERROR_OPERATION_ABORTED` (995); that
-code is `InvalidState` on a TAP handle only (the rule takes the device
-kind as well as the OS), since applying `Up` recovers the same handle.
+`Down` disconnects the adapter's media, and tap-windows then fails every
+`send` and `recv` made while the media is disconnected at once with raw
+`ERROR_OPERATION_ABORTED` (995); that code is `InvalidState` on a TAP
+handle only (the rule takes the device kind as well as the OS), since
+applying `Up` recovers the same handle. A read already pending when
+`Down` is applied is not aborted: it keeps waiting, as on a down Linux
+device, through `Down` and a later `Up`, and only disabling the adapter
+ends it.
 A healthy TAP adapter also reports 995 for a read cancelled because the
 thread that started it exited (an async `recv` starts its read on the
 polling thread, so a dropped `recv` whose thread then exits leaves one

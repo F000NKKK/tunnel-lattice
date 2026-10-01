@@ -431,9 +431,12 @@ where
     ///
     /// The stream adapter never yields `InvalidState` for its own reasons;
     /// a rejected `buf_len` is reported only by this method's own `Err`.
-    /// With the tun-rs backend, an `InvalidState` item means the Windows
-    /// (Wintun) interface is currently disabled, which is recoverable; other
-    /// backends define their own meaning.
+    /// With the tun-rs backend, an `InvalidState` item means the device
+    /// exists but is not passing packets because it is down or disabled (a
+    /// disabled Wintun interface, or a Windows TAP adapter whose media
+    /// applying `DesiredAdminState::Down` disconnected); applying
+    /// `DesiredAdminState::Up` recovers it unless the adapter was disabled
+    /// outside this API. Other backends define their own meaning.
     ///
     /// ```no_run
     /// # #[cfg(any(feature = "async-io", feature = "tokio"))]
@@ -565,8 +568,10 @@ where
     /// Whatever the device's [`AsyncPacketIo::send`] returns. With the
     /// tun-rs backend these are the same results and errors as
     /// [`Handle::send`] in the same build: [`Error::Disconnected`] once the
-    /// device is gone, [`Error::InvalidState`] while a Windows (Wintun)
-    /// interface is disabled, and other native failures as the backend's
+    /// device is gone, [`Error::InvalidState`] while the device is down or
+    /// disabled (a disabled Wintun interface, an administratively down Linux
+    /// TUN/TAP device, or a Windows TAP adapter after
+    /// `DesiredAdminState::Down`), and other native failures as the backend's
     /// error table maps them. An interrupted write is retried, not reported.
     ///
     /// # Cancellation

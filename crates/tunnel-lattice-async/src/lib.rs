@@ -105,9 +105,12 @@ use pool::{Acquirer, SlotGuard, drop_guarded};
 ///
 /// The stream never yields `Err(Error::InvalidState)` for its own reasons: a
 /// rejected `buf_len` is reported only by the constructor. With the tun-rs
-/// backend, an `InvalidState` item means the Windows (Wintun) interface is
-/// currently disabled, which is recoverable; other backends define their
-/// own meaning.
+/// backend, an `InvalidState` item means the device exists but is not
+/// passing packets because it is down or disabled (a disabled Wintun
+/// interface, or a Windows TAP adapter whose media applying
+/// `DesiredAdminState::Down` disconnected); applying
+/// `DesiredAdminState::Up` recovers it unless the adapter was disabled
+/// outside this API. Other backends define their own meaning.
 ///
 /// Transient native conditions (a signal interrupting the call, for
 /// example) are retried inside a conforming backend's `recv` and never

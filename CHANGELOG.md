@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Error::Platform(PlatformErrorCode::Linux(5))`: the Linux tun driver
   returns `EIO` from a write only for a down device, so the raw code is
   matched on Linux `send` only. On Windows TAP, applying
-  `DesiredAdminState::Down` disconnects the adapter's media, after which
-  `send` and `recv` both fail at once with `ERROR_OPERATION_ABORTED`; that
+  `DesiredAdminState::Down` disconnects the adapter's media, after which a
+  `send` or `recv` made while it is down fails at once with
+  `ERROR_OPERATION_ABORTED`; that
   code on a Windows TAP handle is now `Error::InvalidState` on both
   directions instead of `Error::Platform(PlatformErrorCode::Windows(995))`.
   In both cases applying `DesiredAdminState::Up` on the same handle makes
@@ -32,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `InvalidState` and a `PacketStream` keeps going. A single `recv` call
   that meets two such cancelled reads still reports `InvalidState` once.
   Documented alongside: `recv` on a down Linux device waits instead of
-  failing, and on macOS `send` on a down device still succeeds.
+  failing, a Windows TAP `recv` already waiting when
+  `DesiredAdminState::Down` is applied keeps waiting the same way (neither
+  `Down` nor a later `Up` ends it; disabling the adapter ends it with
+  `InvalidState`), and on macOS `send` on a down device still succeeds.
 
 - **`snapshot()` reads the administrative state on macOS and Windows.**
   `DeviceObserver::snapshot` now reports `AdminState::Up`/`Down` on macOS

@@ -141,8 +141,11 @@ Both variants handle errors the same way:
 
 The stream never yields `InvalidState` for its own reasons: a rejected
 `buf_len` is reported only by the constructor. With the tun-rs backend, an
-`InvalidState` item means the Windows (Wintun) interface is currently
-disabled, which is recoverable; other backends define their own meaning.
+`InvalidState` item means the device exists but is not passing packets
+because it is down or disabled (a disabled Wintun interface, or a Windows
+TAP adapter whose media applying `DesiredAdminState::Down` disconnected);
+applying `DesiredAdminState::Up` recovers it unless the adapter was
+disabled outside this API. Other backends define their own meaning.
 
 Ending on the first such error keeps a device whose `recv` fails
 immediately and repeatedly (for example after the interface was deleted or

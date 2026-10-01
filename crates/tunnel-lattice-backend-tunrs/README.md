@@ -234,7 +234,7 @@ disabled underneath the handle, before the general table above:
 | Windows TUN          | `"The interface has been disabled"` (no OS code; exact message pinned against `tun-rs` 2.8.11), after the adapter was disabled, for example by applying `DesiredAdminState::Down` | `InvalidState` |
 | Linux (`send`)       | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | `InvalidState` |
 | Windows TAP (`recv`) | `ERROR_OPERATION_ABORTED` (995) while the adapter's operational status reads up: a read cancelled because the thread that started it exited | not reported: retried once with a fresh read, which waits as usual |
-| Windows TAP          | `ERROR_OPERATION_ABORTED` (995) otherwise: the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this crate | `InvalidState` |
+| Windows TAP          | `ERROR_OPERATION_ABORTED` (995) otherwise: a call made while the adapter's media is disconnected, which applying `DesiredAdminState::Down` does (a read already waiting is not ended by it), or the adapter was disabled outside this crate | `InvalidState` |
 
 `InvalidState` from `recv` or `send` means the device exists but is not
 passing packets because it is down or disabled. When applying
@@ -259,9 +259,13 @@ A down device does not fail every call:
   up or down: the kernel checks the length first.
 - On macOS, `send` on a down `utun` or `feth` still accepts the packet.
 - On Windows TAP, applying `DesiredAdminState::Down` disconnects the
-  adapter's media, and `send` and `recv` then fail at once with
-  `InvalidState` until `DesiredAdminState::Up` is applied; after that a
-  `recv` waits for traffic again. Disabling the adapter outside this
+  adapter's media, and a `send` or `recv` made while it is down then
+  fails at once with `InvalidState` until `DesiredAdminState::Up` is
+  applied; after that a `recv` waits for traffic again. A `recv` that was
+  already waiting when `Down` was applied is not ended by it: as on
+  Linux, it keeps waiting through `Down` and a later `Up`, so a
+  `PacketStream` ends with `InvalidState` only if its next `recv` starts
+  while the device is down. Disabling the adapter outside this
   crate (for example with `Disable-NetAdapter`) ends a waiting `recv`
   with the same native code and so also with `InvalidState`, but applying
   `DesiredAdminState::Up` does not undo `Disable-NetAdapter`; only

@@ -204,7 +204,7 @@ impl TunRsBackend {
 /// | Windows TUN | `"The interface has been disabled"`: the adapter was disabled, for example by applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
 /// | Linux (`send`) | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers it |
 /// | Windows TAP (`recv`) | `ERROR_OPERATION_ABORTED` (995) while the adapter's operational status reads up: a read cancelled because the thread that started it exited | not reported: retried once with a fresh read, which waits as usual |
-/// | Windows TAP | `ERROR_OPERATION_ABORTED` (995) otherwise: the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this API | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers the first case only |
+/// | Windows TAP | `ERROR_OPERATION_ABORTED` (995) otherwise: a call made while the adapter's media is disconnected, which applying `DesiredAdminState::Down` does (a read already waiting is not ended by it), or the adapter was disabled outside this API | [`Error::InvalidState`]; applying `DesiredAdminState::Up` recovers the first case only |
 ///
 /// So on Linux, deleting the device (for example with `ip link del`) ends
 /// a pending or later `recv` with [`Error::Disconnected`] in every feature
@@ -219,8 +219,12 @@ impl TunRsBackend {
 /// `DesiredAdminState::Up` on the same handle recovers it. A down Linux
 /// device does not fail `recv`: the call waits until a packet arrives, the
 /// device comes up, or it is deleted. On Windows TAP, after applying
-/// `DesiredAdminState::Down`, `send` and `recv` fail at once with
-/// [`Error::InvalidState`] until `DesiredAdminState::Up` is applied.
+/// `DesiredAdminState::Down`, a `send` or `recv` made while the device is
+/// down fails at once with [`Error::InvalidState`] until
+/// `DesiredAdminState::Up` is applied. A `recv` already waiting when
+/// `Down` is applied is not ended by it: as on Linux, it keeps waiting
+/// through `Down` and a later `Up`, and a `PacketStream` ends with this
+/// error only if its next `recv` starts while the device is down.
 /// Disabling the TAP adapter outside this API (for example with
 /// `Disable-NetAdapter`) fails them with the same native code and so the
 /// same error, but only re-enabling the adapter the same way recovers it.

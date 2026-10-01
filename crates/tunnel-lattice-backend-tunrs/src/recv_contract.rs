@@ -54,7 +54,11 @@
 //! `DesiredAdminState::Down` caused it, applying `DesiredAdminState::Up`
 //! on the same handle recovers it. A down Linux device does not fail
 //! `recv` at all: the read waits until the device is up and traffic
-//! arrives. A Windows TAP adapter disabled outside this API
+//! arrives. On Windows TAP the media disconnect fails only the calls made
+//! while it lasts: a `recv` whose read was already waiting when
+//! `apply(Down)` ran is not ended by it, nor by a later `apply(Up)`, and
+//! keeps waiting as on a down Linux device; disabling the adapter outside
+//! this API ends it with [`Error::InvalidState`]. A Windows TAP adapter disabled outside this API
 //! (`Disable-NetAdapter`) also fails with raw 995 and so also reads as
 //! [`Error::InvalidState`], but only re-enabling the adapter outside this
 //! API recovers that one.
@@ -155,6 +159,10 @@ pub(crate) fn is_transient(os: HostOs, err: &io::Error) -> bool {
 /// thread that polls it); the retry issues a fresh read, which waits as
 /// usual. A call that already retried reports its next 995, so a read
 /// that fails again at once is reported instead of retried forever.
+/// This is the path of a `recv` started in the few milliseconds after
+/// `apply(Down)` returns, before the operational status reads `Down`: its
+/// fresh read fails at once, is retried once, and the second 995 is
+/// reported.
 pub(crate) fn tap_abort_retries(
     retried: bool,
     oper: impl FnOnce() -> io::Result<AdminState>,
@@ -263,10 +271,14 @@ fn send_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
 /// maps.
 fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Error> {
     let unix = matches!(os, HostOs::Linux | HostOs::Macos);
-    // tap-windows completes every pending and new read and write with
-    // `ERROR_OPERATION_ABORTED` while the adapter's media is disconnected:
-    // `apply(Down)` (`tun-rs` `set_status(false)`, the
-    // `TAP_IOCTL_SET_MEDIA_STATUS` ioctl) does that, and
+    // tap-windows fails every read and write *issued* while the adapter's
+    // media is disconnected with `ERROR_OPERATION_ABORTED`; a read already
+    // pending when the media is disconnected is not completed and keeps
+    // waiting (the Windows privileged tests check it is still waiting 10 s
+    // after `apply(Down)`), so `apply(Down)` never brings it here, while
+    // disabling the adapter completes it with 995. `apply(Down)` (`tun-rs`
+    // `set_status(false)`, the `TAP_IOCTL_SET_MEDIA_STATUS` ioctl)
+    // disconnects the media, and
     // `apply(Up)` on the same handle makes both directions work again
     // (checked by the Windows privileged tests on every feature set). An
     // adapter disabled outside this API fails the same way, so it reads as
