@@ -2565,9 +2565,13 @@ mod privileged_tests {
     }
 
     /// A name unique to this test process and `tag`, within `IFNAMSIZ`.
+    ///
+    /// Uses the whole process id, which no other live process shares: a
+    /// Linux pid is at most 4194304 (`PID_MAX_LIMIT`), seven digits, so
+    /// `tl` plus a tag of up to six characters still fits in 15 bytes.
     #[cfg(target_os = "linux")]
     fn unique_linux_name(tag: &str) -> String {
-        let name = format!("tl{tag}{}", std::process::id() % 100_000);
+        let name = format!("tl{tag}{}", std::process::id());
         assert!(name.len() <= 15, "{name} exceeds IFNAMSIZ");
         name
     }
@@ -3009,6 +3013,10 @@ mod privileged_tests {
         eprintln!("windows TAP {state:?} {waited:?} after open");
         assert_eq!(state, AdminState::Up, "the adapter is up after open");
 
+        // Each attempt that completes at once drains one queued frame (CI
+        // has always reached a pending read by the third attempt); the bound
+        // only keeps a never-empty receive queue from looping forever.
+        const ORPHAN_ATTEMPTS: u32 = 1000;
         // The attempt whose `recv` was left pending, or `None` if every
         // attempt completed.
         let orphaned = std::thread::scope(|scope| {
@@ -3018,14 +3026,15 @@ mod privileged_tests {
                     let _entered = runtime.enter();
                     let mut buf = vec![0u8; buf_len];
                     let mut cx = Context::from_waker(Waker::noop());
-                    for attempt in 1..=100 {
+                    for attempt in 1..=ORPHAN_ATTEMPTS {
                         let mut recv = std::pin::pin!(AsyncPacketIo::recv(&*device, &mut buf));
                         match std::future::Future::poll(recv.as_mut(), &mut cx) {
                             // Dropped on return; the thread then exits.
                             Poll::Pending => return Some(attempt),
-                            Poll::Ready(result) => {
+                            Poll::Ready(result) if attempt <= 10 => {
                                 eprintln!("windows TAP orphan attempt {attempt}: {result:?}");
                             }
+                            Poll::Ready(_) => {}
                         }
                     }
                     None
@@ -3036,7 +3045,9 @@ mod privileged_tests {
         eprintln!("windows TAP recv left pending on attempt {orphaned:?}");
         assert!(
             orphaned.is_some(),
-            "no recv was left pending, so no read was orphaned"
+            "setup failed, not the retry: none of {ORPHAN_ATTEMPTS} recv polls was left \
+             pending (each completed at once; the first ten are printed above), so no \
+             read was orphaned"
         );
         std::thread::sleep(Duration::from_millis(100));
 
