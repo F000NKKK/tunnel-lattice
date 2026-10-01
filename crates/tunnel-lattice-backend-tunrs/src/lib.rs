@@ -2917,6 +2917,85 @@ mod privileged_tests {
         );
     }
 
+    /// A Windows TAP read cancelled because the thread that started it
+    /// exited, on a healthy adapter. An async `recv` issues its overlapped
+    /// `ReadFile` on the thread that polls it; here a scoped thread polls a
+    /// `recv` future once (until it is pending, draining any queued
+    /// frame), drops it, and exits, which makes Windows cancel that read.
+    /// The next `recv` then collects the cancelled read's
+    /// `ERROR_OPERATION_ABORTED`.
+    ///
+    /// Observational: prints the outcome of the next `recv` (2 s bound),
+    /// the snapshot's admin state, and a `send`, without asserting them.
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "async"))]
+    #[ignore = "requires Administrator and the tap-windows6 driver"]
+    fn windows_tap_orphaned_read_is_retried() {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Duration;
+
+        let _serial = serialize_windows_tap_tests();
+        #[cfg(feature = "tokio")]
+        let runtime = enter_tokio_runtime();
+        #[cfg(feature = "tokio")]
+        let _entered = runtime.enter();
+
+        let device = Arc::new(
+            TunRsBackend::new()
+                .open(DeviceConfig::new(DeviceKind::Tap))
+                .expect("open a TAP device"),
+        );
+        let snapshot = device.snapshot().expect("snapshot the device");
+        let name = snapshot.name.clone();
+        let buf_len = snapshot.recv_buffer_len();
+        let frame = broadcast_arp_request(snapshot.mac.expect("a TAP snapshot carries its MAC"));
+        let (state, waited) = poll_admin_state(&device, AdminState::Up);
+        eprintln!("windows TAP {state:?} {waited:?} after open");
+        assert_eq!(state, AdminState::Up, "the adapter is up after open");
+
+        // The attempt whose `recv` was left pending, or `None` if every
+        // attempt completed.
+        let orphaned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    #[cfg(feature = "tokio")]
+                    let _entered = runtime.enter();
+                    let mut buf = vec![0u8; buf_len];
+                    let mut cx = Context::from_waker(Waker::noop());
+                    for attempt in 1..=100 {
+                        let mut recv = std::pin::pin!(AsyncPacketIo::recv(&*device, &mut buf));
+                        match std::future::Future::poll(recv.as_mut(), &mut cx) {
+                            // Dropped on return; the thread then exits.
+                            Poll::Pending => return Some(attempt),
+                            Poll::Ready(result) => {
+                                eprintln!("windows TAP orphan attempt {attempt}: {result:?}");
+                            }
+                        }
+                    }
+                    None
+                })
+                .join()
+                .expect("the orphaning thread does not panic")
+        });
+        eprintln!("windows TAP recv left pending on attempt {orphaned:?}");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let next_recv = BlockingCall::spawn(&device, &name, move |device| {
+            let mut buf = vec![0u8; buf_len];
+            // Skips frames until the first error.
+            loop {
+                PacketIo::recv(device, &mut buf)?;
+            }
+        });
+        let received = next_recv.wait(Duration::from_secs(2));
+        eprintln!("windows TAP recv after an orphaned read, after 2 s: {received:?}");
+        let state = device.snapshot().map(|snapshot| snapshot.admin_state);
+        eprintln!("windows TAP admin state after an orphaned read: {state:?}");
+        let sent = PacketIo::send(&*device, &frame);
+        eprintln!("windows TAP send after an orphaned read: {sent:?}");
+    }
+
     /// A TAP device opened with a MAC address reports it, reports
     /// `MAC_MUTATION`, and a later patch's MAC is observable on the next
     /// snapshot; a TUN device reports no MAC and refuses one at open. The
