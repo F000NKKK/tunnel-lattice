@@ -48,3 +48,14 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread"], optional = tru
 
 [dev-dependencies]
 futures = { workspace = true }
+# The device benchmark's thread-bridge path calls `from_device_with_pool`
+# directly (the facade only takes it for a backend without native async),
+# also in the default build, where the optional dependency above is off.
+tunnel-lattice-async = { workspace = true }
+
+# Privileged real-device latency/throughput benchmark. Opt-in: a no-op
+# unless TUNNEL_LATTICE_PRIVILEGED_BENCH=1 (see benches/device/main.rs and
+# CONTRIBUTING.md); CI runs it only from the manual bench-device workflow.
+[[bench]]
+name = "device"
+harness = false
