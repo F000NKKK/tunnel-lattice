@@ -7,10 +7,7 @@ follow the same workflow, but everything Claude Code needs to operate lives
 here; nothing under this directory reads `.codex/` at runtime. Task-specific
 plans, evidence, and decisions are meant to live in the YouTrack project `TL`
 (https://hush.youtrack.cloud/projects/TL), reached via the `mcp__youtrack__*`
-tools — this directory only holds durable, reusable configuration. **The
-`TL` project does not exist yet**; this workflow documents the convention to
-follow once the user creates it (see `@.claude/rules/youtrack.md`'s opening
-note) — do not call `mcp__youtrack__*` against `TL` until then.
+tools — this directory only holds durable, reusable configuration.
 
 ## Load order
 
