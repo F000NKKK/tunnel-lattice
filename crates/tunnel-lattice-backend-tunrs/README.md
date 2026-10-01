@@ -233,10 +233,12 @@ disabled underneath the handle, before the general table above:
 | Windows TUN (`send`) | Wintun reports the adapter terminating, which `tun-rs` returns as `io::ErrorKind::WriteZero` without an OS code | `Disconnected` |
 | Windows TUN          | `"The interface has been disabled"` (no OS code; exact message pinned against `tun-rs` 2.8.11), after the adapter was disabled, for example by applying `DesiredAdminState::Down` | `InvalidState` |
 | Linux (`send`)       | `EIO`: the device is administratively down, for example after applying `DesiredAdminState::Down` | `InvalidState` |
-| Windows TAP          | `ERROR_OPERATION_ABORTED` (995): the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this crate | `InvalidState` |
+| Windows TAP (`recv`) | `ERROR_OPERATION_ABORTED` (995) while the adapter's operational status reads up: a read cancelled because the thread that started it exited | not reported: retried once with a fresh read, which waits as usual |
+| Windows TAP          | `ERROR_OPERATION_ABORTED` (995) otherwise: the adapter's media is disconnected, which applying `DesiredAdminState::Down` does, or the adapter was disabled outside this crate | `InvalidState` |
 
-`InvalidState` from `recv` or `send` means the device exists but is down
-or disabled. When applying `DesiredAdminState::Down` caused it, applying
+`InvalidState` from `recv` or `send` means the device exists but is not
+passing packets because it is down or disabled. When applying
+`DesiredAdminState::Down` caused it, applying
 `DesiredAdminState::Up` on the same handle recovers it: the disabled
 Wintun adapter starts a new session, a down Linux TUN/TAP device sends
 again, and a Windows TAP adapter's media is connected again. The Linux tun
@@ -264,6 +266,23 @@ A down device does not fail every call:
   with the same native code and so also with `InvalidState`, but applying
   `DesiredAdminState::Up` does not undo `Disable-NetAdapter`; only
   re-enabling the adapter the same way does.
+
+A healthy Windows TAP adapter also reports `ERROR_OPERATION_ABORTED` for a
+read that was cancelled: with `async-io` or `tokio`, `recv` starts its
+read on the thread that polls it, and if that `recv` is dropped while
+waiting and the thread then exits, Windows cancels the read. While the
+adapter's operational status (the one `snapshot()` reads) is up, `recv`
+retries the first such error in a call once with a fresh read, so the
+caller does not see it and a `PacketStream` keeps going. A `recv` already
+waiting when `DesiredAdminState::Down` is applied may make that one
+retry, which fails at once, before it returns `InvalidState`. The status
+is read at most once per call and a call retries at most once, so it
+never spins; `send` has no such retry, because `tun-rs` discards a
+cancelled pending write. One case remains: a single `recv` call that
+meets two such cancelled reads (for example, it collects one left by an
+earlier dropped `recv`, and then a thread that polled it exits while it is
+still pending) returns `InvalidState` once while the adapter is up, and
+the next call works.
 
 On Linux, a blocking `recv` that is already waiting when the device is
 deleted is woken by the kernel with `EFAULT` rather than `EBADFD`; later

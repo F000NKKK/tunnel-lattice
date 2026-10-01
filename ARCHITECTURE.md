@@ -160,13 +160,24 @@ from a write only for that case. On a Windows TAP handle, applying
 `send` and `recv` at once with raw `ERROR_OPERATION_ABORTED` (995); that
 code is `InvalidState` on a TAP handle only (the rule takes the device
 kind as well as the OS), since applying `Up` recovers the same handle.
-`InvalidState` from `recv`/`send` means "the device exists but is down or
-disabled"; when `apply(Down)` caused it, `apply(Up)` on the same handle
-recovers it. A down Linux device makes `recv` wait rather than fail, and a
-down macOS device still accepts `send`. A Windows TAP adapter disabled
-outside the crate (`Disable-NetAdapter`) fails with the same code and so
-also reports `InvalidState`, although only re-enabling it outside the
-crate recovers it. These rules match raw OS codes only on the
+A healthy TAP adapter also reports 995 for a read cancelled because the
+thread that started it exited (an async `recv` starts its read on the
+polling thread, so a dropped `recv` whose thread then exits leaves one
+behind). On `recv`, the first 995 in a call is therefore retried once with
+a fresh read if the adapter's operational status reads up; the status is
+read at most once per call. A read pending across `apply(Down)` can see
+995 before the status reads down; its retry fails at once and reports
+`InvalidState`. A single call that meets two cancelled reads reports
+`InvalidState` once on a healthy adapter. `send` is not retried, because
+`tun-rs` discards a cancelled pending write.
+`InvalidState` from `recv`/`send` means "the device exists but is not
+passing packets because it is down or disabled"; when `apply(Down)` caused
+it, `apply(Up)` on the same handle recovers it. A down Linux device makes
+`recv` wait rather than fail, and a down macOS device still accepts
+`send`. A Windows TAP adapter disabled outside the crate
+(`Disable-NetAdapter`) fails with the same code and so also reports
+`InvalidState`, although only re-enabling it outside the crate recovers
+it. These rules match raw OS codes only on the
 OS they belong to, and a raw-coded error is never matched through `kind()`
 (which `std` decodes with the running host's code table); only the
 code-less Wintun errors are matched by kind and message. Every rule is

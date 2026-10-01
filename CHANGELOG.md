@@ -20,10 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In both cases applying `DesiredAdminState::Up` on the same handle makes
   it work again, as it already did for a disabled Wintun adapter.
   `InvalidState` from `recv` or `send` now means "the device exists but is
-  down or disabled". A Windows TAP adapter disabled outside this API (for
-  example with `Disable-NetAdapter`) fails with the same code and so is
-  also `InvalidState` now, but only re-enabling it the same way recovers
-  it. Documented alongside: `recv` on a down Linux device waits instead of
+  not passing packets because it is down or disabled". A Windows TAP
+  adapter disabled outside this API (for example with
+  `Disable-NetAdapter`) fails with the same code and so is also
+  `InvalidState` now, but only re-enabling it the same way recovers it. A
+  healthy Windows TAP adapter also reports that code for a read cancelled
+  because the thread that started it exited (an async `recv` that was
+  dropped while waiting, on a thread that then exited); while the
+  adapter's operational status reads up, `recv` retries the first such
+  error in a call once with a fresh read, so it does not report
+  `InvalidState` and a `PacketStream` keeps going. A single `recv` call
+  that meets two such cancelled reads still reports `InvalidState` once.
+  Documented alongside: `recv` on a down Linux device waits instead of
   failing, and on macOS `send` on a down device still succeeds.
 
 - **`snapshot()` reads the administrative state on macOS and Windows.**
