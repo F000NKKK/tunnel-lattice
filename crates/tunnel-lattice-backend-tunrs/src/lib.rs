@@ -21,6 +21,12 @@
 mod admin_state;
 #[cfg(any(all(target_os = "macos", feature = "async"), all(test, unix)))]
 mod macos_tap;
+// Pure and I/O-free, so it compiles and is unit-tested on every OS; only
+// the Linux TUN receive and batch-send paths are meant to call it. Nothing
+// outside its tests calls it yet: once the Linux paths do, narrow this
+// allowance to `not(target_os = "linux")`.
+#[cfg_attr(not(test), allow(dead_code))]
+mod offload;
 mod open_contract;
 mod recv_contract;
 #[cfg(all(target_os = "linux", feature = "tokio"))]
