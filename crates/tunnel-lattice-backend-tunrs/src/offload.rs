@@ -1793,6 +1793,92 @@ mod tests {
         assert_round_trip(TCP4, &packets, 3);
     }
 
+    /// The NEEDS_CSUM partial sum a run's L4 checksum field must hold,
+    /// computed naively and only from the original packets: the folded,
+    /// not complemented, ones' complement sum of the pseudo-header over
+    /// the whole run's L4 length (the first packet's L4 header plus every
+    /// packet's payload).
+    fn naive_partial(shape: Shape, packets: &[Vec<u8>]) -> u16 {
+        let (l4_off, hdr_len) = shape.offsets();
+        let l4_len: usize =
+            (hdr_len - l4_off) + packets.iter().map(|p| p.len() - hdr_len).sum::<usize>();
+        let first = &packets[0];
+        let (addrs, len_words) = match shape.ip {
+            Ip::V4 => (&first[12..20], vec![l4_len as u32]),
+            Ip::V6 => (
+                &first[8..40],
+                vec![(l4_len >> 16) as u32, (l4_len & 0xffff) as u32],
+            ),
+        };
+        let mut sum: u32 = u32::from(shape.l4.proto());
+        for word in len_words {
+            sum += word;
+        }
+        for pair in addrs.chunks(2) {
+            sum += (u32::from(pair[0]) << 8) | u32::from(pair[1]);
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// A coalesced run's header carries, in its L4 checksum field, the
+    /// pseudo-header partial sum NEEDS_CSUM asks for (checked against an
+    /// independent naive computation), and completing that checksum over
+    /// the super-packet, as the kernel or a device would, gives a valid
+    /// L4 checksum.
+    #[test]
+    fn a_run_header_holds_the_pseudo_header_partial_sum() {
+        let v4_opts = Shape { opts: 2, ..TCP4 };
+        for shape in [TCP4, TCP6, UDP4, UDP6, v4_opts] {
+            let mut short_last = vec![1400; 6];
+            short_last.push(321);
+            let cases = [
+                flow(shape, &short_last, ACK | TCP_PSH),
+                flow(shape, &[1000; 4], ACK),
+                flow(shape, &[7; 3], ACK),
+            ];
+            for packets in &cases {
+                let r = refs(packets);
+                let run = plan_run(&r, true).unwrap_or_else(|| panic!("{shape:?}: no run"));
+                assert_eq!(run.count(), packets.len(), "{shape:?}");
+                let frame = run_frame(&run, &r);
+                let (l4_off, _) = shape.offsets();
+                let field = VNET_HDR_LEN + l4_off + shape.l4.csum_offset();
+                let partial = u16::from_be_bytes([frame[field], frame[field + 1]]);
+                assert_eq!(
+                    partial,
+                    naive_partial(shape, packets),
+                    "{shape:?}, {} packets: the partial sum",
+                    packets.len()
+                );
+                // NEEDS_CSUM completion: the complemented sum over the L4
+                // bytes from `csum_start`, with the partial in the field.
+                let mut pkt = frame[VNET_HDR_LEN..].to_vec();
+                let l4_csum = ref_checksum(&pkt[l4_off..]);
+                pkt[field - VNET_HDR_LEN..field - VNET_HDR_LEN + 2]
+                    .copy_from_slice(&l4_csum.to_be_bytes());
+                assert!(
+                    ref_valid(&pkt, shape),
+                    "{shape:?}, {} packets: the completed checksum",
+                    packets.len()
+                );
+            }
+        }
+        // The largest UDP run: 128 segments.
+        let packets = flow(UDP6, &[10; MAX_SEGMENTS], 0);
+        let r = refs(&packets);
+        let run = plan_run(&r, true).expect("a run");
+        assert_eq!(run.count(), MAX_SEGMENTS);
+        let frame = run_frame(&run, &r);
+        let field = VNET_HDR_LEN + 40 + L4::Udp.csum_offset();
+        assert_eq!(
+            u16::from_be_bytes([frame[field], frame[field + 1]]),
+            naive_partial(UDP6, &packets)
+        );
+    }
+
     #[test]
     fn run_caps_at_128_segments_and_64_kib() {
         let packets = flow(UDP4, &[10; MAX_SEGMENTS + 5], ACK);

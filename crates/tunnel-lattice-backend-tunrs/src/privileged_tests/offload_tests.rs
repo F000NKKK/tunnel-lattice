@@ -13,8 +13,15 @@
 //! whole and the backend splits them; on an older kernel the stack
 //! segments them first. Either way `recv` must return each segment as its
 //! own MTU-sized packet, in order, with valid checksums.
+//!
+//! In-order arrival alone would also pass if the kernel delivered every
+//! segment as its own packet, so wherever the queue has the offload the
+//! traffic needs (USO for these bursts, TSO for the TCP test), a test also
+//! requires the queue's test-only split counter to show that at least one
+//! super-packet was read and split.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +73,28 @@ fn has_offload(device: &TunRsDevice) -> bool {
 fn vnet_hdr_flag(name: &str) -> bool {
     linux_tun_flags(name) & VNET_HDR_FLAG != 0
 }
+
+/// How many super-packets `device` has read and split so far (its staging's
+/// test-only counter); 0 for a plainly framed queue. Call it between
+/// `recv`s.
+fn split_frames(device: &TunRsDevice) -> usize {
+    device
+        .offload
+        .as_ref()
+        .map_or(0, crate::offload_queue::OffloadRx::split_frames)
+}
+
+/// Whether a test must see a split: logs the decision for the CI output.
+fn require_split(what: &str, offload: bool) -> bool {
+    if !offload {
+        eprintln!("{what}: the queue lacks the offload, so the stack segments first");
+    }
+    offload
+}
+
+/// How many whole bursts a receive reads, at most, waiting for one that was
+/// read as a super-packet and split.
+const MAX_BURSTS: usize = 20;
 
 /// An offload request on a Linux TUN device gives an offload-framed queue
 /// that reports `SEGMENTATION_OFFLOAD`; without the request, and for TAP,
@@ -297,8 +326,10 @@ fn within_deadline(
 }
 
 /// Addresses `device`, sends GSO bursts into it, and checks that blocking
-/// `recv`s return one whole burst segment by segment.
-fn assert_receives_a_burst(device: TunRsDevice, subnet: [u8; 3]) {
+/// `recv`s return one whole burst segment by segment. With `require_split`,
+/// reads on (up to [`MAX_BURSTS`] whole bursts) until one was read as a
+/// super-packet and split by the queue.
+fn assert_receives_a_burst(device: TunRsDevice, subnet: [u8; 3], require_split: bool) {
     let name = device.snapshot().expect("snapshot").name;
     let device = Arc::new(device);
     let target = route_traffic_into(DeviceKind::Tun, &name, subnet);
@@ -307,12 +338,25 @@ fn assert_receives_a_burst(device: TunRsDevice, subnet: [u8; 3]) {
     let result = within_deadline(&device, &name, move |device| {
         let mut check = BurstCheck::new(port);
         let mut buf = vec![0u8; usize::from(MTU)];
+        let mut bursts = 0;
         loop {
             match PacketIo::recv(device, &mut buf) {
                 Ok(n) => {
-                    if check.feed(&buf[..n])? {
+                    if !check.feed(&buf[..n])? {
+                        continue;
+                    }
+                    bursts += 1;
+                    let splits = split_frames(device);
+                    if !require_split || splits > 0 {
+                        eprintln!("{bursts} whole bursts, {splits} super-packets split");
                         return Ok(());
                     }
+                    if bursts == MAX_BURSTS {
+                        return Err(format!(
+                            "{bursts} whole bursts arrived, but no super-packet was split"
+                        ));
+                    }
+                    check = BurstCheck::new(port);
                 }
                 Err(err) => return Err(format!("recv: {err:?}")),
             }
@@ -326,14 +370,16 @@ fn assert_receives_a_burst(device: TunRsDevice, subnet: [u8; 3]) {
 }
 
 /// A UDP GSO burst routed into an offload-framed queue is received as
-/// MTU-sized segments, each with valid checksums, none lost.
+/// MTU-sized segments, each with valid checksums, none lost; with USO the
+/// queue reads it as one super-packet and splits it.
 #[test]
 #[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
 fn a_gso_burst_is_received_segment_by_segment() {
     enter_runtime!();
     let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
     assert!(has_offload(&device));
-    assert_receives_a_burst(device, [10, 204, subnet_octet()]);
+    let split = require_split("UDP GSO burst", device.handle.udp_gso());
+    assert_receives_a_burst(device, [10, 204, subnet_octet()], split);
 }
 
 /// A plain send on an offload-framed queue goes out behind an all-zero
@@ -784,6 +830,277 @@ fn a_tcp_batch_reaches_the_host_whole_and_in_order() {
     }
 }
 
+/// The port the device side of the TSO test listens on.
+const TSO_PORT: u16 = 5201;
+/// The MSS the device side announces: the MTU less the IPv4 and TCP
+/// headers, so every segment the split produces is exactly MTU-sized.
+const TSO_MSS: u16 = MTU - 40;
+/// How many in-order stream bytes the TSO test reads before it may finish.
+const TSO_BYTES: usize = 256 * 1024;
+/// How many in-order stream bytes the TSO test reads, at most, waiting for
+/// a super-packet to be split.
+const TSO_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// The device side's initial sequence number.
+const TSO_ISS: u32 = 1_000_000;
+
+/// Byte `offset` of the stream the TSO test's host client sends.
+fn tso_stream_byte(offset: usize) -> u8 {
+    (offset % 251) as u8
+}
+
+/// A host TCP client that connects to `target` through the device
+/// (retrying until the route is usable, and again whenever a connection
+/// fails) and writes the [`tso_stream_byte`] stream, from offset 0 on each
+/// connection, until stopped.
+struct TcpClient {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TcpClient {
+    fn start(target: SocketAddr) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut chunk = vec![0u8; 64 * 1024];
+                while !stop.load(Ordering::Acquire) {
+                    let Ok(stream) = TcpStream::connect_timeout(&target, Duration::from_secs(2))
+                    else {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    };
+                    // Short timeouts, so a blocked write sees `stop` soon.
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    let mut offset = 0;
+                    while !stop.load(Ordering::Acquire) {
+                        for (i, byte) in chunk.iter_mut().enumerate() {
+                            *byte = tso_stream_byte(offset + i);
+                        }
+                        match (&stream).write(&chunk) {
+                            Ok(n) => offset += n,
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            })
+        };
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for TcpClient {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Whether the TCP checksum of the IPv4 `packet` (header length `ihl`)
+/// checks out.
+fn tcp_checksum_ok(packet: &[u8], ihl: usize) -> bool {
+    let Ok(l4_len) = u16::try_from(packet.len() - ihl) else {
+        return false;
+    };
+    let [l0, l1] = l4_len.to_be_bytes();
+    let mut l4 = packet[ihl..].to_vec();
+    if l4.len() % 2 == 1 {
+        l4.push(0);
+    }
+    checksum_ok(&[&packet[12..20], &[0, 6, l0, l1], &l4])
+}
+
+/// The device side of one TCP connection in the TSO test: it answers the
+/// client's SYN, then acknowledges every segment, checking that each one is
+/// a whole, checksummed, MTU-bounded packet carrying the right bytes.
+struct TcpPeer {
+    /// The client (`subnet.1`) and device side (`subnet.2`) addresses.
+    client: [u8; 4],
+    server: [u8; 4],
+    /// The client port of the connection being followed, once its SYN came.
+    client_port: Option<u16>,
+    /// The next stream sequence number expected from the client.
+    rcv_nxt: u32,
+    /// The in-order stream bytes received on the connection.
+    received: usize,
+    /// The IPv4 id of the next reply.
+    id: u16,
+}
+
+impl TcpPeer {
+    fn new(subnet: [u8; 3]) -> Self {
+        let [a, b, c] = subnet;
+        Self {
+            client: [a, b, c, 1],
+            server: [a, b, c, 2],
+            client_port: None,
+            rcv_nxt: 0,
+            received: 0,
+            id: 0,
+        }
+    }
+
+    /// An IPv4 TCP reply to the client: `flags`, our sequence number `seq`,
+    /// acknowledging `rcv_nxt`, a 65535-byte window, and `options`.
+    fn reply(&mut self, seq: u32, flags: u8, options: &[u8]) -> Vec<u8> {
+        let port = self.client_port.expect("a connection");
+        let doff = u8::try_from((20 + options.len()) / 4).expect("a short header") << 4;
+        let mut l4 = TSO_PORT.to_be_bytes().to_vec();
+        l4.extend_from_slice(&port.to_be_bytes());
+        l4.extend_from_slice(&seq.to_be_bytes());
+        l4.extend_from_slice(&self.rcv_nxt.to_be_bytes());
+        l4.extend_from_slice(&[doff, flags, 0xff, 0xff, 0, 0, 0, 0]);
+        l4.extend_from_slice(options);
+        self.id = self.id.wrapping_add(1);
+        ipv4_packet(self.server, self.client, self.id, &l4, &[])
+    }
+
+    /// Feeds one received packet: `Ok(Some(reply))` to send back,
+    /// `Ok(None)` for nothing (another flow, or a packet that needs no
+    /// answer), `Err` on a malformed or corrupt packet of the flow.
+    fn feed(&mut self, packet: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
+        const SYN: u8 = 0x02;
+        const RST: u8 = 0x04;
+        const ACK: u8 = 0x10;
+        let ihl = usize::from(packet.first().copied().unwrap_or(0) & 0x0f) * 4;
+        let ours = packet.len() >= 40
+            && packet[0] >> 4 == 4
+            && ihl >= 20
+            && packet.len() >= ihl + 20
+            && packet[9] == 6
+            && packet[12..16] == self.client
+            && packet[16..20] == self.server
+            && packet[ihl + 2..ihl + 4] == TSO_PORT.to_be_bytes();
+        if !ours {
+            return Ok(None);
+        }
+        let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+        if total != packet.len() {
+            return Err(format!(
+                "a {}-byte packet with total length {total}",
+                packet.len()
+            ));
+        }
+        if packet.len() > usize::from(MTU) {
+            return Err(format!("a {}-byte packet over the MTU", packet.len()));
+        }
+        if !checksum_ok(&[&packet[..ihl]]) {
+            return Err("an invalid IPv4 header checksum".to_owned());
+        }
+        if !tcp_checksum_ok(packet, ihl) {
+            return Err(format!("an invalid TCP checksum ({} bytes)", packet.len()));
+        }
+        let tcp = &packet[ihl..];
+        let port = u16::from_be_bytes([tcp[0], tcp[1]]);
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        let flags = tcp[13];
+        let data_at = usize::from(tcp[12] >> 4) * 4;
+        let Some(data) = tcp.get(data_at..) else {
+            return Err("a TCP header past the packet".to_owned());
+        };
+        if flags & SYN != 0 {
+            // A new connection (the client retries until one works):
+            // follow it from the start.
+            self.client_port = Some(port);
+            self.rcv_nxt = seq.wrapping_add(1);
+            self.received = 0;
+            let [m0, m1] = TSO_MSS.to_be_bytes();
+            return Ok(Some(self.reply(TSO_ISS, SYN | ACK, &[2, 4, m0, m1])));
+        }
+        if self.client_port != Some(port) {
+            return Ok(None);
+        }
+        if flags & RST != 0 {
+            self.client_port = None;
+            return Ok(None);
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        if seq == self.rcv_nxt {
+            let expected = (self.received..self.received + data.len()).map(tso_stream_byte);
+            if !data.iter().copied().eq(expected) {
+                return Err(format!(
+                    "corrupt stream bytes at offset {} ({} bytes)",
+                    self.received,
+                    data.len()
+                ));
+            }
+            self.received += data.len();
+            self.rcv_nxt = self
+                .rcv_nxt
+                .wrapping_add(u32::try_from(data.len()).expect("a short segment"));
+        }
+        // In order or not (a retransmission), acknowledge what we have.
+        Ok(Some(self.reply(TSO_ISS.wrapping_add(1), ACK, &[])))
+    }
+}
+
+/// A host TCP client sending a bulk stream into an offload-framed queue
+/// through the device (its route to the peer address) has the stack hand
+/// the queue TSO super-packets: `recv` splits them into MTU-sized segments,
+/// each with valid checksums, that carry the stream in order, and the
+/// queue's split counter shows at least one super-packet was split. The
+/// device side is a minimal TCP peer answering through the same queue.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn a_tso_stream_is_received_segment_by_segment() {
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    assert!(has_offload(&device));
+    let split = require_split("TCP TSO stream", device.handle.tcp_gso());
+    let name = device.snapshot().expect("snapshot").name;
+    let device = Arc::new(device);
+    let subnet = [10, 214, subnet_octet()];
+    let target = route_traffic_into(DeviceKind::Tun, &name, subnet);
+    let client = TcpClient::start(SocketAddr::new(target.ip(), TSO_PORT));
+    let result = within_deadline(&device, &name, move |device| {
+        let mut peer = TcpPeer::new(subnet);
+        let mut buf = vec![0u8; usize::from(MTU)];
+        loop {
+            let n = PacketIo::recv(device, &mut buf).map_err(|err| format!("recv: {err:?}"))?;
+            let Some(reply) = peer.feed(&buf[..n])? else {
+                continue;
+            };
+            PacketIo::send(device, &reply).map_err(|err| format!("send: {err:?}"))?;
+            if peer.received < TSO_BYTES {
+                continue;
+            }
+            let splits = split_frames(device);
+            if !split || splits > 0 {
+                eprintln!(
+                    "{} stream bytes, {splits} super-packets split",
+                    peer.received
+                );
+                return Ok(());
+            }
+            if peer.received >= TSO_MAX_BYTES {
+                return Err(format!(
+                    "{} stream bytes arrived, but no super-packet was split",
+                    peer.received
+                ));
+            }
+        }
+    });
+    drop(client);
+    drop(device);
+    if let Err(message) = result {
+        panic!("{name}: {message}");
+    }
+}
+
 /// A queue attached to a multi-queue device that already has a queue takes
 /// the device's framing, not its own request: a plain attach to an offload
 /// device is offload-framed (and reports it), and an offload attach to a
@@ -816,13 +1133,18 @@ fn an_attached_queue_takes_the_framing_of_its_device() {
         assert_eq!(vnet_hdr_flag(&name), first_offload, "{name}: device flag");
         assert_send_reaches_the_host(&attached, [10, send_subnet, subnet_octet()]);
         drop(first);
-        assert_receives_a_burst(attached, [10, recv_subnet, subnet_octet()]);
+        // No split is required: the attach that did not request offload
+        // cleared the device-wide offload mask (`tun-rs` does on every
+        // plain open), so the stack segments the bursts before either queue
+        // sees them; the framing is what this test checks.
+        assert_receives_a_burst(attached, [10, recv_subnet, subnet_octet()], false);
     }
 }
 
 /// `additional_queue` on an offload-framed queue gives another
 /// offload-framed queue with its own staging, which receives a GSO burst
-/// segment by segment once the original queue is gone.
+/// segment by segment once the original queue is gone (with USO, splitting
+/// it itself).
 #[test]
 #[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
 fn an_additional_queue_of_an_offload_queue_is_offload_framed() {
@@ -835,7 +1157,8 @@ fn an_additional_queue_of_an_offload_queue_is_offload_framed() {
     let queue = device.additional_queue().expect("add a queue");
     assert!(has_offload(&queue), "the added queue reports offload");
     drop(device);
-    assert_receives_a_burst(queue, [10, 208, subnet_octet()]);
+    let split = require_split("added queue", queue.handle.udp_gso());
+    assert_receives_a_burst(queue, [10, 208, subnet_octet()], split);
 }
 
 /// An async `recv` dropped after one poll, between the segments of a GSO
@@ -843,7 +1166,8 @@ fn an_additional_queue_of_an_offload_queue_is_offload_framed() {
 /// burst is still received whole and in order. With `tokio` the dropped
 /// poll is forced to yield by an exhausted cooperative budget; with
 /// `async-io` it is dropped whether or not it completed (a completed one's
-/// packet is checked too).
+/// packet is checked too). With USO, at least one of the bursts must have
+/// been read as a super-packet, so the drops really fell between segments.
 #[test]
 #[cfg(feature = "async")]
 #[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
@@ -862,11 +1186,30 @@ fn a_dropped_async_recv_loses_no_segment() {
     let target = route_traffic_into(DeviceKind::Tun, &name, [10, 209, subnet_octet()]);
     let sender = GsoSender::start(target);
     let port = sender.port;
+    let split = require_split("dropped recv", device.handle.udp_gso());
 
     let owned = Arc::clone(&device);
     let result = within_deadline(&device, &name, move |_| {
         let receive = async move {
             let device = &*owned;
+            // Whether enough whole bursts arrived: three, and with `split`
+            // at least one read as a super-packet and split.
+            let enough = |bursts: usize| -> std::result::Result<bool, String> {
+                if bursts < 3 {
+                    return Ok(false);
+                }
+                let splits = split_frames(device);
+                if !split || splits > 0 {
+                    eprintln!("{bursts} whole bursts, {splits} super-packets split");
+                    return Ok(true);
+                }
+                if bursts >= MAX_BURSTS {
+                    return Err(format!(
+                        "{bursts} whole bursts arrived, but no super-packet was split"
+                    ));
+                }
+                Ok(false)
+            };
             let mut check = BurstCheck::new(port);
             let mut buf = vec![0u8; usize::from(MTU)];
             let mut bursts = 0;
@@ -876,7 +1219,7 @@ fn a_dropped_async_recv_loses_no_segment() {
                     .map_err(|err| format!("recv: {err:?}"))?;
                 if check.feed(&buf[..n])? {
                     bursts += 1;
-                    if bursts == 3 {
+                    if enough(bursts)? {
                         return Ok(());
                     }
                     check = BurstCheck::new(port);
@@ -902,7 +1245,7 @@ fn a_dropped_async_recv_loses_no_segment() {
                         let n = result.map_err(|err| format!("recv: {err:?}"))?;
                         if check.feed(&buf[..n])? {
                             bursts += 1;
-                            if bursts == 3 {
+                            if enough(bursts)? {
                                 return Ok(());
                             }
                             check = BurstCheck::new(port);

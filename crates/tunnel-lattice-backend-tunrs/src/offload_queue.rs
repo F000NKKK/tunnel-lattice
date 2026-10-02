@@ -201,6 +201,11 @@ pub(crate) struct Staging {
     frame_len: usize,
     /// The segments of that frame still to serve; idle when none are.
     cursor: SplitCursor,
+    /// Test builds only: how many frames read so far carried more than one
+    /// segment, so a test can tell a real split from packets the kernel
+    /// delivered one by one.
+    #[cfg(test)]
+    split_frames: usize,
 }
 
 impl OffloadRx {
@@ -210,7 +215,17 @@ impl OffloadRx {
             buf: vec![0u8; STAGING_LEN].into_boxed_slice(),
             frame_len: 0,
             cursor: SplitCursor::IDLE,
+            #[cfg(test)]
+            split_frames: 0,
         }))
+    }
+
+    /// Test builds only: how many frames this queue has read that carried
+    /// more than one segment (super-packets that were split). Takes the
+    /// staging lock, so call it between `recv`s, not during one.
+    #[cfg(test)]
+    pub(crate) fn split_frames(&self) -> usize {
+        self.lock().split_frames
     }
 
     /// Locks the staging. The split code cannot panic, so the mutex is
@@ -344,6 +359,10 @@ impl Staging {
                 self.frame_len = len.min(self.buf.len());
                 let frame = self.buf.get(..self.frame_len).unwrap_or_default();
                 self.cursor = SplitCursor::new(frame).unwrap_or(SplitCursor::IDLE);
+                #[cfg(test)]
+                if self.cursor.segments() > 1 {
+                    self.split_frames += 1;
+                }
                 self.next_pending(out)
             }
             Err(err) => match recv_contract::offload_recv_error_step(os, kind, err) {
@@ -798,6 +817,45 @@ mod tests {
             assert_segment(&out[..len], k, if k == 4 { 300 } else { 1000 });
         }
         assert!(reads.0.is_empty(), "one read for the whole super-packet");
+    }
+
+    /// The test-only split counter counts frames of more than one segment
+    /// once each, when they are read: not a plain frame, not a GSO frame
+    /// that carries a single segment, and not a frame dropped as malformed.
+    #[test]
+    fn the_split_counter_counts_multi_segment_frames_only() {
+        let rx = OffloadRx::new();
+        let plain = [
+            crate::offload::VNET_HDR_NONE.as_slice(),
+            &[
+                0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+            ],
+        ]
+        .concat();
+        let mut malformed = udp4_frame(100, 4, 100);
+        malformed[1] = 0x33;
+        let mut reads = Reads::new([
+            Ok(plain),
+            Ok(udp4_frame(100, 1, 60)),
+            Ok(malformed),
+            Ok(udp4_frame(100, 3, 100)),
+            Ok(udp4_frame(200, 2, 10)),
+        ]);
+        let mut out = vec![0u8; 400];
+        assert_eq!(rx.split_frames(), 0);
+        recv(&rx, &mut reads, &mut out).expect("the plain packet");
+        assert_eq!(rx.split_frames(), 0, "a plain frame is not split");
+        recv(&rx, &mut reads, &mut out).expect("the single segment");
+        assert_eq!(rx.split_frames(), 0, "one segment is not a split");
+        // The malformed frame is dropped; the next frame is split.
+        recv(&rx, &mut reads, &mut out).expect("segment 0");
+        assert_eq!(rx.split_frames(), 1, "counted when read");
+        for _ in 1..3 {
+            recv(&rx, &mut reads, &mut out).expect("a pending segment");
+        }
+        assert_eq!(rx.split_frames(), 1, "pending segments read nothing");
+        recv(&rx, &mut reads, &mut out).expect("segment 0");
+        assert_eq!(rx.split_frames(), 2);
     }
 
     /// A segment that does not fit is dropped alone; the next `recv` with
