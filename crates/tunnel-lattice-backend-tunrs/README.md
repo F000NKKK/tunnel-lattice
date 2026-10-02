@@ -109,8 +109,9 @@ is a compile error from `tun-rs` itself, so `--all-features` is not valid.
   empty macOS TAP read are retried internally.
 - Deleting a Linux device, or the peer `feth` of a macOS TAP device, ends a
   waiting `recv` with `Disconnected` in every feature set. A device that is
-  down or disabled reports `InvalidState` (a down Linux device makes `recv`
-  wait instead); applying `DesiredAdminState::Up` on the same handle
+  down or disabled reports `InvalidState`, with two exceptions: a down
+  Linux device makes `recv` wait instead, and a down macOS device still
+  accepts `send`. Applying `DesiredAdminState::Up` on the same handle
   recovers it, except for a Windows adapter disabled outside this crate.
 - `DriverUnavailable` comes only from `open`: a missing `wintun.dll` or
   tap-windows6 driver on Windows, or a missing `tun` module on Linux.
@@ -130,6 +131,10 @@ and the [API reference](https://docs.rs/tunnel-lattice-backend-tunrs).
   existing name gives `AlreadyExists`, except two documented attach cases
   that are never deleted on drop: a Linux persistent or multi-queue device
   of the same kind and setting, and an existing Wintun adapter on Windows.
+  A Windows `Tun` open fails with `Platform(Windows(1247))` while another
+  handle holds that Wintun adapter's session (the other handle keeps
+  working), and with `Platform(Windows(code))` when the existing adapter of
+  that name is not a Wintun adapter.
 - `open` does not report whether it attached or created. Joining another
   user's Linux multi-queue device requires `CAP_NET_ADMIN`.
 - `DeviceConfig::with_mac` sets a TAP MAC address at open on every OS; if
