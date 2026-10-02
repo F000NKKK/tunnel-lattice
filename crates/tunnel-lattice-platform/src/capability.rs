@@ -41,6 +41,22 @@ bitflags::bitflags! {
         /// handle only, and only where the platform allows it; where it is
         /// absent, a MAC can still be requested when the device is opened.
         const MAC_MUTATION = 1 << 5;
+        /// The handle uses the kernel's segmentation offload internally:
+        /// [`crate::PacketIo::recv`] (and the async `recv`) transparently
+        /// splits each offloaded super-packet the kernel delivers into
+        /// single IP packets, and [`crate::PacketIo::send_batch`] (and the
+        /// async `send_batch`) may coalesce adjacent
+        /// packets of the same flow into one native write.
+        ///
+        /// Packet framing is unchanged: every receive still returns exactly
+        /// one packet and every send still takes one packet per buffer, so
+        /// a caller never sees an offload header or an aggregate. Reported
+        /// on an open device's handle only, never as a host capability, and
+        /// only once the backend has verified that the device actually uses
+        /// offload framing. Requested with
+        /// `tunnel_lattice_model::DeviceConfig::with_offload`; the request
+        /// is a hint, and this flag is the answer.
+        const SEGMENTATION_OFFLOAD = 1 << 6;
     }
 }
 
@@ -68,5 +84,13 @@ mod tests {
             Capability::PERSISTENT_DEVICES.bits()
         );
         assert!(!Capability::TAP_DEVICES.contains(Capability::MULTI_QUEUE));
+    }
+
+    #[test]
+    fn segmentation_offload_is_bit_six_and_overlaps_no_other_flag() {
+        assert_eq!(Capability::SEGMENTATION_OFFLOAD.bits(), 1 << 6);
+        let others = Capability::all().difference(Capability::SEGMENTATION_OFFLOAD);
+        assert!(!others.intersects(Capability::SEGMENTATION_OFFLOAD));
+        assert_eq!(others.bits(), (1 << 6) - 1, "bits 0-5 are unchanged");
     }
 }

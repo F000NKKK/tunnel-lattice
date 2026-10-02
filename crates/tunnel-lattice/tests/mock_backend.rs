@@ -22,6 +22,9 @@ struct State {
     inbox: Mutex<VecDeque<Vec<u8>>>,
     /// Packets written through `PacketIo::send`.
     sent: Mutex<Vec<Vec<u8>>>,
+    /// The length of every batch passed to either `send_batch` override,
+    /// so a test can tell the facade reached the device's own method.
+    batches: Mutex<Vec<usize>>,
     /// Packets written through `AsyncPacketIo::send`, kept apart so a test
     /// can tell which path a facade method took.
     #[cfg(feature = "async")]
@@ -111,7 +114,21 @@ impl PacketIo for MockDevice {
         self.state.sent.lock().unwrap().push(buf.to_vec());
         Ok(buf.len())
     }
+
+    /// Records the batch, then sends at most `BATCH_LIMIT` packets: a short
+    /// batch the facade must hand back unchanged.
+    fn send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
+        self.state.batches.lock().unwrap().push(packets.len());
+        let limit = packets.len().min(BATCH_LIMIT);
+        for packet in &packets[..limit] {
+            PacketIo::send(self, packet)?;
+        }
+        Ok(limit)
+    }
 }
+
+/// The most packets one mock `send_batch` call sends.
+const BATCH_LIMIT: usize = 2;
 
 impl DeviceObserver for MockDevice {
     type Device = Device;
@@ -217,6 +234,20 @@ impl tunnel_lattice::AsyncPacketIo for MockDevice {
             std::task::Poll::Ready(Ok(buf.len()))
         })
     }
+
+    /// Records the batch, then sends at most `BATCH_LIMIT` packets through
+    /// the async `send`, like the sync override.
+    async fn send_batch(&self, packets: &[&[u8]]) -> Result<usize>
+    where
+        Self: Sync,
+    {
+        self.state.batches.lock().unwrap().push(packets.len());
+        let limit = packets.len().min(BATCH_LIMIT);
+        for packet in &packets[..limit] {
+            tunnel_lattice::AsyncPacketIo::send(self, packet).await?;
+        }
+        Ok(limit)
+    }
 }
 
 #[test]
@@ -279,6 +310,31 @@ fn send_and_recv_reach_the_device() {
         handle.recv(&mut [0u8; 4]),
         Err(Error::BufferTooSmall)
     ));
+}
+
+const BATCH: [&[u8]; 3] = [b"one", b"two", b"three"];
+
+#[test]
+fn send_batch_passes_through_to_the_device_including_a_short_batch() {
+    let backend = MockBackend::new();
+    let state = Arc::clone(&backend.state);
+    let handle = Tunnel::new(backend)
+        .open(DeviceConfig::new(DeviceKind::Tun).with_offload(true))
+        .expect("open");
+
+    assert_eq!(handle.send_batch(&BATCH).expect("send_batch"), BATCH_LIMIT);
+    assert_eq!(*state.batches.lock().unwrap(), [3]);
+    assert_eq!(*state.sent.lock().unwrap(), BATCH[..BATCH_LIMIT]);
+
+    assert_eq!(handle.send_batch(&BATCH[BATCH_LIMIT..]).expect("rest"), 1);
+    assert_eq!(*state.sent.lock().unwrap(), BATCH);
+
+    state.fail_send.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        handle.send_batch(&BATCH),
+        Err(Error::Disconnected)
+    ));
+    assert_eq!(*state.batches.lock().unwrap(), [3, 1, 3]);
 }
 
 #[test]
@@ -486,6 +542,25 @@ fn a_send_async_error_reaches_the_caller_unchanged() {
         futures::executor::block_on(handle.send_async(b"pkt")).expect("send_async"),
         3
     );
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn send_batch_async_passes_through_to_the_async_device_method() {
+    let (handle, state) = async_handle(true);
+
+    let sent = futures::executor::block_on(handle.send_batch_async(&BATCH));
+    assert_eq!(sent.expect("send_batch_async"), BATCH_LIMIT);
+    assert_eq!(*state.batches.lock().unwrap(), [3]);
+    assert_eq!(*state.async_sent.lock().unwrap(), BATCH[..BATCH_LIMIT]);
+    assert!(state.sent.lock().unwrap().is_empty(), "not PacketIo");
+
+    state.fail_send.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        futures::executor::block_on(handle.send_batch_async(&BATCH)),
+        Err(Error::Disconnected)
+    ));
+    assert_eq!(state.async_sent.lock().unwrap().len(), BATCH_LIMIT);
 }
 
 #[cfg(feature = "async")]

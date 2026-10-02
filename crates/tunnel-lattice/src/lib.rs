@@ -41,11 +41,13 @@
 //!   `tunnel-lattice-async`'s thread-based adapter. Either feature also adds
 //!   `Handle::send_async`, which returns the backend's own async send
 //!   future for use inside async code, where the blocking `Handle::send`
-//!   must not be called. No async runtime is forced on a caller that
-//!   enables neither feature. `packet_stream` and `send_async` are
-//!   referenced here as plain text, not intra-doc links, because they only
-//!   exist under these features and this crate's default `cargo doc` build
-//!   (no features beyond `tun-rs`) cannot resolve them.
+//!   must not be called, and its batch counterpart
+//!   `Handle::send_batch_async`. No async runtime is forced on a caller
+//!   that enables neither feature. `packet_stream`, `send_async`, and
+//!   `send_batch_async` are referenced here as plain text, not intra-doc
+//!   links, because they only exist under these features and this crate's
+//!   default `cargo doc` build (no features beyond `tun-rs`) cannot resolve
+//!   them.
 
 #![warn(missing_docs)]
 
@@ -328,6 +330,47 @@ where
         self.device.send(buf)
     }
 
+    /// Writes a prefix of `packets`, in order, returning how many were sent.
+    ///
+    /// Each element is one packet, framed as for [`Handle::send`]. Passes
+    /// straight through to the device's [`PacketIo::send_batch`], with its
+    /// prefix contract: `Ok(n)` means `packets[..n]` were each sent whole
+    /// and in order and the rest were not touched, and `n` may be less than
+    /// `packets.len()`; `Err` means nothing was sent. A failure after some
+    /// packets were sent is reported as `Ok(k)`, and the error appears on
+    /// the next call, starting at `packets[k]`. An empty slice returns
+    /// `Ok(0)`.
+    ///
+    /// To send every packet, loop:
+    ///
+    /// ```no_run
+    /// # use tunnel_lattice::{ConnectedDevice, Handle, Result};
+    /// # fn example<D: ConnectedDevice>(device: &Handle<D>, packets: &[&[u8]]) -> Result<()> {
+    /// let mut rest = packets;
+    /// while !rest.is_empty() {
+    ///     let sent = device.send_batch(rest)?;
+    ///     rest = &rest[sent..];
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Blocks the calling thread like [`Handle::send`], with the same
+    /// runtime requirements; inside async code use `send_batch_async`
+    /// instead (available with the `async-io` or `tokio` feature).
+    ///
+    /// # Errors
+    ///
+    /// The error of the first packet, classified as [`Handle::send`]
+    /// classifies it.
+    ///
+    /// # Panics
+    ///
+    /// Under the same conditions as [`Handle::send`].
+    pub fn send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
+        self.device.send_batch(packets)
+    }
+
     /// Returns this device's current observed state.
     pub fn snapshot(&self) -> Result<Device> {
         self.device.snapshot()
@@ -596,6 +639,36 @@ where
     /// to await the future to completion.
     pub fn send_async(&self, buf: &[u8]) -> impl Future<Output = Result<usize>> + Send {
         AsyncPacketIo::send(&*self.device, buf)
+    }
+
+    /// Writes a prefix of `packets`, in order, without blocking the calling
+    /// thread, returning how many were sent.
+    ///
+    /// The async counterpart of [`Handle::send_batch`], with the same prefix
+    /// contract: `Ok(n)` means `packets[..n]` were each sent whole and in
+    /// order (`n` may be less than `packets.len()`, so callers loop), and
+    /// `Err` means nothing was sent. The returned future is the device's own
+    /// [`AsyncPacketIo::send_batch`] future, unchanged, and must be polled
+    /// as `send_async`'s is. Like `send_async`, there is no capability
+    /// check and no fallback.
+    ///
+    /// # Errors
+    ///
+    /// The error of the first packet, classified as `send_async` classifies
+    /// it.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future before it completes is always safe and leaves an
+    /// unknown prefix of `packets` sent: each packet whole and at most once,
+    /// and never a packet after one that was not sent. A caller that must
+    /// know how many packets went out has to await the future to
+    /// completion.
+    pub fn send_batch_async(&self, packets: &[&[u8]]) -> impl Future<Output = Result<usize>> + Send
+    where
+        D: Sync,
+    {
+        AsyncPacketIo::send_batch(&*self.device, packets)
     }
 }
 

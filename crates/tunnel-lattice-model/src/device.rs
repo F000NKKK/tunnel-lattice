@@ -164,12 +164,26 @@ pub struct DeviceConfig {
     /// persistent TAP device with a MAC attaches to that device and changes
     /// its MAC address, which outlives the handle.
     pub mac: Option<MacAddress>,
+    /// Requests kernel segmentation offload for the device's packet I/O
+    /// (`Capability::SEGMENTATION_OFFLOAD`). Off by default.
+    ///
+    /// This is a request, not a guarantee: it is ignored where the
+    /// backend/platform has no such concept, without an error, and the
+    /// device then uses plain framing. The `tun-rs` backend ignores it on
+    /// every OS except Linux, and for TAP devices on Linux. Check
+    /// `Capability::SEGMENTATION_OFFLOAD` on the opened handle to learn
+    /// whether offload is in use.
+    ///
+    /// Offload never changes what a caller sees: each receive still returns
+    /// one packet and each send still takes one, with no offload header.
+    /// It is fixed when the device is opened; no patch can change it.
+    pub offload: bool,
 }
 
 impl DeviceConfig {
     /// Creates a device-creation descriptor for `kind` with no name or MTU
-    /// preference — the backend chooses both — multi-queue disabled, and
-    /// no MAC address preference.
+    /// preference — the backend chooses both — multi-queue disabled, no
+    /// MAC address preference, and offload not requested.
     pub const fn new(kind: DeviceKind) -> Self {
         Self {
             kind,
@@ -177,6 +191,7 @@ impl DeviceConfig {
             mtu: None,
             multi_queue: false,
             mac: None,
+            offload: false,
         }
     }
 
@@ -207,6 +222,14 @@ impl DeviceConfig {
     #[must_use]
     pub const fn with_mac(mut self, mac: MacAddress) -> Self {
         self.mac = Some(mac);
+        self
+    }
+
+    /// Requests kernel segmentation offload (see [`Self::offload`]). No
+    /// effect where the platform ignores the request.
+    #[must_use]
+    pub const fn with_offload(mut self, offload: bool) -> Self {
+        self.offload = offload;
         self
     }
 }
@@ -395,6 +418,21 @@ mod tests {
         let config = DeviceConfig::new(DeviceKind::Tap);
         assert_eq!(config.name, None);
         assert_eq!(config.mtu, None);
+    }
+
+    #[test]
+    fn offload_defaults_to_off_and_its_builder_sets_only_offload() {
+        assert!(!DeviceConfig::new(DeviceKind::Tun).offload);
+
+        let config = DeviceConfig::new(DeviceKind::Tun).with_offload(true);
+        assert!(config.offload);
+        assert_eq!(
+            (config.kind, config.name.as_deref(), config.mtu),
+            (DeviceKind::Tun, None, None)
+        );
+        assert_eq!((config.multi_queue, config.mac), (false, None));
+
+        assert!(!config.with_offload(false).offload);
     }
 
     #[test]
