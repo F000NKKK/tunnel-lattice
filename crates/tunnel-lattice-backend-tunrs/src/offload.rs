@@ -504,6 +504,18 @@ impl SplitCursor {
         self.remaining() == 0
     }
 
+    /// The length of the next packet, without producing or dropping it, so
+    /// a caller can check it fits before [`write_next`](Self::write_next)
+    /// consumes it. `None` when every packet has been produced, or when the
+    /// cursor's plan cannot size it (the next `write_next` then ends the
+    /// cursor with [`DropReason::FrameMismatch`]).
+    pub(crate) fn next_len(&self) -> Option<usize> {
+        if self.is_finished() {
+            return None;
+        }
+        self.segment_len(self.next)
+    }
+
     /// Writes the next packet of `frame` to the start of `out` and advances.
     ///
     /// `frame` must be the frame passed to [`new`](Self::new); a frame of a
@@ -1707,6 +1719,35 @@ mod tests {
         let mut idle = SplitCursor::IDLE;
         assert!(idle.is_finished());
         assert_eq!(idle.write_next(&frame, &mut out), Ok(Segment::Done));
+    }
+
+    /// `next_len` sizes the next segment without consuming it: asking any
+    /// number of times leaves the cursor where it was, and the length is
+    /// exactly what `write_next` then produces. `None` once finished.
+    #[test]
+    fn next_len_sizes_the_next_segment_without_consuming_it() {
+        let data = payload(2500);
+        let frame = super_frame(TCP4, 1, 1, ACK, &data, 1000);
+        let want = expected(TCP4, 1, 1, ACK, &data, 1000);
+        let mut cursor = SplitCursor::new(&frame).unwrap();
+        let mut out = vec![0u8; 2000];
+        for packet in &want {
+            assert_eq!(cursor.next_len(), Some(packet.len()));
+            assert_eq!(cursor.next_len(), Some(packet.len()), "asking again");
+            let remaining = cursor.remaining();
+            assert_eq!(
+                cursor.write_next(&frame, &mut out),
+                Ok(Segment::Packet(packet.len()))
+            );
+            assert_eq!(cursor.remaining(), remaining - 1);
+        }
+        assert_eq!(cursor.next_len(), None);
+        assert_eq!(SplitCursor::IDLE.next_len(), None);
+
+        // A non-GSO frame: one packet, the frame without its header.
+        let plain = [VNET_HDR_NONE.as_slice(), &[0x45u8; 20]].concat();
+        let cursor = SplitCursor::new(&plain).unwrap();
+        assert_eq!(cursor.next_len(), Some(20));
     }
 
     // ---- coalescing --------------------------------------------------------

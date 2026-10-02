@@ -35,6 +35,23 @@
 //! future therefore never loses a frame it read, because its remaining
 //! segments stay in the staging buffer for the next `recv`.
 //!
+//! # Receiving a batch on an offload-framed queue
+//!
+//! A `recv_batch` fills position 0 exactly as a `recv` does (`recv` is a
+//! batch of one), then [`Staging::drain`]s, still under the same lock and
+//! with no `.await`: the pending segments of the current frame go into
+//! `bufs[1..]` in order, and once none is pending, the next frame is read
+//! into the staging buffer with a *non-waiting* read and split on. A
+//! segment is sized before it is copied ([`SplitCursor::next_len`]): one
+//! that does not fit `bufs[k]`, `k >= 1`, stays pending and ends the batch,
+//! so the next call serves it (or, at position 0, drops it as
+//! [`Error::BufferTooSmall`], as `recv` does). A frame the split does not
+//! accept and a raw `EINVAL` read are dropped and the drain goes on; every
+//! other failed read ends the batch (see `recv_contract`, "Draining a
+//! batch"). The drain takes its read as a closure, so the blocking build
+//! (`preadv2` with `RWF_NOWAIT`), `async-io` (`try_recv`) and Tokio
+//! (`try_io`) share it, and so do the scripted-read unit tests.
+//!
 //! # Sending a batch on an offload-framed queue
 //!
 //! [`send_batch_blocking`] and `send_batch_async` send at most
@@ -65,7 +82,7 @@ use crate::offload::{
     MAX_SEGMENTS, Run, STAGING_LEN, Segment, SplitCursor, VNET_HDR_LEN, VNET_HDR_NONE, plan_run,
 };
 use crate::open_contract::HostOs;
-use crate::recv_contract::{self, Step};
+use crate::recv_contract::{self, DrainStep, Step};
 
 /// Whether `open` passes a segmentation-offload request on to `tun-rs`:
 /// only for a Linux TUN device. Off Linux and for TAP the request is
@@ -240,10 +257,8 @@ impl OffloadRx {
         })
     }
 
-    /// Blocking `recv`: serves a pending segment, or reads frames with
-    /// `read` (one blocking native read into the given buffer) until one
-    /// yields a packet or an error. Holds the lock across `read`, which is
-    /// what a blocking caller does anyway.
+    /// Blocking `recv`: a batch of one through [`Self::recv_batch_blocking`],
+    /// which therefore never drains.
     #[cfg_attr(
         all(target_os = "linux", feature = "async", not(test)),
         expect(dead_code, reason = "async builds receive through an async loop")
@@ -253,29 +268,46 @@ impl OffloadRx {
         os: HostOs,
         kind: DeviceKind,
         out: &mut [u8],
-        mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+        read: impl FnMut(&mut [u8]) -> io::Result<usize>,
     ) -> Result<usize> {
+        let mut lens = [0];
+        self.recv_batch_blocking(os, kind, &mut [out], &mut lens, read, never_drained)
+            .map(|_| lens[0])
+    }
+
+    /// Blocking `recv_batch` (see the module docs): position 0 serves a
+    /// pending segment, or reads frames with `read` (one blocking native
+    /// read into the given buffer) until one yields a packet or an error;
+    /// then [`Staging::drain`] fills the rest with `read_nowait`, which must
+    /// never wait. Holds the lock across `read`, which is what a blocking
+    /// caller does anyway.
+    pub(crate) fn recv_batch_blocking(
+        &self,
+        os: HostOs,
+        kind: DeviceKind,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+        mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+        mut read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> Result<usize> {
+        if recv_contract::batch_capacity(bufs, lens) == 0 {
+            return Ok(0);
+        }
         let mut staging = self.lock();
         loop {
-            if let Some(result) = staging.next_pending(out) {
+            if let Some(result) = staging.pending_batch(os, bufs, lens, &mut read_nowait) {
                 return result;
             }
             let result = read(staging.read_buf());
-            if let Some(result) = staging.finish_read(os, kind, result, out) {
+            if let Some(result) = staging.read_batch(os, kind, result, bufs, lens, &mut read_nowait)
+            {
                 return result;
             }
         }
     }
 
-    /// The `async-io` receive loop: does one non-blocking read into the
-    /// staging buffer first, and waits for readiness on the `tun-rs` handle
-    /// only after that read found the queue empty (`WouldBlock`), as
-    /// `async-io`'s own `read_with` and the plain receive path do.
-    ///
-    /// The read must come first: a fresh `async-io` readiness wait never
-    /// completes on its first poll, only once the reactor has delivered an
-    /// event, so waiting before every read would cost a reactor round trip
-    /// per frame even while frames are queued.
+    /// The `async-io` `recv`: a batch of one through
+    /// [`Self::recv_batch_async_io`], which therefore never drains.
     #[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
     pub(crate) async fn recv_async_io(
         &self,
@@ -284,6 +316,36 @@ impl OffloadRx {
         handle: &tun_rs::AsyncDevice,
         out: &mut [u8],
     ) -> Result<usize> {
+        let mut lens = [0];
+        self.recv_batch_async_io(os, kind, handle, &mut [out], &mut lens)
+            .await
+            .map(|_| lens[0])
+    }
+
+    /// The `async-io` receive loop: does one non-blocking read into the
+    /// staging buffer first, and waits for readiness on the `tun-rs` handle
+    /// only after that read found the queue empty (`WouldBlock`), as
+    /// `async-io`'s own `read_with` and the plain receive path do. Once
+    /// position 0 holds a packet, [`Staging::drain`] fills the rest with
+    /// `try_recv`, which never waits.
+    ///
+    /// The read must come first: a fresh `async-io` readiness wait never
+    /// completes on its first poll, only once the reactor has delivered an
+    /// event, so waiting before every read would cost a reactor round trip
+    /// per frame even while frames are queued.
+    #[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+    pub(crate) async fn recv_batch_async_io(
+        &self,
+        os: HostOs,
+        kind: DeviceKind,
+        handle: &tun_rs::AsyncDevice,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+    ) -> Result<usize> {
+        if recv_contract::batch_capacity(bufs, lens) == 0 {
+            return Ok(0);
+        }
+        let mut read_nowait = |buf: &mut [u8]| handle.try_recv(buf);
         // The outcome of the last readiness wait; an error is handled
         // like a failed read.
         let mut ready = Ok(());
@@ -294,7 +356,7 @@ impl OffloadRx {
             // future can be dropped.
             {
                 let mut staging = self.lock();
-                if let Some(result) = staging.next_pending(out) {
+                if let Some(result) = staging.pending_batch(os, bufs, lens, &mut read_nowait) {
                     return result;
                 }
                 let result = match std::mem::replace(&mut ready, Ok(())) {
@@ -304,7 +366,9 @@ impl OffloadRx {
                 match result {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     result => {
-                        if let Some(result) = staging.finish_read(os, kind, result, out) {
+                        if let Some(result) =
+                            staging.read_batch(os, kind, result, bufs, lens, &mut read_nowait)
+                        {
                             return result;
                         }
                         continue;
@@ -318,7 +382,128 @@ impl OffloadRx {
     }
 }
 
+/// The drain read of a batch of one, which [`Staging::drain`] never calls.
+fn never_drained(_: &mut [u8]) -> io::Result<usize> {
+    Err(io::ErrorKind::WouldBlock.into())
+}
+
 impl Staging {
+    /// Position 0 of a batch from a pending segment, then the drain:
+    /// `Some(result)` for the call, or `None` when nothing is pending (or
+    /// the batch has no capacity, which callers check first).
+    pub(crate) fn pending_batch(
+        &mut self,
+        os: HostOs,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> Option<Result<usize>> {
+        let first = self.next_pending(bufs.first_mut()?)?;
+        Some(self.complete_batch(os, first, bufs, lens, read_nowait))
+    }
+
+    /// Position 0 of a batch from one native read's `result` (see
+    /// [`Self::finish_read`]), then the drain: `Some(result)` for the call,
+    /// or `None` to read again.
+    pub(crate) fn read_batch(
+        &mut self,
+        os: HostOs,
+        kind: DeviceKind,
+        result: io::Result<usize>,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> Option<Result<usize>> {
+        let first = self.finish_read(os, kind, result, bufs.first_mut()?)?;
+        Some(self.complete_batch(os, first, bufs, lens, read_nowait))
+    }
+
+    /// Records position 0's packet, or returns its error with nothing
+    /// received, then drains.
+    fn complete_batch(
+        &mut self,
+        os: HostOs,
+        first: Result<usize>,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> Result<usize> {
+        let len = first?;
+        let Some(slot) = lens.first_mut() else {
+            return Ok(0);
+        };
+        *slot = len;
+        Ok(self.drain(os, bufs, lens, 1, read_nowait))
+    }
+
+    /// Positions `n..` of a batch, never waiting: serves pending segments
+    /// into `bufs[n..]`, and when none is pending reads the next frame with
+    /// `read_nowait` and splits on, until the capacity is reached or the
+    /// batch ends (see the module docs). Returns the new count.
+    ///
+    /// A segment longer than its buffer stays pending and ends the batch.
+    /// A frame the split does not accept is dropped, and a failed read
+    /// follows `recv_contract::drain_error_step`. A zero-length read is a
+    /// zero-length packet, as `recv` passes it through.
+    pub(crate) fn drain(
+        &mut self,
+        os: HostOs,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+        mut n: usize,
+        mut read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> usize {
+        let capacity = recv_contract::batch_capacity(bufs, lens);
+        while n < capacity {
+            let (Some(out), Some(len)) = (bufs.get_mut(n), lens.get_mut(n)) else {
+                break;
+            };
+            if !self.cursor.is_finished() {
+                if self.cursor.next_len().is_some_and(|next| next > out.len()) {
+                    break;
+                }
+                match self.next_pending(out) {
+                    Some(Ok(got)) => {
+                        *len = got;
+                        n += 1;
+                    }
+                    // Unreachable after the size check: a too-small buffer
+                    // is the only error, and it would have dropped the
+                    // segment. End the batch rather than go on.
+                    Some(Err(_)) => break,
+                    // The cursor ended: read the next frame.
+                    None => {}
+                }
+                continue;
+            }
+            match read_nowait(self.read_buf()) {
+                Ok(0) => {
+                    *len = 0;
+                    n += 1;
+                }
+                Ok(got) => self.load(got),
+                Err(err) => match recv_contract::drain_error_step(os, true, &err) {
+                    DrainStep::Repeat => {}
+                    DrainStep::End => break,
+                },
+            }
+        }
+        n
+    }
+
+    /// Takes a frame of `len` bytes that a read put in the staging buffer:
+    /// validates it and points the cursor at its first segment, or, when
+    /// the split does not accept it, drops it (the cursor stays idle).
+    fn load(&mut self, len: usize) {
+        self.frame_len = len.min(self.buf.len());
+        let frame = self.buf.get(..self.frame_len).unwrap_or_default();
+        self.cursor = SplitCursor::new(frame).unwrap_or(SplitCursor::IDLE);
+        #[cfg(test)]
+        if self.cursor.segments() > 1 {
+            self.split_frames += 1;
+        }
+    }
+
     /// Writes the next pending segment into `out`: `Some(Ok(len))`, or
     /// `Some(Err(BufferTooSmall))` when `out` is too short (that segment is
     /// dropped, and the next call serves the one after it). `None` when no
@@ -368,13 +553,7 @@ impl Staging {
                 Some(Ok(0))
             }
             Ok(len) => {
-                self.frame_len = len.min(self.buf.len());
-                let frame = self.buf.get(..self.frame_len).unwrap_or_default();
-                self.cursor = SplitCursor::new(frame).unwrap_or(SplitCursor::IDLE);
-                #[cfg(test)]
-                if self.cursor.segments() > 1 {
-                    self.split_frames += 1;
-                }
+                self.load(len);
                 self.next_pending(out)
             }
             Err(err) => match recv_contract::offload_recv_error_step(os, kind, err) {
@@ -982,6 +1161,237 @@ mod tests {
         assert_segment(&out[..len], 0, 100);
         assert!(!rx.0.is_poisoned());
     }
+
+    /// `count` receive buffers of `len` bytes each.
+    struct Bufs(Vec<Vec<u8>>);
+
+    impl Bufs {
+        fn new(count: usize, len: usize) -> Self {
+            Self(vec![vec![0u8; len]; count])
+        }
+
+        fn slices(&mut self) -> Vec<&mut [u8]> {
+            self.0.iter_mut().map(Vec::as_mut_slice).collect()
+        }
+    }
+
+    /// One blocking `recv_batch`: `reads` scripts position 0's waiting
+    /// reads, `nowait` the drain's.
+    fn batch(
+        rx: &OffloadRx,
+        reads: &mut Reads,
+        nowait: &mut Reads,
+        bufs: &mut Bufs,
+        lens: &mut [usize],
+    ) -> Result<usize> {
+        rx.recv_batch_blocking(
+            HostOs::Linux,
+            TUN,
+            &mut bufs.slices(),
+            lens,
+            |buf| reads.read(buf),
+            |buf| nowait.read(buf),
+        )
+    }
+
+    fn would_block() -> io::Result<Vec<u8>> {
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    #[test]
+    fn a_batch_with_no_capacity_reads_nothing() {
+        let rx = OffloadRx::new();
+        let (mut reads, mut nowait) = (Reads::new([]), Reads::new([]));
+        let mut bufs = Bufs::new(4, 100);
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut []).unwrap(),
+            0
+        );
+        let mut none = Bufs::new(0, 0);
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut none, &mut [0; 4]).unwrap(),
+            0
+        );
+    }
+
+    /// Every segment of one super-frame in one call, with no further read
+    /// once the capacity is reached.
+    #[test]
+    fn one_call_serves_every_segment_of_a_frame() {
+        let rx = OffloadRx::new();
+        let mut reads = Reads::new([Ok(udp4_frame(1000, 5, 300))]);
+        let mut nowait = Reads::new([]);
+        let mut bufs = Bufs::new(5, 2000);
+        let mut lens = [0; 5];
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            5
+        );
+        for (k, (buf, len)) in bufs.0.iter().zip(lens).enumerate() {
+            assert_segment(&buf[..len], k, if k == 4 { 300 } else { 1000 });
+        }
+        assert!(reads.0.is_empty());
+    }
+
+    /// A frame larger than the batch leaves its rest pending for the next
+    /// call, which is served before any read.
+    #[test]
+    fn the_rest_of_a_frame_stays_pending_for_the_next_call() {
+        let rx = OffloadRx::new();
+        let mut reads = Reads::new([Ok(udp4_frame(100, 5, 100))]);
+        let mut nowait = Reads::new([would_block()]);
+        let mut bufs = Bufs::new(3, 200);
+        let mut lens = [0; 3];
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            3
+        );
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            2
+        );
+        assert_segment(&bufs.0[0][..lens[0]], 3, 100);
+        assert_segment(&bufs.0[1][..lens[1]], 4, 100);
+        assert!(reads.0.is_empty() && nowait.0.is_empty());
+    }
+
+    /// The drain reads further frames without waiting and stops at the
+    /// first empty or unsupported read.
+    #[test]
+    fn the_drain_spans_frames_until_the_queue_is_empty() {
+        let plain = [
+            crate::offload::VNET_HDR_NONE.as_slice(),
+            &[
+                0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+            ],
+        ]
+        .concat();
+        for end in [
+            would_block(),
+            Err(io::Error::from_raw_os_error(11)),
+            Err(io::Error::from_raw_os_error(95)),
+        ] {
+            let rx = OffloadRx::new();
+            let mut reads = Reads::new([Ok(udp4_frame(100, 2, 100))]);
+            let mut nowait = Reads::new([Ok(udp4_frame(200, 2, 50)), Ok(plain.clone()), end]);
+            let mut bufs = Bufs::new(8, 300);
+            let mut lens = [0; 8];
+            assert_eq!(
+                batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+                5
+            );
+            assert_segment(&bufs.0[0][..lens[0]], 0, 100);
+            assert_segment(&bufs.0[1][..lens[1]], 1, 100);
+            assert_segment(&bufs.0[2][..lens[2]], 0, 200);
+            assert_segment(&bufs.0[3][..lens[3]], 1, 50);
+            assert_eq!(lens[4], 20);
+            assert!(nowait.0.is_empty(), "the drain stopped at the empty read");
+        }
+    }
+
+    /// A segment too long for its buffer at a position after the first
+    /// stays pending and ends the batch; the next call with a large
+    /// enough buffer serves it. At position 0 it is dropped, as by `recv`.
+    #[test]
+    fn a_too_small_buffer_after_the_first_keeps_the_segment() {
+        let rx = OffloadRx::new();
+        let mut reads = Reads::new([Ok(udp4_frame(100, 4, 100))]);
+        let mut nowait = Reads::new([]);
+        let mut bufs = Bufs::new(3, 200);
+        bufs.0[1].truncate(50);
+        let mut lens = [0; 3];
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            1
+        );
+        assert_segment(&bufs.0[0][..lens[0]], 0, 100);
+
+        let mut small = Bufs::new(2, 50);
+        assert!(matches!(
+            batch(&rx, &mut reads, &mut nowait, &mut small, &mut [0; 2]),
+            Err(Error::BufferTooSmall)
+        ));
+        // Segment 1 was kept, then dropped at position 0; 2 and 3 remain.
+        let mut bufs = Bufs::new(3, 200);
+        let mut nowait = Reads::new([would_block()]);
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            2
+        );
+        assert_segment(&bufs.0[0][..lens[0]], 2, 100);
+        assert_segment(&bufs.0[1][..lens[1]], 3, 100);
+    }
+
+    /// A frame the split does not accept, a raw `EINVAL` and `EINTR` are
+    /// dropped by the drain, which goes on reading; a zero-length read is a
+    /// zero-length packet.
+    #[test]
+    fn the_drain_drops_bad_frames_and_goes_on() {
+        let rx = OffloadRx::new();
+        let mut bad_type = udp4_frame(100, 2, 10);
+        bad_type[1] = 0x33;
+        let mut reads = Reads::new([Ok(udp4_frame(100, 1, 100))]);
+        let mut nowait = Reads::new([
+            Ok(bad_type),
+            Err(io::Error::from_raw_os_error(22)),
+            Err(io::Error::from_raw_os_error(4)),
+            Ok(udp4_frame(100, 1, 60)),
+            Ok(Vec::new()),
+            would_block(),
+        ]);
+        let mut bufs = Bufs::new(4, 200);
+        let mut lens = [9; 4];
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            3
+        );
+        assert_segment(&bufs.0[0][..lens[0]], 0, 100);
+        assert_segment(&bufs.0[1][..lens[1]], 0, 60);
+        assert_eq!(lens[2], 0);
+        assert!(nowait.0.is_empty());
+    }
+
+    /// Any other drain error returns the prefix; the next call's own read
+    /// reports the device state behind it.
+    #[test]
+    fn another_drain_error_returns_the_prefix_first() {
+        let rx = OffloadRx::new();
+        let mut reads = Reads::new([
+            Ok(udp4_frame(100, 1, 100)),
+            Err(io::Error::from_raw_os_error(77)),
+        ]);
+        let mut nowait = Reads::new([Err(io::Error::from_raw_os_error(77))]);
+        let mut bufs = Bufs::new(4, 200);
+        let mut lens = [0; 4];
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            1
+        );
+        assert!(matches!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens),
+            Err(Error::Disconnected)
+        ));
+    }
+
+    /// Position 0 waits through dropped frames and retried errors exactly
+    /// as `recv` does, then drains.
+    #[test]
+    fn position_zero_reads_again_like_recv() {
+        let rx = OffloadRx::new();
+        let mut reads = Reads::new([
+            Ok(vec![0u8; 4]),
+            Err(io::Error::from_raw_os_error(22)),
+            Ok(udp4_frame(100, 2, 100)),
+        ]);
+        let mut nowait = Reads::new([would_block()]);
+        let mut bufs = Bufs::new(4, 200);
+        let mut lens = [0; 4];
+        assert_eq!(
+            batch(&rx, &mut reads, &mut nowait, &mut bufs, &mut lens).unwrap(),
+            2
+        );
+        assert!(reads.0.is_empty() && nowait.0.is_empty());
+    }
 }
 
 /// The batch send over a scripted queue, through both the blocking and the
@@ -1587,5 +1997,63 @@ mod async_io_tests {
         let _peer = sender.join().expect("the sender thread");
         let n = recv(&rx, &device, &mut out).expect("segment 1");
         assert_segment(&out[..n], 1, 40);
+    }
+
+    /// One `recv_batch` serves every queued segment, across frames, with
+    /// `try_recv` reads that never wait, and returns at the empty queue.
+    #[test]
+    fn a_batch_drains_every_queued_frame() {
+        let (device, peer) = queue();
+        let rx = OffloadRx::new();
+        peer.send(&udp4_frame(300, 3, 300)).expect("send a frame");
+        peer.send(&udp4_frame(200, 2, 50)).expect("send a frame");
+        let mut bufs = vec![vec![0u8; 1500]; 8];
+        let mut lens = [0; 8];
+        let n = block_on(rx.recv_batch_async_io(
+            HostOs::Linux,
+            DeviceKind::Tun,
+            &device,
+            &mut bufs.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+            &mut lens,
+        ))
+        .expect("a batch");
+        assert_eq!(n, 5);
+        for (i, (k, len)) in [(0, 300), (1, 300), (2, 300), (0, 200), (1, 50)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_segment(&bufs[i][..lens[i]], k, len);
+        }
+    }
+
+    /// A batch dropped while it waits takes nothing; a batch never polled
+    /// mid-split takes nothing either; the rest of a frame larger than the
+    /// batch is served, without waiting, by the next one.
+    #[test]
+    fn a_dropped_batch_loses_no_segment() {
+        let (device, peer) = queue();
+        let rx = OffloadRx::new();
+        let mut bufs = vec![vec![0u8; 1500]; 2];
+        let mut lens = [0; 2];
+        let batch = |bufs: &mut Vec<Vec<u8>>, lens: &mut [usize]| {
+            let mut slices: Vec<&mut [u8]> = bufs.iter_mut().map(Vec::as_mut_slice).collect();
+            rx.recv_batch_async_io(HostOs::Linux, DeviceKind::Tun, &device, &mut slices, lens)
+                .now_or_never()
+        };
+        assert!(batch(&mut bufs, &mut lens).is_none(), "nothing to read yet");
+        peer.send(&udp4_frame(100, 5, 100)).expect("send a frame");
+        for first in [0, 2] {
+            let n = batch(&mut bufs, &mut lens)
+                .expect("a queued frame is read on the first poll")
+                .expect("a batch");
+            assert_eq!(n, 2);
+            assert_segment(&bufs[0][..lens[0]], first, 100);
+            assert_segment(&bufs[1][..lens[1]], first + 1, 100);
+        }
+        let n = batch(&mut bufs, &mut lens)
+            .expect("a pending segment is served without waiting")
+            .expect("segment 4");
+        assert_eq!(n, 1);
+        assert_segment(&bufs[0][..lens[0]], 4, 100);
     }
 }

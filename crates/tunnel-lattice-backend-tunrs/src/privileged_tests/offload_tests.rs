@@ -1275,3 +1275,239 @@ fn a_dropped_async_recv_loses_no_segment() {
         panic!("{name}: {message}");
     }
 }
+
+/// How many buffers each `recv_batch` in these tests offers: more than a
+/// burst, so one call can take a whole burst.
+const BATCH: usize = 2 * SEGMENTS;
+
+/// Tracks what the `recv_batch` tests require: whole bursts in order (one
+/// [`BurstCheck`] over every packet of every batch), at least one batch of
+/// more than one packet, and with `split` at least one super-packet split.
+struct BatchCheck {
+    port: u16,
+    check: BurstCheck,
+    bursts: usize,
+    largest: usize,
+    split: bool,
+}
+
+impl BatchCheck {
+    fn new(port: u16, split: bool) -> Self {
+        Self {
+            port,
+            check: BurstCheck::new(port),
+            bursts: 0,
+            largest: 0,
+            split,
+        }
+    }
+
+    /// Feeds the packets of one batch: `Ok(true)` once enough was seen.
+    fn feed(
+        &mut self,
+        device: &TunRsDevice,
+        packets: impl IntoIterator<Item = Vec<u8>>,
+    ) -> std::result::Result<bool, String> {
+        let mut count = 0;
+        let mut whole = false;
+        for packet in packets {
+            count += 1;
+            if self.check.feed(&packet)? {
+                self.bursts += 1;
+                self.check = BurstCheck::new(self.port);
+                whole = true;
+            }
+        }
+        self.largest = self.largest.max(count);
+        if !whole {
+            return Ok(false);
+        }
+        let splits = split_frames(device);
+        if self.largest > 1 && (!self.split || splits > 0) {
+            eprintln!(
+                "{} whole bursts, largest batch {}, {splits} super-packets split",
+                self.bursts, self.largest
+            );
+            return Ok(true);
+        }
+        if self.bursts >= MAX_BURSTS {
+            return Err(format!(
+                "{} whole bursts, but the largest batch was {} and {splits} super-packets \
+                 were split",
+                self.bursts, self.largest
+            ));
+        }
+        Ok(false)
+    }
+}
+
+/// Addresses `device`, sends GSO bursts into it, and checks that blocking
+/// `recv_batch` calls return whole bursts in order, some call more than
+/// one packet, and (with `require_split`) some burst read as a super-packet.
+fn assert_batches_receive_a_burst(device: TunRsDevice, subnet: [u8; 3], require_split: bool) {
+    let name = device.snapshot().expect("snapshot").name;
+    let device = Arc::new(device);
+    let target = route_traffic_into(DeviceKind::Tun, &name, subnet);
+    let sender = GsoSender::start(target);
+    let port = sender.port;
+    let result = within_deadline(&device, &name, move |device| {
+        let mut check = BatchCheck::new(port, require_split);
+        let mut bufs = vec![vec![0u8; usize::from(MTU)]; BATCH];
+        let mut lens = [0usize; BATCH];
+        loop {
+            let mut slices: Vec<&mut [u8]> = bufs.iter_mut().map(Vec::as_mut_slice).collect();
+            let n = PacketIo::recv_batch(device, &mut slices, &mut lens)
+                .map_err(|err| format!("recv_batch: {err:?}"))?;
+            if n == 0 || n > BATCH {
+                return Err(format!("recv_batch returned {n}"));
+            }
+            let packets = (0..n).map(|i| bufs[i][..lens[i]].to_vec());
+            if check.feed(device, packets)? {
+                return Ok(());
+            }
+        }
+    });
+    drop(sender);
+    drop(device);
+    if let Err(message) = result {
+        panic!("{name}: {message}");
+    }
+}
+
+/// On a plainly framed queue `recv_batch` waits for the first packet, then
+/// drains what the queue already holds: the segments the stack produced
+/// for a burst come back several per call, whole and in order.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn a_plain_queue_batch_drains_queued_packets() {
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun));
+    assert!(!has_offload(&device));
+    assert_batches_receive_a_burst(device, [10, 215, subnet_octet()], false);
+}
+
+/// On an offload-framed queue one `recv_batch` serves the segments of a
+/// super-packet together, whole and in order.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn an_offload_queue_batch_serves_a_burst_together() {
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    assert!(has_offload(&device));
+    let split = require_split("offload batch", device.handle.udp_gso());
+    assert_batches_receive_a_burst(device, [10, 216, subnet_octet()], split);
+}
+
+/// An added queue drains with `recv_batch` like the first one, from its
+/// own staging.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn an_additional_queue_batch_serves_a_burst_together() {
+    enter_runtime!();
+    let device = open(
+        DeviceConfig::new(DeviceKind::Tun)
+            .with_multi_queue(true)
+            .with_offload(true),
+    );
+    let queue = device.additional_queue().expect("add a queue");
+    assert!(has_offload(&queue));
+    drop(device);
+    let split = require_split("added queue batch", queue.handle.udp_gso());
+    assert_batches_receive_a_burst(queue, [10, 217, subnet_octet()], split);
+}
+
+/// An async `recv_batch` dropped before it completes (by an exhausted
+/// Tokio budget, or after one poll under `async-io`) loses no segment:
+/// the bursts still arrive whole and in order across the calls.
+#[cfg(feature = "async")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn a_dropped_async_recv_batch_loses_no_segment() {
+    #[cfg(feature = "tokio")]
+    use std::future::Future;
+    #[cfg(feature = "tokio")]
+    use std::task::Poll;
+
+    use tunnel_lattice_platform::AsyncPacketIo;
+
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    let name = device.snapshot().expect("snapshot").name;
+    let device = Arc::new(device);
+    let target = route_traffic_into(DeviceKind::Tun, &name, [10, 218, subnet_octet()]);
+    let sender = GsoSender::start(target);
+    let port = sender.port;
+    let split = require_split("dropped recv_batch", device.handle.udp_gso());
+
+    let owned = Arc::clone(&device);
+    let result = within_deadline(&device, &name, move |_| {
+        let receive = async move {
+            let device = &*owned;
+            let mut check = BatchCheck::new(port, split);
+            let mut bufs = vec![vec![0u8; usize::from(MTU)]; BATCH];
+            let mut lens = [0usize; BATCH];
+            loop {
+                {
+                    let mut slices: Vec<&mut [u8]> =
+                        bufs.iter_mut().map(Vec::as_mut_slice).collect();
+                    let n = AsyncPacketIo::recv_batch(device, &mut slices, &mut lens)
+                        .await
+                        .map_err(|err| format!("recv_batch: {err:?}"))?;
+                    let packets = (0..n).map(|i| bufs[i][..lens[i]].to_vec());
+                    if check.feed(device, packets)? {
+                        return Ok(());
+                    }
+                }
+                let mut slices: Vec<&mut [u8]> = bufs.iter_mut().map(Vec::as_mut_slice).collect();
+                #[cfg(feature = "tokio")]
+                {
+                    while tokio::task::coop::has_budget_remaining() {
+                        tokio::task::coop::consume_budget().await;
+                    }
+                    let mut dropped =
+                        std::pin::pin!(AsyncPacketIo::recv_batch(device, &mut slices, &mut lens));
+                    let pending = std::future::poll_fn(|cx| {
+                        Poll::Ready(dropped.as_mut().poll(cx).is_pending())
+                    })
+                    .await;
+                    if !pending {
+                        return Err("the exhausted budget did not force a yield".to_owned());
+                    }
+                }
+                #[cfg(not(feature = "tokio"))]
+                {
+                    use futures::FutureExt;
+                    let polled_once =
+                        AsyncPacketIo::recv_batch(device, &mut slices, &mut lens).now_or_never();
+                    drop(slices);
+                    if let Some(result) = polled_once {
+                        let n = result.map_err(|err| format!("recv_batch: {err:?}"))?;
+                        let packets = (0..n).map(|i| bufs[i][..lens[i]].to_vec());
+                        if check.feed(device, packets)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                #[cfg(feature = "tokio")]
+                tokio::task::yield_now().await;
+            }
+        };
+        // Spawned, so the task's cooperative budget is in force.
+        #[cfg(feature = "tokio")]
+        {
+            let runtime = tokio::runtime::Handle::current();
+            runtime
+                .block_on(runtime.spawn(receive))
+                .unwrap_or_else(|err| Err(format!("the receive task failed: {err}")))
+        }
+        #[cfg(not(feature = "tokio"))]
+        {
+            futures::executor::block_on(receive)
+        }
+    });
+    drop(sender);
+    drop(device);
+    if let Err(message) = result {
+        panic!("{name}: {message}");
+    }
+}

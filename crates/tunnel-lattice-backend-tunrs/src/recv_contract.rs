@@ -80,9 +80,35 @@
 //! workspace's minimum `tun-rs` requirement; re-verify them whenever the
 //! resolved `tun-rs` changes. The unit tests pin this crate's own
 //! constants, not the upstream strings.
+//!
+//! # Draining a batch
+//!
+//! The Linux `recv_batch` override receives its first packet (position 0)
+//! exactly as `recv` does, with every rule above. Once it holds that packet
+//! it never waits again: each further position `k >= 1` is one
+//! *non-waiting* read (`preadv2` with `RWF_NOWAIT` on the blocking build's
+//! descriptor, a `try_io` or `try_recv` on the async builds' non-blocking
+//! one), and its failure follows [`drain_error_step`] instead:
+//!
+//! | Drain read result | Batch |
+//! |---|---|
+//! | `EAGAIN` / `WouldBlock`: nothing queued | ends with `Ok(k)`; not an error |
+//! | `EOPNOTSUPP`: the descriptor does not take `RWF_NOWAIT` (a kernel whose TUN lacks it) | ends with `Ok(k)`; not an error |
+//! | raw `EINTR` (Linux, macOS) | the read is repeated |
+//! | raw `EINVAL` on an offload-framed Linux queue | the frame is dropped and the drain goes on, as `recv` retries it |
+//! | a frame the offload split does not accept | dropped, and the drain goes on (see `offload_queue`) |
+//! | any other error | ends with `Ok(k)`; the next call's native read meets the same device state and reports it |
+//! | a plain packet longer than `bufs[k]` (the sentinel filled) | ends with `Ok(k)`; the packet is already consumed, so the queue's [`DeferredTooSmall`] is set and the next `recv` or `recv_batch` on the queue returns [`Error::BufferTooSmall`] first |
+//!
+//! A drain never toggles `O_NONBLOCK`: the descriptor's open file
+//! description is shared by every handle clone, and a concurrent blocking
+//! `recv` would then fail with `EAGAIN`. The drain functions take their
+//! reads as closures, like [`recv_blocking`], so they stay free of any I/O
+//! type and every rule is exercised by scripted reads on every host.
 
 use std::future::Future;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tunnel_lattice_core::{Error, Result};
 use tunnel_lattice_model::{AdminState, DeviceKind};
@@ -360,10 +386,6 @@ fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Erro
 /// than a transient error. `oper` reads the adapter's operational status
 /// for the Windows TAP 995 retry (see [`tap_abort_retries`]); it is
 /// called at most once per call, and never on other hosts or kinds.
-#[cfg_attr(
-    all(feature = "async", not(test)),
-    expect(dead_code, reason = "async builds block on `recv_async` instead")
-)]
 pub(crate) fn recv_blocking<O>(
     os: HostOs,
     kind: DeviceKind,
@@ -436,6 +458,218 @@ where
             return result;
         }
     }
+}
+
+/// What a `recv_batch` drain does after one failed non-waiting read at a
+/// position `k >= 1` (see the module's "Draining a batch").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrainStep {
+    /// Read again: the failure consumed nothing the caller should see.
+    Repeat,
+    /// End the batch with the packets received so far.
+    End,
+}
+
+/// Classifies a failed drain read on a queue that is offload-framed or
+/// not (`offload`). Only a raw `EINTR` (Linux, macOS), and a raw `EINVAL`
+/// on an offload-framed Linux queue (a packet the kernel could not frame
+/// and already freed, as [`offload_recv_error_step`] retries it), repeat
+/// the read; each consumed a signal or a packet, so the drain never spins.
+/// Every other error ends the batch: `EAGAIN`/`WouldBlock` and
+/// `EOPNOTSUPP` because the queue has nothing ready to give without
+/// waiting, and the rest because the packets already received are
+/// returned first, and the next call's own native read reports the device
+/// state behind it.
+pub(crate) fn drain_error_step(os: HostOs, offload: bool, err: &io::Error) -> DrainStep {
+    let code = err.raw_os_error();
+    let eintr = matches!(os, HostOs::Linux | HostOs::Macos) && code == Some(EINTR);
+    let dropped_frame = offload && os == HostOs::Linux && code == Some(EINVAL);
+    if eintr || dropped_frame {
+        DrainStep::Repeat
+    } else {
+        DrainStep::End
+    }
+}
+
+/// How many packets one `recv_batch` call may receive: the shorter of its
+/// two slices.
+pub(crate) fn batch_capacity(bufs: &[&mut [u8]], lens: &[usize]) -> usize {
+    bufs.len().min(lens.len())
+}
+
+/// The deferred [`Error::BufferTooSmall`] of one queue: set by a
+/// `recv_batch` drain that consumed a plain packet too long for its
+/// buffer after it had already received others, and returned once, first,
+/// by the next `recv` or `recv_batch` on the same queue, before any native
+/// call.
+///
+/// The flag is per queue (one per device handle, never shared with an
+/// `additional_queue`), so every handle clone that reads this queue sees
+/// it. The fast path is one relaxed load; the swap happens only when it is
+/// set. It is set immediately before the batch returns, with no `.await`
+/// after it, so a dropped future can neither lose nor duplicate it.
+#[derive(Debug, Default)]
+pub(crate) struct DeferredTooSmall(AtomicBool);
+
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "only the Linux recv_batch override drains")
+)]
+impl DeferredTooSmall {
+    /// No error pending.
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Records one pending [`Error::BufferTooSmall`]. Several drains that
+    /// each set it before any receive collapse into one, which cannot
+    /// happen in practice: a drain that sets it returns, and the next call
+    /// clears it before reading.
+    pub(crate) fn set(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Returns the pending [`Error::BufferTooSmall`] once and clears it, or
+    /// `Ok(())` when none is pending.
+    pub(crate) fn take(&self) -> Result<()> {
+        if self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::Relaxed) {
+            Err(Error::BufferTooSmall)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Positions `n..` of a `recv_batch` on a plainly framed queue, after the
+/// first `n` (normally one) were received and recorded in `lens`: reads
+/// with `read`, which must never wait, into `bufs[k]` until the capacity
+/// is reached or a read ends the batch. Returns the new count.
+///
+/// `read` is the sentinel read of the module docs (`[bufs[k], 1-byte
+/// sentinel]`), so a result past `bufs[k].len()` is a packet that did not
+/// fit: it is already consumed, so the batch ends there and `deferred` is
+/// set (see [`DeferredTooSmall`]). Failures follow [`drain_error_step`].
+/// A zero-length read is a zero-length packet, as `recv` passes it through.
+pub(crate) fn drain_plain(
+    os: HostOs,
+    bufs: &mut [&mut [u8]],
+    lens: &mut [usize],
+    mut n: usize,
+    deferred: &DeferredTooSmall,
+    mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+) -> usize {
+    let capacity = batch_capacity(bufs, lens);
+    while n < capacity {
+        let (Some(buf), Some(len)) = (bufs.get_mut(n), lens.get_mut(n)) else {
+            break;
+        };
+        match read(buf) {
+            Ok(got) if got > buf.len() => {
+                deferred.set();
+                break;
+            }
+            Ok(got) => {
+                *len = got;
+                n += 1;
+            }
+            Err(err) => match drain_error_step(os, false, &err) {
+                DrainStep::Repeat => {}
+                DrainStep::End => break,
+            },
+        }
+    }
+    n
+}
+
+/// Blocking `recv_batch` on a plainly framed queue: position 0 is exactly
+/// [`recv_blocking`] (with `read`, the blocking sentinel read), and the
+/// rest is [`drain_plain`] with `read_nowait`. The caller has checked the
+/// capacity and taken any deferred error.
+#[cfg_attr(
+    all(any(not(target_os = "linux"), feature = "async"), not(test)),
+    expect(dead_code, reason = "only the blocking Linux build drains this way")
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the queue's state and both reads are passed in, to stay I/O-free"
+)]
+pub(crate) fn recv_batch_blocking<O>(
+    os: HostOs,
+    kind: DeviceKind,
+    bufs: &mut [&mut [u8]],
+    lens: &mut [usize],
+    deferred: &DeferredTooSmall,
+    oper: &O,
+    read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+) -> Result<usize>
+where
+    O: Fn() -> io::Result<AdminState>,
+{
+    let (Some(buf), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
+        return Ok(0);
+    };
+    *len = recv_blocking(os, kind, buf, oper, read)?;
+    Ok(drain_plain(os, bufs, lens, 1, deferred, read_nowait))
+}
+
+/// One read on `fd` that never waits, whatever the descriptor's
+/// `O_NONBLOCK` flag says: `preadv2(fd, iov, -1, RWF_NOWAIT)`, a per-call
+/// non-blocking read at the current position (an offset of `-1`, like
+/// `readv`). The flag is never changed, so a blocking `recv` on another
+/// handle clone of the same queue is not affected.
+///
+/// A Linux TUN descriptor takes `RWF_NOWAIT` (its open sets
+/// `FMODE_NOWAIT`, and its read treats the flag like `O_NONBLOCK`); so do
+/// sockets, which is what the unit tests read. A descriptor that does not
+/// fails with `EOPNOTSUPP`, which ends a drain like `EAGAIN`.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_nowait(
+    fd: std::os::fd::BorrowedFd<'_>,
+    iov: &mut [io::IoSliceMut<'_>],
+) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    let count = libc::c_int::try_from(iov.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `fd` is borrowed, so it stays open for the call. `IoSliceMut`
+    // is guaranteed ABI-compatible with `struct iovec` on unix, so `iov` is
+    // `count` valid iovecs, each describing writable memory that `iov`
+    // borrows mutably for the call; the kernel writes at most each iovec's
+    // length into it. An offset of -1 reads at the current position and
+    // `RWF_NOWAIT` only changes whether the call may sleep.
+    let rc = unsafe {
+        libc::preadv2(
+            fd.as_raw_fd(),
+            iov.as_mut_ptr().cast::<libc::iovec>().cast_const(),
+            count,
+            -1,
+            libc::RWF_NOWAIT,
+        )
+    };
+    usize::try_from(rc).map_err(|_| io::Error::last_os_error())
+}
+
+/// The sentinel read of the module docs, through [`read_nowait`]: reads
+/// one packet into `[buf, 1-byte sentinel]`, so a result past `buf.len()`
+/// means the packet did not fit.
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    all(feature = "async", not(test)),
+    expect(
+        dead_code,
+        reason = "async builds drain through their non-blocking handle"
+    )
+)]
+pub(crate) fn sentinel_read_nowait(
+    fd: std::os::fd::BorrowedFd<'_>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    let mut sentinel = [0u8; 1];
+    read_nowait(
+        fd,
+        &mut [io::IoSliceMut::new(buf), io::IoSliceMut::new(&mut sentinel)],
+    )
 }
 
 /// Async `send`: re-awaits `write()` until it returns something other than
@@ -1453,5 +1687,370 @@ mod tests {
         .unwrap();
         assert_eq!(n, 5);
         assert_eq!(script.calls(), 2);
+    }
+
+    /// Linux `EAGAIN` and `EOPNOTSUPP`, the two codes that end a drain
+    /// because the queue has nothing to give without waiting.
+    const EAGAIN: i32 = 11;
+    const EOPNOTSUPP: i32 = 95;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn eagain_and_eopnotsupp_match_libc_on_linux() {
+        assert_eq!(EAGAIN, libc::EAGAIN);
+        assert_eq!(EOPNOTSUPP, libc::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn drain_repeats_only_eintr_and_an_offload_einval_on_linux() {
+        let raw = io::Error::from_raw_os_error;
+        for offload in [false, true] {
+            assert_eq!(
+                drain_error_step(HostOs::Linux, offload, &eintr()),
+                DrainStep::Repeat
+            );
+            assert_eq!(
+                drain_error_step(HostOs::Macos, offload, &eintr()),
+                DrainStep::Repeat
+            );
+            assert_eq!(
+                drain_error_step(HostOs::Windows, offload, &eintr()),
+                DrainStep::End
+            );
+            for err in [
+                raw(EAGAIN),
+                raw(EOPNOTSUPP),
+                io::ErrorKind::WouldBlock.into(),
+                raw(EBADFD),
+                raw(EIO),
+                close(),
+            ] {
+                assert_eq!(
+                    drain_error_step(HostOs::Linux, offload, &err),
+                    DrainStep::End,
+                    "{err:?} (offload {offload})"
+                );
+            }
+        }
+        assert_eq!(
+            drain_error_step(HostOs::Linux, true, &raw(EINVAL)),
+            DrainStep::Repeat
+        );
+        assert_eq!(
+            drain_error_step(HostOs::Linux, false, &raw(EINVAL)),
+            DrainStep::End
+        );
+        assert_eq!(
+            drain_error_step(HostOs::Macos, true, &raw(EINVAL)),
+            DrainStep::End
+        );
+    }
+
+    #[test]
+    fn batch_capacity_is_the_shorter_slice() {
+        let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
+        let bufs: [&mut [u8]; 2] = [&mut a, &mut b];
+        assert_eq!(batch_capacity(&bufs, &[0; 1]), 1);
+        assert_eq!(batch_capacity(&bufs, &[0; 3]), 2);
+        assert_eq!(batch_capacity(&[], &[0; 3]), 0);
+    }
+
+    #[test]
+    fn deferred_too_small_is_returned_once() {
+        let deferred = DeferredTooSmall::new();
+        assert!(deferred.take().is_ok());
+        deferred.set();
+        deferred.set();
+        assert!(matches!(deferred.take(), Err(Error::BufferTooSmall)));
+        assert!(deferred.take().is_ok());
+    }
+
+    /// Four 8-byte buffers for the drain tests.
+    struct Batch([[u8; 8]; 4]);
+
+    impl Batch {
+        fn new() -> Self {
+            Self([[0; 8]; 4])
+        }
+
+        fn bufs(&mut self) -> [&mut [u8]; 4] {
+            let [a, b, c, d] = &mut self.0;
+            [a, b, c, d]
+        }
+    }
+
+    #[test]
+    fn drain_plain_fills_the_capacity_without_reading_past_it() {
+        let script = Script::new(vec![Ok(3), Ok(0), Ok(8)], b"abcdefgh");
+        let mut batch = Batch::new();
+        let mut lens = [5, 0, 0, 0];
+        let deferred = DeferredTooSmall::new();
+        let n = drain_plain(
+            HostOs::Linux,
+            &mut batch.bufs(),
+            &mut lens,
+            1,
+            &deferred,
+            |buf| script.read(buf),
+        );
+        assert_eq!(n, 4);
+        assert_eq!(lens, [5, 3, 0, 8]);
+        assert_eq!(&batch.0[1][..3], b"abc");
+        assert_eq!(script.calls(), 3);
+        assert!(deferred.take().is_ok());
+    }
+
+    #[test]
+    fn drain_plain_stops_at_the_shorter_slice() {
+        let script = Script::new(vec![Ok(1)], b"a");
+        let mut batch = Batch::new();
+        let mut lens = [1, 0];
+        let deferred = DeferredTooSmall::new();
+        let n = drain_plain(
+            HostOs::Linux,
+            &mut batch.bufs(),
+            &mut lens,
+            1,
+            &deferred,
+            |buf| script.read(buf),
+        );
+        assert_eq!(n, 2);
+        assert_eq!(script.calls(), 1);
+    }
+
+    #[test]
+    fn drain_plain_ends_on_an_empty_or_unsupported_read() {
+        let raw = io::Error::from_raw_os_error;
+        for end in [
+            raw(EAGAIN),
+            raw(EOPNOTSUPP),
+            io::ErrorKind::WouldBlock.into(),
+        ] {
+            let script = Script::new(vec![Ok(2), Err(end)], b"ab");
+            let mut batch = Batch::new();
+            let mut lens = [1, 0, 0, 0];
+            let n = drain_plain(
+                HostOs::Linux,
+                &mut batch.bufs(),
+                &mut lens,
+                1,
+                &DeferredTooSmall::new(),
+                |buf| script.read(buf),
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&lens[..2], [1, 2]);
+            assert_eq!(script.calls(), 2);
+        }
+    }
+
+    #[test]
+    fn drain_plain_repeats_eintr() {
+        let script = Script::new(
+            vec![Err(eintr()), Ok(2), Err(eintr()), Err(eintr()), Ok(1)],
+            b"ab",
+        );
+        let mut batch = Batch::new();
+        let mut lens = [1, 0, 0];
+        let n = drain_plain(
+            HostOs::Linux,
+            &mut batch.bufs(),
+            &mut lens,
+            1,
+            &DeferredTooSmall::new(),
+            |buf| script.read(buf),
+        );
+        assert_eq!(n, 3);
+        assert_eq!(lens, [1, 2, 1]);
+        assert_eq!(script.calls(), 5);
+    }
+
+    #[test]
+    fn drain_plain_returns_the_prefix_before_any_other_error() {
+        let raw = io::Error::from_raw_os_error;
+        for err in [raw(EBADFD), raw(EIO), raw(EINVAL), close()] {
+            let script = Script::new(vec![Ok(4), Err(err)], b"abcd");
+            let mut batch = Batch::new();
+            let mut lens = [1, 0, 0, 0];
+            let deferred = DeferredTooSmall::new();
+            let n = drain_plain(
+                HostOs::Linux,
+                &mut batch.bufs(),
+                &mut lens,
+                1,
+                &deferred,
+                |buf| script.read(buf),
+            );
+            assert_eq!(n, 2);
+            assert_eq!(script.calls(), 2);
+            assert!(
+                deferred.take().is_ok(),
+                "only a too-long packet is deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_plain_defers_a_packet_that_filled_the_sentinel() {
+        // 9 bytes into an 8-byte buffer: the sentinel read reports 9.
+        let script = Script::new(vec![Ok(2), Ok(9)], b"abcdefghi");
+        let mut batch = Batch::new();
+        let mut lens = [1, 0, 0, 0];
+        let deferred = DeferredTooSmall::new();
+        let n = drain_plain(
+            HostOs::Linux,
+            &mut batch.bufs(),
+            &mut lens,
+            1,
+            &deferred,
+            |buf| script.read(buf),
+        );
+        assert_eq!(n, 2, "the batch ends at the packet that did not fit");
+        assert_eq!(script.calls(), 2);
+        assert!(matches!(deferred.take(), Err(Error::BufferTooSmall)));
+        assert!(deferred.take().is_ok());
+    }
+
+    #[test]
+    fn recv_batch_blocking_waits_only_for_position_zero() {
+        let first = Script::new(vec![Err(eintr()), Ok(3)], b"abc");
+        let rest = Script::new(
+            vec![Ok(2), Err(io::Error::from_raw_os_error(EAGAIN))],
+            b"de",
+        );
+        let mut batch = Batch::new();
+        let mut lens = [0; 4];
+        let n = recv_batch_blocking(
+            HostOs::Linux,
+            TUN,
+            &mut batch.bufs(),
+            &mut lens,
+            &DeferredTooSmall::new(),
+            &no_status,
+            |buf| first.read(buf),
+            |buf| rest.read(buf),
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&lens[..2], [3, 2]);
+        assert_eq!(&batch.0[0][..3], b"abc");
+        assert_eq!(&batch.0[1][..2], b"de");
+        assert_eq!((first.calls(), rest.calls()), (2, 2));
+    }
+
+    #[test]
+    fn recv_batch_blocking_reports_position_zero_errors_as_recv_does() {
+        let mut batch = Batch::new();
+        let mut lens = [0; 4];
+        let never = |_: &mut [u8]| -> io::Result<usize> { panic!("no drain after an error") };
+
+        let first = Script::new(vec![Err(io::Error::from_raw_os_error(EBADFD))], b"");
+        let result = recv_batch_blocking(
+            HostOs::Linux,
+            TUN,
+            &mut batch.bufs(),
+            &mut lens,
+            &DeferredTooSmall::new(),
+            &no_status,
+            |buf| first.read(buf),
+            never,
+        );
+        assert!(matches!(result, Err(Error::Disconnected)));
+
+        let first = Script::new(vec![Ok(9)], b"abcdefghi");
+        let result = recv_batch_blocking(
+            HostOs::Linux,
+            TUN,
+            &mut batch.bufs(),
+            &mut lens,
+            &DeferredTooSmall::new(),
+            &no_status,
+            |buf| first.read(buf),
+            never,
+        );
+        assert!(matches!(result, Err(Error::BufferTooSmall)));
+    }
+
+    /// The `RWF_NOWAIT` reads on a blocking datagram socket, which takes
+    /// the flag like a TUN descriptor and keeps datagram boundaries.
+    #[cfg(target_os = "linux")]
+    mod nowait {
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixDatagram;
+
+        use super::*;
+
+        #[test]
+        fn read_nowait_returns_eagain_on_an_empty_blocking_socket() {
+            let (rx, _tx) = UnixDatagram::pair().unwrap();
+            let mut buf = [0u8; 8];
+            let err = read_nowait(rx.as_fd(), &mut [io::IoSliceMut::new(&mut buf)]).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(EAGAIN));
+            assert_eq!(drain_error_step(HostOs::Linux, false, &err), DrainStep::End);
+            // The descriptor is still blocking: the flag was per call.
+            // SAFETY: `F_GETFL` on a descriptor `rx` owns reads no memory.
+            let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&rx), libc::F_GETFL) };
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+
+        #[test]
+        fn sentinel_read_nowait_reads_one_datagram_at_a_time() {
+            let (rx, tx) = UnixDatagram::pair().unwrap();
+            tx.send(b"abc").unwrap();
+            tx.send(b"defghijkl").unwrap();
+            tx.send(b"").unwrap();
+            let mut buf = [0u8; 8];
+            assert_eq!(sentinel_read_nowait(rx.as_fd(), &mut buf).unwrap(), 3);
+            assert_eq!(&buf[..3], b"abc");
+            assert_eq!(
+                sentinel_read_nowait(rx.as_fd(), &mut buf).unwrap(),
+                9,
+                "a datagram longer than the buffer fills the sentinel"
+            );
+            assert_eq!(sentinel_read_nowait(rx.as_fd(), &mut buf).unwrap(), 0);
+            let err = sentinel_read_nowait(rx.as_fd(), &mut buf).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(EAGAIN));
+        }
+
+        #[test]
+        fn recv_batch_blocking_drains_a_socket_without_waiting() {
+            let (rx, tx) = UnixDatagram::pair().unwrap();
+            for packet in [&b"one"[..], b"two!", b"three", b"four"] {
+                tx.send(packet).unwrap();
+            }
+            let mut batch = Batch::new();
+            let mut lens = [0; 3];
+            let deferred = DeferredTooSmall::new();
+            // Position 0's blocking read; every packet here fits.
+            let read = |buf: &mut [u8]| rx.recv(buf);
+            let n = recv_batch_blocking(
+                HostOs::Linux,
+                TUN,
+                &mut batch.bufs(),
+                &mut lens,
+                &deferred,
+                &no_status,
+                read,
+                |buf| sentinel_read_nowait(rx.as_fd(), buf),
+            )
+            .unwrap();
+            assert_eq!(n, 3);
+            assert_eq!(lens, [3, 4, 5]);
+            assert_eq!(&batch.0[2][..5], b"three");
+            // The fourth stays queued; the next drain stops on EAGAIN.
+            let mut lens = [0; 4];
+            let n = recv_batch_blocking(
+                HostOs::Linux,
+                TUN,
+                &mut batch.bufs(),
+                &mut lens,
+                &deferred,
+                &no_status,
+                read,
+                |buf| sentinel_read_nowait(rx.as_fd(), buf),
+            )
+            .unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(lens[0], 4);
+        }
     }
 }

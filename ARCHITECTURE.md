@@ -375,7 +375,13 @@ caller sees it does not change:
   successful read and the return, so a dropped `recv` future never loses
   a read super-packet: unreturned segments wait for the next call. The
   receive split is bounded only by the frame length, never by a segment
-  count, so a small-MSS TCP super-packet is never dropped.
+  count, so a small-MSS TCP super-packet is never dropped. `recv_batch`
+  serves the pending segments into consecutive buffers and reads further
+  super-packets without waiting (see "Async design"), so one call can
+  return a whole super-packet, or several. A segment too long for its
+  buffer after the first is not dropped there: it ends the batch and
+  stays pending. A frame the split rejects, or a raw `EINVAL`, met while
+  draining is dropped and the drain goes on.
 - **Send.** `send` writes the packet behind an all-zero header.
   `send_batch` coalesces runs of adjacent same-flow packets (TCP with
   contiguous sequence numbers and otherwise identical headers, or UDP with
@@ -532,9 +538,27 @@ Linux TUN offload queue overrides the default (see "Segmentation offload"
 above); every other backend, OS, and queue sends packet by packet. `recv_batch`
 mirrors it on receive: it waits for the first packet only, returns a
 prefix, and reports an error after `k` packets on the next call. Its
-default receives exactly one packet, and every backend currently keeps that
-default; the offload receive path splits super-packets behind the ordinary
-one-packet `recv`, which keeps the pool and stream unchanged.
+default receives exactly one packet, which the `tun-rs` backend keeps on
+Windows and macOS. On Linux (TUN and TAP, every feature set) it overrides
+it with a drain: the first packet is received exactly as `recv` receives
+it, and each further position is one read that never waits (`preadv2`
+with `RWF_NOWAIT` in the blocking build, a non-blocking read on the
+already registered descriptor in the async builds, with `tokio` a
+`try_io` on the same readiness guard), so the descriptor's `O_NONBLOCK`
+flag is never toggled under another clone of the handle. The drain ends
+at the capacity, at an empty queue (`EAGAIN`) or a read that cannot avoid
+waiting (`EOPNOTSUPP`), or at any other error, which is left for the next
+call's own read to report; `EINTR` repeats the read. A plain packet that
+turns out too long for its buffer after the first has already left the
+queue, so the batch ends before it and the next `recv` or `recv_batch` on
+that handle returns `BufferTooSmall` first, once (a flag per queue). On an
+offload queue each position takes the next staged segment (see
+"Segmentation offload" above), and a segment too long for its buffer
+after the first stays pending instead. Nothing awaits after the first
+packet, so a dropped async `recv_batch` has received nothing. The drain
+itself is written against read closures, with no I/O of its own, so a
+native backend can reuse it. `PacketStream` and `PacketPool` still
+receive through the one-packet `recv`.
 A downstream type that implements both `PacketIo` and `AsyncPacketIo` and
 calls `send_batch` with both traits in scope must name the trait, as it
 already must for `recv` and `send`.
