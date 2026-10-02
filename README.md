@@ -54,7 +54,7 @@ addresses and routes.
   [`tun-rs`](https://github.com/tun-rs/tun-rs); native per-OS backends can
   slot in without changing your code.
 
-> **Status:** `0.5.0` is published and development is active. Nothing is
+> **Status:** `0.6.0` is published and development is active. Nothing is
 > API-frozen before `1.0`; see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 🌟 Key Features
@@ -201,13 +201,13 @@ cargo bench -p tunnel-lattice-async --bench pool   # PacketPool overhead and con
 ```toml
 [dependencies]
 # Synchronous API, no async runtime
-tunnel-lattice = "0.5"
+tunnel-lattice = "0.6"
 
 # Async packet stream on Tokio (multi-threaded runtime)
-tunnel-lattice = { version = "0.5", features = ["tokio"] }
+tunnel-lattice = { version = "0.6", features = ["tokio"] }
 
 # Async packet stream on async-io (smol, async-std, ...)
-tunnel-lattice = { version = "0.5", features = ["async-io"] }
+tunnel-lattice = { version = "0.6", features = ["async-io"] }
 ```
 
 `tokio` and `async-io` are mutually exclusive.

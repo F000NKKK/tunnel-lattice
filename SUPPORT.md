@@ -10,7 +10,7 @@ Thank you for your interest in Tunnel Lattice.
 
 ## Project Status
 
-Tunnel Lattice has published `0.5.0` and has a working crate architecture
+Tunnel Lattice has published `0.6.0` and has a working crate architecture
 (see [ARCHITECTURE.md](ARCHITECTURE.md)), but nothing in the public API is
 frozen. Until `1.0.0`, any new `0.x` minor release may change the public
 API, including in breaking ways; every such change is listed in

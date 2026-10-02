@@ -240,7 +240,7 @@ so it can be requested at open but not changed afterwards.
 
 ## Frozen public API surface
 
-`0.5.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
+`0.6.0` is published (see `index.md`, `SUPPORT.md`). Nothing in this
 workspace is API-frozen; every type, trait, and feature flag described here
 may still change in a future `0.x` release: until `1.0.0`, any new `0.x`
 minor release may change the public API, including in breaking ways, and
