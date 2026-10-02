@@ -79,15 +79,17 @@ contracts; it never inspects or changes the host system.
 
 ```toml
 [dependencies]
-tunnel-lattice-model = "0.5"
+tunnel-lattice-model = "0.6"
 # For `tunnel_lattice_core::Error`, used in the example below
-tunnel-lattice-core = "0.5"
+tunnel-lattice-core = "0.6"
 ```
 
 ## 🎓 Quick Start
 
 ```rust
-use tunnel_lattice_model::{DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, DesiredAdminState};
+use tunnel_lattice_model::{
+    DesiredAdminState, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
+};
 
 fn main() -> Result<(), tunnel_lattice_core::Error> {
     let config = DeviceConfig::new(DeviceKind::Tun)
@@ -112,4 +114,5 @@ fn main() -> Result<(), tunnel_lattice_core::Error> {
 
 ## 📄 License
 
-Licensed under the [Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).
+Licensed under the
+[Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).

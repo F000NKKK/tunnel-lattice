@@ -50,7 +50,7 @@ It has no OS dependency and no TUN/TAP-specific types.
 
 ```toml
 [dependencies]
-tunnel-lattice-core = "0.5"
+tunnel-lattice-core = "0.6"
 ```
 
 ## 🎓 Quick Start
@@ -73,4 +73,5 @@ assert!(err.is_not_found());
 
 ## 📄 License
 
-Licensed under the [Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).
+Licensed under the
+[Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).

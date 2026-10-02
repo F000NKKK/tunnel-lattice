@@ -89,10 +89,10 @@ public API. The workspace
 
 ```toml
 [dependencies]
-tunnel-lattice-platform = "0.5"
+tunnel-lattice-platform = "0.6"
 
 # With the native async packet I/O trait
-tunnel-lattice-platform = { version = "0.5", features = ["async"] }
+tunnel-lattice-platform = { version = "0.6", features = ["async"] }
 ```
 
 ## 📐 Backend Contract
@@ -137,4 +137,5 @@ errors, and an override must keep it:
 
 ## 📄 License
 
-Licensed under the [Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).
+Licensed under the
+[Mozilla Public License 2.0](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE).
