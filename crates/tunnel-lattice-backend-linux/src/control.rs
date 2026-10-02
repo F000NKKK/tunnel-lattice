@@ -591,6 +591,46 @@ mod tests {
             &decode_datagram(&nlmsg(NLMSG_DONE, 0, 1, &0i32.to_ne_bytes()), 1, &mut reply)
                 .unwrap_err()
         ));
+        // A length field shorter than the header itself (0 would otherwise
+        // never advance through the datagram).
+        for length in [0u32, 4, 15] {
+            let mut short = ack(1, 0, &[]);
+            short[..4].copy_from_slice(&length.to_ne_bytes());
+            assert!(is_unknown(
+                &decode_datagram(&short, 1, &mut reply).unwrap_err()
+            ));
+        }
+    }
+
+    #[test]
+    fn a_tun_reply_with_link_info_decodes() {
+        // What the kernel reports for a TUN device: IFLA_LINKINFO (18)
+        // carrying IFLA_INFO_KIND (1) "tun" and IFLA_INFO_DATA (2) with the
+        // tun attributes (IFLA_TUN_TYPE = 1, IFLA_TUN_PI = 0, ...).
+        let mut tun_data = nla(1, &[1]);
+        tun_data.extend_from_slice(&nla(2, &[0]));
+        tun_data.extend_from_slice(&nla(8, &[0]));
+        let mut info = nla(1, b"tun\0");
+        info.extend_from_slice(&nla(2, &tun_data));
+        let mut datagram = link_reply(
+            12,
+            ARPHRD_NONE,
+            21,
+            0,
+            &[
+                nla(IFLA_IFNAME, b"tln0\0"),
+                nla(IFLA_MTU, &1500u32.to_ne_bytes()),
+                nla(18, &info),
+            ],
+        );
+        datagram.extend_from_slice(&ack(12, 0, &[]));
+        let mut reply = Reply::default();
+        assert!(decode_datagram(&datagram, 12, &mut reply).unwrap());
+        let link = reply.link.unwrap();
+        assert_eq!(
+            (link.index, link.name.as_str(), link.mac),
+            (21, "tln0", None)
+        );
     }
 
     #[test]

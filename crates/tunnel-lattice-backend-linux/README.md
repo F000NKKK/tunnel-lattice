@@ -25,9 +25,10 @@ to implement the same `tunnel-lattice-platform` provider contracts as
 [`tunnel-lattice-backend-tunrs`](https://crates.io/crates/tunnel-lattice-backend-tunrs)
 and to be selectable alongside it.
 
-> **Status: in development.** This version contains the internal
-> foundations only and exports no public API: it cannot open a device yet.
-> For a working backend today use the
+> **Status: in development.** This version contains a working synchronous
+> device core, but it is internal: the crate exports no public API yet, so
+> it cannot be used to open a device from outside. For a working backend
+> today use the
 > [`tunnel-lattice`](https://crates.io/crates/tunnel-lattice) facade, whose
 > default backend is `tunnel-lattice-backend-tunrs`.
 
@@ -42,11 +43,42 @@ What is implemented so far (all internal):
   request per change, sequence numbers checked, and kernel errors decoded
   to typed `tunnel_lattice_core::Error` values. It uses no async runtime,
   so it is safe to call from any thread, inside or outside one.
+- **Opening devices.** TUN and TAP devices are created (or attached to,
+  for a persistent or multi-queue device) through `TUNSETIFF`, always
+  without the packet-information header. The descriptor is non-blocking
+  and close-on-exec from creation. The interface index is captured at open
+  and is the device's identity; a requested MTU and MAC address are applied
+  right after, and any failure closes the descriptor again. A device that
+  uses virtio-net header framing is refused as `Unsupported`, and the
+  `offload` request is accepted but ignored.
+- **Packet I/O.** `recv` reads with `readv` into the caller's buffer plus
+  a one-byte sentinel, so an oversize packet is reported as
+  `BufferTooSmall` instead of being silently truncated; `send` writes first.
+  Both wait with `poll` only when the queue is empty or full. A deleted
+  device ends a waiting receive with `Disconnected`; sending to a device
+  that is administratively down is `InvalidState`.
+- **Observing and changing a device** over rtnetlink by the captured
+  index: `snapshot` (name, kind, MTU, administrative state, and the MAC of
+  a TAP device) and `apply` of MTU, then MAC, then administrative state,
+  with a best-effort reverse revert of the steps already applied when a
+  later one fails.
+- **Persistence and multi-queue.** `TUNSETPERSIST` is passed by value;
+  additional queues attach to a multi-queue device by its current name and
+  share its control socket.
+- **Capabilities** match `tunnel-lattice-backend-tunrs` on Linux: device
+  mutation, persistent devices, TAP devices, and multi-queue on every host,
+  plus MAC mutation on a TAP handle. There is no segmentation offload and
+  no native async I/O yet.
+
+Known limitation: Linux reports `IFF_NO_PI` and "no socket filter" with the
+same flag bit, so the read-back cannot confirm that the packet-information
+header is off; it is always requested.
 
 ## 💻 Platforms
 
 Linux only. On every other target the crate compiles to an **empty
-crate** and pulls in no dependency beyond `tunnel-lattice-core`, so a
+crate** and pulls in no dependency beyond `tunnel-lattice-core`,
+`tunnel-lattice-model`, and `tunnel-lattice-platform`, so a
 cross-platform workspace can depend on it unconditionally.
 
 ## 📦 Installation
@@ -62,10 +94,14 @@ default features off (no tokio, mio, or smol).
 
 ## 🔐 Privileges
 
-Nothing in this version needs privilege by itself: looking a link up over
-rtnetlink is unprivileged. Changing a link (MTU, MAC, administrative state)
-requires `CAP_NET_ADMIN` and is otherwise refused with
-`Error::PermissionDenied`.
+Creating a TUN/TAP device needs `CAP_NET_ADMIN` (attaching to a
+persistent device owned by the calling user or group does not), and
+changing a link (MTU, MAC, administrative state) always does; without it
+both are refused with `Error::PermissionDenied`. Looking a link up over
+rtnetlink, packet I/O on an open queue, and toggling persistence through an
+open queue need nothing more. `/dev/net/tun` must exist: a missing node or
+`tun` module is reported as `Error::DriverUnavailable`, and the backend
+never creates the node (no `mknod`).
 
 ## 📖 Documentation
 

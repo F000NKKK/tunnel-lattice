@@ -34,8 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public API yet: the raw-`errno` error mapping (never by
   `io::ErrorKind`; a missing `/dev/net/tun` is `DriverUnavailable` and the
   device node is never created) and the rtnetlink control plane for link
-  lookups and single-attribute changes. The facade does not select it
-  yet.
+  lookups and single-attribute changes. It also holds a synchronous device
+  core that implements the provider traits internally: TUN and TAP devices
+  opened through `TUNSETIFF` with `IFF_NO_PI` and multi-queue on request,
+  non-blocking descriptors from creation, the interface index captured at
+  open as the device id (a deleted or moved device is then `NotFound` for
+  `snapshot`/`apply`), `readv` with a one-byte sentinel so an oversize
+  packet is `BufferTooSmall` instead of silently truncated, write-first
+  sends (`EIO` on a down device is `InvalidState`), a deleted device ending
+  a waiting receive with `Disconnected`, MTU/MAC/admin `apply` with a
+  best-effort reverse revert, by-value `TUNSETPERSIST`, any stale offload
+  mask cleared at open, and the same Linux capability set as
+  `tunnel-lattice-backend-tunrs` (`MAC_MUTATION` on TAP handles, no
+  segmentation offload or native async yet). A queue that uses virtio-net
+  header framing is refused as `Unsupported`. None of it is public yet, and
+  the facade does not select it.
 
 ### Changed
 

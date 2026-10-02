@@ -91,9 +91,17 @@ public API:
 
 The first per-OS backend, `tunnel-lattice-backend-linux`, is in development:
 the crate exists (Linux-only, empty on other targets) and holds its raw-errno
-error mapping and synchronous rtnetlink control plane, but it exports no
-public API yet, cannot open a device, and no facade feature selects it. Until
-it does, this section records the intended shape, not completed work.
+error mapping, its synchronous rtnetlink control plane, and a synchronous
+device core that implements the provider traits internally: opening TUN and
+TAP devices through `TUNSETIFF` with `IFF_NO_PI` (non-blocking from
+creation, the interface index captured as the device id, the device node
+never created), packet I/O with `readv` plus a one-byte sentinel for
+oversize detection and write-first sends, snapshot and best-effort-reverted
+apply over rtnetlink, persistence, and multi-queue, with the same Linux
+capability set as `tunnel-lattice-backend-tunrs`. It still exports no
+public API, has no async I/O and no segmentation offload, and no facade
+feature selects it. Until it does, this section records the intended shape,
+not completed work.
 
 ## Error model
 
