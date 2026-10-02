@@ -3,7 +3,7 @@
 Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
 compose with the rest of the Lattice networking stack.
 
-`0.4.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
+`0.5.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
 describe the current crate design, but nothing in the workspace is
 API-frozen — do not assume any stability guarantee from this file.
 
@@ -18,10 +18,12 @@ tunnel-lattice/
 │   ├── tunnel-lattice-backend-tunrs/  tun-rs-backed implementation
 │   ├── tunnel-lattice-async/          futures::Stream adapter over PacketIo
 │   └── tunnel-lattice/                facade
-├── .github/workflows/          CI
+├── bench/forwarder/            Standalone unpublished workspace: iperf3 forwarder
+│                               binaries (tun-rs vs tunnel-lattice) + report generator
+├── .github/workflows/          CI (ci.yml) and the forwarder benchmark (bench-forward.yml)
 ├── .claude/                    Reusable Claude Code rules, roles, and templates
 ├── .codex/                     Reusable Codex rules, roles, and templates
-├── scripts/                    Release automation
+├── scripts/                    Release automation; bench-forward.sh (netns + iperf3 runner)
 ├── README.md                   English user documentation
 ├── README.ru.md                Russian user documentation
 ├── ARCHITECTURE.md             Crate design and rationale
@@ -49,7 +51,7 @@ sdk-lattice      Application-facing SDK composing the crates above
 
 ## Current release and roadmap
 
-Published stage baseline: `tunnel-lattice 0.4.0` (see `SECURITY.md`'s
+Published stage baseline: `tunnel-lattice 0.5.0` (see `SECURITY.md`'s
 supported-version table). Read the current workspace version from
 `crates/tunnel-lattice/Cargo.toml`; do not duplicate a patch version here.
 Roadmap/version tracking lives in the YouTrack project `TL`
@@ -100,6 +102,16 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   rationale and alternatives considered. Verified against a real device
   under `CAP_NET_ADMIN` on both `async-io` and `tokio` builds, plus two
   non-privileged unit tests against mock `AsyncPacketIo` implementations.
+- **0.5 (done, released):** typed error mapping in the tun-rs backend
+  (including `InvalidState` for calls made on a down device, ADR-0002
+  `TL-A-3` rev 6); honest TAP/L2 on Linux, Windows and macOS (MAC, host
+  capabilities, Linux persistence with `unpersist`); facade backend
+  injection and `apply()` correctness; per-OS parity tests in privileged CI
+  (exact capability sets, cloned-`Handle` concurrency, admin state read on
+  every OS, name and Wintun adoption semantics); device and iperf3
+  forwarder benchmarks vs raw `tun-rs` (`bench/forwarder`); tun-rs-style
+  READMEs (EN/RU). Epic `TL-7`.
+- **0.6 (planned):** batched I/O and GSO/GRO offload (`TL-38`).
 - **Unscheduled:** a hand-written per-OS TUN/TAP backend (`tunnel-lattice-
   backend-linux`/`-windows`/`-darwin`, mirroring `net-lattice`'s split) to
   eventually let `tun-rs` be dropped, per the original design goal recorded
