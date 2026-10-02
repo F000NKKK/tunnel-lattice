@@ -3343,7 +3343,10 @@ mod privileged_tests {
     /// admin state reads `Up`). Disabling the adapter with
     /// `Disable-NetAdapter` ([`release_waiting_recv`]) then ends it within
     /// 30 s with exactly `InvalidState`, and the call lets go of the
-    /// device. Frames that arrive meanwhile are skipped. The test prints
+    /// device. Frames that arrive meanwhile are skipped; an attempt in which
+    /// a frame completed the waiting read across `apply(Down)` is retried
+    /// (at most three attempts), since the call that ended was then a new
+    /// one made on a disconnected adapter. The test prints
     /// how long each `apply` took and each step's elapsed time. A failing
     /// assertion drops the [`BlockingCall`] first, which releases the call
     /// before the device drops.
@@ -3372,40 +3375,67 @@ mod privileged_tests {
         eprintln!("windows TAP pending recv: {state:?} {waited:?} after open");
         assert_eq!(state, AdminState::Up, "the adapter is up after open");
 
-        let call = BlockingCall::spawn(&device, &name, move |device| {
-            let mut buf = vec![0u8; buf_len];
-            // Skips frames until the first error.
-            loop {
-                PacketIo::recv(device, &mut buf)?;
-            }
-        });
-        // Let it reach its wait first.
-        std::thread::sleep(Duration::from_millis(500));
-        let before = call.wait(Duration::ZERO);
-        assert!(
-            before.is_none(),
-            "recv waits before apply(Down): {before:?}"
-        );
+        // A frame that arrives around `apply(Down)` completes the waiting
+        // read, and the next `recv` is then a new call on a disconnected
+        // adapter, which fails at once. Such an attempt proves nothing about
+        // the waiting read, so it is retried with the adapter up again.
+        const ATTEMPTS: usize = 3;
+        let mut attempt = 0;
+        let call = loop {
+            attempt += 1;
+            let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let call = {
+                let frames = Arc::clone(&frames);
+                BlockingCall::spawn(&device, &name, move |device| {
+                    let mut buf = vec![0u8; buf_len];
+                    // Skips frames until the first error.
+                    loop {
+                        PacketIo::recv(device, &mut buf)?;
+                        frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            };
+            // Let it reach its wait first.
+            std::thread::sleep(Duration::from_millis(500));
+            let before = call.wait(Duration::ZERO);
+            assert!(
+                before.is_none(),
+                "recv waits before apply(Down): {before:?}"
+            );
 
-        let applied = Instant::now();
-        let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
-            .expect("build a patch");
-        device.apply(patch).expect("apply Down");
-        let apply_took = applied.elapsed();
-        let (state, waited) = poll_admin_state(&device, AdminState::Down);
-        eprintln!(
-            "windows TAP pending recv: apply(Down) took {apply_took:?}, {state:?} after {waited:?}"
-        );
-        assert_eq!(state, AdminState::Down, "the adapter is down after apply");
-        let across_down = call.wait(Duration::from_secs(10));
-        eprintln!(
-            "windows TAP pending recv across apply(Down): {across_down:?} after {:?}",
-            applied.elapsed()
-        );
-        assert!(
-            across_down.is_none(),
-            "a recv already waiting when Down is applied keeps waiting: {across_down:?}"
-        );
+            let frames_before = frames.load(std::sync::atomic::Ordering::SeqCst);
+            let applied = Instant::now();
+            let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Down), None)
+                .expect("build a patch");
+            device.apply(patch).expect("apply Down");
+            let apply_took = applied.elapsed();
+            let (state, waited) = poll_admin_state(&device, AdminState::Down);
+            eprintln!(
+                "windows TAP pending recv: apply(Down) took {apply_took:?}, {state:?} after {waited:?}"
+            );
+            assert_eq!(state, AdminState::Down, "the adapter is down after apply");
+            let across_down = call.wait(Duration::from_secs(10));
+            let frames_across = frames.load(std::sync::atomic::Ordering::SeqCst) - frames_before;
+            eprintln!(
+                "windows TAP pending recv across apply(Down): {across_down:?} after {:?}, \
+                 {frames_across} frames meanwhile (attempt {attempt})",
+                applied.elapsed()
+            );
+            if across_down.is_none() {
+                break call;
+            }
+            assert!(
+                frames_across > 0 && attempt < ATTEMPTS,
+                "a recv already waiting when Down is applied keeps waiting: {across_down:?}"
+            );
+            // The call returned, so this only joins its thread.
+            drop(call);
+            let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Up), None)
+                .expect("build a patch");
+            device.apply(patch).expect("apply Up before retrying");
+            let (state, _) = poll_admin_state(&device, AdminState::Up);
+            assert_eq!(state, AdminState::Up, "the adapter is up before retrying");
+        };
 
         let applied = Instant::now();
         let patch = DeviceConfigPatch::new(device.id(), Some(DesiredAdminState::Up), None)
