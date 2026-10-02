@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Batch send: `send_batch`.** `PacketIo::send_batch(&[&[u8]])` and
+  `AsyncPacketIo::send_batch` are new provided trait methods (no required
+  method was added, and `PacketIo` stays dyn-compatible), and the facade
+  passes them through as `Handle::send_batch` and, with `async-io` or
+  `tokio`, `Handle::send_batch_async`. The default implementation sends
+  one packet at a time, stopping at the first failure. A downstream type
+  that implements both traits and calls `send_batch` with both in scope
+  has to name the trait, as it already does for `recv` and `send`.
+- **Linux TUN segmentation offload, opt-in.** `DeviceConfig::offload`
+  (default `false`) and `DeviceConfig::with_offload` request it, and the
+  new `Capability::SEGMENTATION_OFFLOAD` (bit 6) on an open handle reports
+  whether the queue uses it. With the `tun-rs` backend on a Linux TUN
+  device, the kernel then moves TCP and UDP traffic as super-packets of up
+  to 64 KiB with a virtio-net header; the backend parses and builds that
+  header itself (it uses none of `tun-rs`'s hidden offload helpers):
+  - `recv` (sync and async) still returns one IP packet per call: each
+    super-packet is read once into a per-queue staging buffer of about
+    64 KiB, allocated only for an offload queue, and split lazily, with
+    lengths and checksums completed. `PacketStream` and `PacketPool` are
+    unchanged.
+  - `send` writes the packet behind an all-zero header.
+  - `send_batch` coalesces adjacent packets of one TCP flow, or of one UDP
+    flow with equal-sized datagrams when the kernel supports UDP
+    segmentation offload, into one gather write that copies no payload.
+  - Plain (non-offload) handles read and write exactly as before.
+
+### Fixed
+
+- **A queue attached to a multi-queue offload device is framed
+  correctly.** On Linux the kernel's header flag is device-wide and is not
+  applied to a queue attached to a multi-queue device that already has
+  queues. A queue opened without offload on such a device used to hand
+  every packet to the caller with a 10-byte virtio-net header in front of
+  it. The backend now reads the real framing back after every open and
+  every `additional_queue` (`TUNGETIFF`, `TUNGETVNETHDRSZ`) and follows
+  the device: a header of size 10 gives an offload queue (reporting
+  `SEGMENTATION_OFFLOAD`) even without a request, any other header size
+  fails `open` with `Error::Unsupported`, and no header gives a plain
+  queue even with a request.
+- **A stray offload mask is cleared.** When an offload request did not
+  get the header flag (an attach to a non-offload multi-queue device), the
+  offload mask that request set is cleared again (`TUNSETOFFLOAD(0)`), so
+  a device without the header never produces super-packets for anyone.
+
+### Notes
+
+- **Linux TUN only, and a request rather than a guarantee.** Like
+  `multi_queue`, `offload` is ignored without an error on Windows, macOS,
+  and for TAP, where the handle uses plain framing.
+  `SEGMENTATION_OFFLOAD` is reported per handle only, never by
+  `Tunnel::capabilities()`, and is the only reliable answer.
+- **Per-packet fallback.** Everywhere except an offload-framed Linux TUN
+  queue, `send_batch` uses the per-packet default, without a packet
+  limit, so one code path works on every OS.
+- **Prefix contract and the 128-packet cap.** `Ok(n)` means `packets[..n]`
+  were each sent whole and in order and the rest were not touched; `n` may
+  be short, so callers loop. `Err` means nothing was sent and the error
+  belongs to the first packet; a failure after `k > 0` packets is `Ok(k)`,
+  and the next call returns the error. An empty list gives `Ok(0)`. An
+  offload queue sends at most 128 packets per call (the kernel's segment
+  limit for one super-packet), so a longer list gives a short `Ok(128)`. If
+  the kernel refuses a coalesced write with `EINVAL`, nothing of it was
+  sent and its packets are resent one by one.
+- **Cancellation.** A dropped `send_batch_async` future has sent an
+  unknown prefix of its packets: each whole and at most once, never a
+  packet after one that was not sent. A dropped async `recv` on an
+  offload queue loses no segment; the rest are returned by the next
+  `recv`.
+- **Receive on an offload queue.** A raw `EINVAL` from the read (the
+  kernel already discarded the packet) and a received frame that fails
+  validation are dropped and the read retried, without a new error
+  variant. `BufferTooSmall` drops one segment. A super-packet is never
+  dropped for its segment count. `EFAULT` stays `Disconnected` and send
+  `EIO` stays `InvalidState`.
+- **Device-wide side effect.** The kernel's offload mask
+  (`TUNSETOFFLOAD`) belongs to the whole device and affects every queue
+  and process on it. An offload open sets it; `tun-rs` clears it on every
+  Linux open without offload, so a plain open of a shared multi-queue
+  offload device turns super-packets off for all of its queues (they stay
+  correct, one packet per read). Nothing restores the mask when a handle
+  is dropped.
+- **Byte order.** The header is decoded in host byte order. A big-endian
+  host whose device was switched to little-endian headers by another
+  program is not supported and not detected.
+- No new privilege is needed, and no Windows or macOS behaviour changes.
+
 ## [0.5.0]
 
 - **A down device's `send` is `InvalidState` on Linux and Windows TAP.**

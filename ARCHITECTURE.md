@@ -143,6 +143,13 @@ and `send` also retry two transient conditions internally instead of
 reporting them: `EINTR` on Linux and macOS, and a macOS TAP read that
 produced no complete frame (which `tun-rs` reports as an end-of-file with
 a specific message). Every other end-of-file stays `Disconnected`.
+On a Linux TUN queue that uses segmentation offload (see "Segmentation
+offload" below), `recv` also drops and re-reads two more conditions
+internally: a raw `EINVAL` from the read (the kernel refused to frame a
+packet and has already freed it) and a received frame that fails
+validation. Neither is reported, so neither adds an error variant or ends
+a stream. On such a queue `BufferTooSmall` drops one segment rather than
+one packet.
 
 `recv` and `send` also recognize a device that was deleted or disabled
 underneath the handle. `Disconnected` means the device channel is gone for
@@ -331,6 +338,80 @@ Both platform traits are still declared unconditionally in
   `Error::Unsupported` (mapped from `tun-rs`'s own
   `io::ErrorKind::Unsupported` — a portable signal distinct from a raw OS
   error code, unlike the `Error::Platform` cases elsewhere in this crate).
+  A queue attached to an existing multi-queue device, and every
+  `additional_queue`, takes the device's packet framing, which the backend
+  reads back after the open (see the next section).
+
+## Segmentation offload (Linux TUN)
+
+`DeviceConfig::offload` (`with_offload`, off by default) requests kernel
+segmentation offload. Like `multi_queue`, it is a request, not a
+guarantee: the `tun-rs` backend honours it only for Linux TUN devices and
+ignores it without an error on Windows, macOS, and for TAP (the split
+path parses IP only, not Ethernet). The answer is
+`Capability::SEGMENTATION_OFFLOAD`, reported on a handle only and never by
+the host-level `Tunnel::capabilities()`. Offload is fixed at open;
+`DeviceConfigPatch` has no field for it and `apply` never touches it.
+
+The kernel side is a 10-byte virtio-net header in front of every packet
+on the queue (`IFF_VNET_HDR`) plus a device-wide offload mask
+(`TUNSETOFFLOAD`) that lets it deliver one TCP or UDP super-packet of up
+to 64 KiB in place of many packets, and accept one on write. The backend
+parses and builds that header itself, in a private module that does no
+I/O, uses checked arithmetic only, and compiles and is unit-tested on
+every OS; it uses only `tun-rs`'s public builder option and vectored
+reads and writes, none of its hidden offload helpers. Packet framing as a
+caller sees it does not change:
+
+- **Receive.** `recv` (sync and async) still returns exactly one IP
+  packet with no header, so `PacketStream`, `PacketPool`, and "one item is
+  one packet" are untouched. Each offload queue owns a staging buffer
+  (header + 65 536 bytes + a one-byte sentinel, about 64 KiB, allocated
+  only for an offload queue) and a split cursor behind a mutex. A `recv`
+  serves the next pending segment straight into the caller's buffer
+  (headers patched, payload copied once, checksums completed); only when
+  none is pending does it read the next super-packet. The async paths
+  never hold the lock across an await, and nothing awaits between a
+  successful read and the return, so a dropped `recv` future never loses
+  a read super-packet: unreturned segments wait for the next call. The
+  receive split is bounded only by the frame length, never by a segment
+  count, so a small-MSS TCP super-packet is never dropped.
+- **Send.** `send` writes the packet behind an all-zero header.
+  `send_batch` coalesces runs of adjacent same-flow packets (TCP with
+  contiguous sequence numbers and otherwise identical headers, or UDP with
+  equal-sized datagrams when the kernel accepts UDP segmentation offload)
+  into one gather write of `[header, patched copy of the first packet's
+  headers, payload slices...]`, with no allocation and no payload copy. A
+  call handles at most 128 packets (the kernel's per-super-packet segment
+  limit) and returns a short `Ok` beyond that. A run's write refused with
+  `EINVAL` sent nothing and is resent packet by packet, so a kernel that
+  lacks a given offload degrades to per-packet sends.
+
+Framing follows the device, not the request. `IFF_VNET_HDR` and the
+header size are device-wide, and a queue attached to a multi-queue device
+that already has queues does not get its own flags applied, so after
+every open and `additional_queue` the backend reads the real framing back
+(`TUNGETIFF`, `TUNGETVNETHDRSZ`): header flag set with size 10 gives an
+offload queue (even without a request), any other size fails `open` with
+`Error::Unsupported`, and a clear flag gives a plain queue (even with a
+request), in which case the backend clears the offload mask the request
+set (`TUNSETOFFLOAD(0)`), since a device without the header must not
+produce super-packets for anyone. Up to 0.5, a plain queue
+attached to an offload multi-queue device handed each packet to the
+caller with the 10-byte header in front of it.
+
+The offload mask is device-wide and has a side effect on other queues and
+processes: an offload open sets it (checksum, TSO for IPv4 and IPv6, and
+UDP segmentation where the kernel has it), and `tun-rs` clears it on every
+Linux open without offload, so a plain open of a shared multi-queue
+offload device turns super-packets off for all of its queues. They stay
+framed and correct, and simply receive single packets. Nothing is
+compensated on drop: the mask is not restored, matching `tun-rs`. The
+header is decoded in host byte order; a big-endian host whose device was
+switched to little-endian headers by someone else is unsupported and not
+detected. There is no compile-time or minimum-kernel gate: what the
+kernel negotiates at open is authoritative. Offload needs no privilege
+beyond opening the device.
 
 ## Async design
 
@@ -411,9 +492,9 @@ every backend `tunnel-lattice` ships as of this crate implements
 `AsyncPacketIo` (previously only `PacketIo`), a pre-1.0 change that was
 additive in effect for every shipped backend.
 
-The send side is a single method, `Handle::send_async`, under the same
-features. It returns the device's own `AsyncPacketIo::send` future
-unchanged (declared `impl Future<Output = Result<usize>> + Send`, not an
+The single-packet send side is one method, `Handle::send_async`, under the
+same features (its batch counterpart is described below). It returns the
+device's own `AsyncPacketIo::send` future unchanged (declared `impl Future<Output = Result<usize>> + Send`, not an
 `async fn`, so `Send` is part of the contract), with no capability check,
 no fallback, and no error mapping: with the tun-rs backend the blocking
 `send` blocks on the very same future, so both have identical results and
@@ -433,6 +514,27 @@ copies the packet and writes on its blocking pool, so a dropped send may or
 may not have gone out. The portable contract, also stated on
 `AsyncPacketIo::send` as a backend obligation, is "the whole packet at most
 once; unknown after drop."
+
+Batch send is additive and works the same way. `PacketIo::send_batch` and
+`AsyncPacketIo::send_batch` are provided trait methods (no required method
+was added, and `PacketIo` stays dyn-compatible) whose default sends one
+packet at a time; `Handle::send_batch` and, under the async features,
+`Handle::send_batch_async` pass straight through. The contract is a prefix
+with no deferred errors: `Ok(n)` means `packets[..n]` were each sent whole
+and in order and `packets[n..]` were not touched, and `n` may be short, so
+callers loop; an empty slice gives `Ok(0)`; `Err(e)` means nothing was
+sent and `e` belongs to `packets[0]`, classified as `send` would classify
+it; a failure after `k > 0` packets becomes `Ok(k)` and the next call,
+starting at `packets[k]`, sees the error. Dropping a `send_batch` future
+extends the single-packet rule: an unknown prefix was sent, each packet
+whole and at most once, never a packet after one that was not sent. Only a
+Linux TUN offload queue overrides the default (see "Segmentation offload"
+above); every other backend, OS, and queue sends packet by packet. There
+is no batch receive: the offload receive path splits super-packets behind
+the ordinary one-packet `recv`, which keeps the pool and stream unchanged.
+A downstream type that implements both `PacketIo` and `AsyncPacketIo` and
+calls `send_batch` with both traits in scope must name the trait, as it
+already must for `recv` and `send`.
 
 ### Packet buffers
 
@@ -495,8 +597,10 @@ copied every packet into a new `Vec` plus an unbounded-channel node.
   bytes `recv` reported; a backend that reports bytes it did not write could
   expose an earlier packet's bytes (see `SECURITY.md`).
 
-Batched receive and send, and Linux GSO/GRO offload, are planned for a
-later release. They must keep one packet per item.
+Linux TUN segmentation offload keeps one packet per item: its receive
+split happens behind `recv`, before a slot is filled, and claims one slot
+per segment like any other receive. A batched receive (several packets
+per call or per item) is not part of the design.
 
 Neither crate depends on Tokio, async-std, or smol directly by default —
 `tunnel-lattice`'s `async-io`/`tokio` features (mutually exclusive; enabling
@@ -515,8 +619,21 @@ Capabilities are answered at two levels. The backend itself
 (`TunRsBackend`, surfaced as `Tunnel::capabilities()`) reports what the
 host supports before any device is opened; an open device's handle reports
 that same answer plus flags that only exist per handle (`MAC_MUTATION` on a
-TAP handle on Linux and macOS). `CapabilityProvider::capabilities()` stays
-infallible: a capability the backend cannot confirm is simply absent.
+TAP handle on Linux and macOS, `SEGMENTATION_OFFLOAD` on a Linux TUN
+handle whose queue was verified to use offload framing).
+`CapabilityProvider::capabilities()` stays infallible: a capability the
+backend cannot confirm is simply absent.
+
+| Flag | Level | `tun-rs` backend |
+|---|---|---|
+| `DEVICE_MUTATION` | host and handle | always |
+| `PERSISTENT_DEVICES` | host and handle | Linux |
+| `TAP_DEVICES` | host and handle | per OS, below |
+| `MULTI_QUEUE` | host and handle | Linux |
+| `NATIVE_ASYNC` | host and handle | with `async-io` or `tokio` |
+| `MAC_MUTATION` | handle only | TAP on Linux and macOS |
+| `SEGMENTATION_OFFLOAD` | handle only | Linux TUN queue with verified offload framing |
+
 `TAP_DEVICES` is per OS:
 
 | OS | How `TAP_DEVICES` is determined |

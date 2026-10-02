@@ -14,7 +14,7 @@
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
 ![macOS](https://img.shields.io/badge/macOS-supported-success)
 
-[Overview](#-overview) • [Features](#-key-features) • [Platforms](#-supported-platforms) • [Performance](#-performance) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Feature Flags](#-feature-flags) • [Ownership](#-ownership-handle-is-clone) • [Privileges](#-platform-and-privilege-notes) • [Comparison](#-comparison)
+[Overview](#-overview) • [Features](#-key-features) • [Platforms](#-supported-platforms) • [Performance](#-performance) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Feature Flags](#-feature-flags) • [Batch Send](#-batch-send-and-segmentation-offload) • [Ownership](#-ownership-handle-is-clone) • [Privileges](#-platform-and-privilege-notes) • [Comparison](#-comparison)
 
 </div>
 
@@ -45,6 +45,11 @@ configuration once a device exists.
 - ✅ `Tunnel::open(DeviceConfig)`, creating a new TUN or TAP device and
   returning a `Handle` to it;
 - ✅ `Handle::recv`/`send`, blocking packet transfer on an open device;
+- ✅ `Handle::send_batch`, sending a prefix of a list of packets in one call
+  (see [Batch send and offload](#-batch-send-and-segmentation-offload));
+- 🐧 `DeviceConfig::with_offload(true)`, an opt-in request for kernel
+  segmentation offload on a Linux TUN device, read back through the
+  handle's `Capability::SEGMENTATION_OFFLOAD`;
 - ✅ `Handle::snapshot`, re-reading a device's current name/MTU/administrative
   state and, for TAP, its MAC address;
 - ✅ `Handle::apply(DeviceConfigPatch)`, changing an open device's MTU,
@@ -59,8 +64,8 @@ configuration once a device exists.
   `Handle::packet_stream` and `Handle::packet_stream_with_pool`, a
   `futures::Stream` of received packets, each a `PacketBuf` view into a
   `PacketPool` slot (both re-exported here), with no allocation or copy per
-  packet; and `Handle::send_async`, the non-blocking send to use inside
-  async code.
+  packet; and `Handle::send_async` and `Handle::send_batch_async`, the
+  non-blocking sends to use inside async code.
 
 ## 💻 Supported Platforms
 
@@ -218,7 +223,8 @@ sent whole at most once, and whether a dropped send went out is unknown.
   `ARCHITECTURE.md`, "Backend replacement plan").
 - **`async-io`** / **`tokio`** (mutually exclusive; enabling both is a
   compile error from `tun-rs`) — either adds `Handle::packet_stream`,
-  `Handle::packet_stream_with_pool`, and `Handle::send_async`. No async
+  `Handle::packet_stream_with_pool`, `Handle::send_async`, and
+  `Handle::send_batch_async`. No async
   runtime dependency is imposed when neither feature is enabled.
   - `async-io` selects `tun-rs`'s `async-io`/`blocking`-based backend (no
     tokio dependency); `tokio` selects its tokio-based one.
@@ -265,9 +271,78 @@ first blocking `recv`/`send` call hangs forever. See that crate's README,
 The blocking `recv`/`send` also panic when called from inside async code
 (a task, `#[tokio::main]`, or `block_on`): Tokio refuses to block inside
 its own runtime. With `async-io` they do not panic but park the executor
-thread. Inside async code use `send_async` and `packet_stream`; their
-futures are polled by the runtime, so `send_async` also works on a
-`current_thread` runtime.
+thread. Inside async code use `send_async`, `send_batch_async`, and
+`packet_stream`; their futures are polled by the runtime, so `send_async`
+and `send_batch_async` also work on a `current_thread` runtime.
+
+## 📨 Batch Send and Segmentation Offload
+
+`Handle::send_batch(&[&[u8]])` (and `send_batch_async` with an async
+feature) sends a prefix of a list of packets, in order, and returns how
+many it sent:
+
+- `Ok(n)`: `packets[..n]` were each sent whole and in order, and the rest
+  were not touched. `n` may be less than the list's length (a short
+  batch), so loop until everything is sent. An empty list gives `Ok(0)`.
+- `Err(e)`: nothing was sent; `e` is the first packet's error, the same
+  one `send` would return. A failure after at least one packet was sent is
+  reported as `Ok(k)`, and the next call, starting at `packets[k]`,
+  returns the error.
+- Dropping a `send_batch_async` future before it completes leaves an
+  unknown prefix sent: each packet whole and at most once, never a packet
+  after one that was not sent. Await it to completion to know the count.
+
+```rust,no_run
+use tunnel_lattice::{Capability, DeviceConfig, DeviceKind, Tunnel};
+
+fn main() -> tunnel_lattice::Result<()> {
+    let config = DeviceConfig::new(DeviceKind::Tun).with_offload(true); // a request
+    let device = Tunnel::connect().open(config)?;
+    let offload = device.capabilities().contains(Capability::SEGMENTATION_OFFLOAD);
+    println!("segmentation offload in use: {offload}");
+
+    let packets: Vec<&[u8]> = Vec::new(); // whole IP packets, e.g. from recv
+    let mut rest = &packets[..];
+    while !rest.is_empty() {
+        let sent = device.send_batch(rest)?;
+        rest = &rest[sent..];
+    }
+    Ok(())
+}
+```
+
+`send_batch` works on every backend and OS. By default it sends one
+packet at a time, exactly like a loop over `send`. With the `tun-rs`
+backend, segmentation offload changes that on **Linux TUN devices only**:
+
+- **Opt-in, and a request rather than a guarantee.** Offload is off by
+  default. `DeviceConfig::with_offload(true)` asks for it; it is ignored
+  without an error on Windows, macOS, and for TAP, and the handle then
+  works exactly as without it. `Capability::SEGMENTATION_OFFLOAD` on the
+  opened handle (never on `Tunnel::capabilities()`) says whether this
+  queue really uses offload. On Linux the device decides: a queue attached
+  to an existing multi-queue device takes that device's framing, whatever
+  this open asked for.
+- **Nothing changes for the caller.** `recv` still returns one IP packet
+  per call. The kernel may hand over one TCP or UDP super-packet of up to
+  64 KiB; the backend reads it once into a per-queue buffer (about 64 KiB
+  per offload queue) and returns its segments one per `recv`, with
+  lengths and checksums completed. An async `recv` dropped mid-way loses
+  no segment, and `packet_stream` is unchanged.
+- **`send_batch` coalesces.** On an offload queue a call sends at most 128
+  packets (a short `Ok` beyond that), and adjacent packets of one TCP flow,
+  or of one UDP flow with equal-sized datagrams when the kernel supports
+  UDP segmentation offload, go out as one super-packet in one write that
+  copies no payload. If the kernel refuses a super-packet, its packets are
+  sent again one by one. Elsewhere `send_batch` falls back to sending
+  packet by packet, with no 128-packet limit.
+- **The kernel's offload setting is device-wide.** An offload open
+  switches it on for the whole device. Any later open of the same device
+  without offload, including a plain queue attached to a shared
+  multi-queue offload device, switches it off again for every queue (the
+  `tun-rs` library clears it on every such open). Those queues stay
+  correct, but they then receive single packets instead of super-packets.
+  Nothing restores the setting when a handle is dropped.
 
 ## 🤝 Ownership: `Handle` is `Clone`
 
@@ -368,7 +443,9 @@ have yet.
 | **TAP MAC address** | ✅ Set at open; changed on an open device on Linux and macOS | Inherited | ✅ |
 | **Persistent devices (Linux)** | ✅ Persist, re-attach by name, un-persist | Persist inherited; un-persist is Tunnel Lattice | ⚠️ Persist only |
 | **Multi-queue (Linux)** | ✅ `additional_queue` | Inherited | ✅ |
-| **Batch I/O and GSO/GRO offload** | 🚧 Planned for 0.6 | — | ✅ Linux |
+| **Batch send** | ✅ `send_batch`, every OS; coalesced only on a Linux TUN offload queue | Tunnel Lattice | ✅ Linux (`send_multiple`) |
+| **GSO/GRO offload** | ✅ Linux TUN, opt-in; one packet per `recv` | Tunnel Lattice (its own header parsing, segmentation, and coalescing) | ✅ Linux |
+| **Batch receive** | ❌ One packet per `recv` | — | ✅ Linux (`recv_multiple`) |
 | **Address and route setup** | ➖ Delegated to [`net-lattice`](https://crates.io/crates/net-lattice) | — | ✅ Built in |
 | **Throughput** | Measured against `tun-rs` in the same run; see [Performance](#-performance) | — | Baseline |
 | **Platforms** | Linux, Windows, macOS | — | 11+, including BSD, iOS, Android |

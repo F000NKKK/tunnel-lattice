@@ -13,7 +13,7 @@
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
 ![macOS](https://img.shields.io/badge/macOS-supported-success)
 
-[Overview](#-overview) • [Platforms](#-supported-platforms) • [Installation](#-installation) • [Errors](#-error-mapping) • [Receiving](#-receiving-packets) • [Opening](#-opening-a-device) • [Windows](#-windows-requires-wintundll)
+[Overview](#-overview) • [Platforms](#-supported-platforms) • [Installation](#-installation) • [Errors](#-error-mapping) • [Receiving](#-receiving-packets) • [Opening](#-opening-a-device) • [Windows](#-windows-requires-wintundll) • [Offload](#-segmentation-offload-linux-tun)
 
 </div>
 
@@ -87,12 +87,21 @@ error into a typed `tunnel_lattice_core::Error`.
   Linux and macOS, where a `DeviceConfigPatch` can change it later; on
   Windows the tap-windows6 driver takes the address only when the adapter
   is created.
+- 🐧 Linux TUN segmentation offload, opt-in with `DeviceConfig::with_offload`
+  and reported per handle as `Capability::SEGMENTATION_OFFLOAD`: `recv`
+  splits kernel super-packets back into single packets, and `send_batch`
+  coalesces adjacent packets of one flow into one write. The header parsing,
+  segmentation, and coalescing are this crate's own. See "Segmentation
+  offload (Linux TUN)" below.
+- ✅ `PacketIo::send_batch`/`AsyncPacketIo::send_batch` on every OS: the
+  coalescing path on a Linux TUN offload queue, the per-packet default
+  everywhere else.
 
 ## 💻 Supported Platforms
 
 | Platform    | TUN | TAP | Sync | Tokio | async-io | Mechanism |
 |-------------|:---:|:---:|:----:|:-----:|:--------:|-----------|
-| **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | `/dev/net/tun`; persistence and multi-queue |
+| **Linux**   | ✅  | ✅  | ✅   | ✅    | ✅       | `/dev/net/tun`; persistence, multi-queue, and TUN segmentation offload |
 | **Windows** | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via Wintun (`wintun.dll`), TAP via tap-windows6 |
 | **macOS**   | ✅  | ✅  | ✅   | ✅    | ✅       | TUN via `utun`, TAP via `feth` pairs and BPF |
 
@@ -114,7 +123,9 @@ device is opened (the `tunnel-lattice` facade exposes it as
 
 `MAC_MUTATION` is never in this answer: it belongs to an open TAP handle,
 whose `TunRsDevice::capabilities()` reports the backend's answer plus
-`MAC_MUTATION` (Linux and macOS) and `TAP_DEVICES`.
+`MAC_MUTATION` (Linux and macOS) and `TAP_DEVICES`. `SEGMENTATION_OFFLOAD`
+is never in it either: only an open Linux TUN handle whose queue was
+verified to use offload framing reports it.
 
 On Windows the driver is detected with the same SetupAPI driver lookup
 `tun-rs` performs before creating a TAP adapter, stopping before anything is
@@ -218,6 +229,15 @@ Two conditions are retried inside `recv` instead of being returned:
 Every other `UnexpectedEof` still maps to `Error::Disconnected`, including
 `tun-rs`'s `"close"` error on a closed macOS device and Windows'
 `ERROR_HANDLE_EOF` when the adapter goes away.
+
+On a Linux TUN queue that uses segmentation offload, `recv` also drops
+two more conditions silently and reads again: a raw `EINVAL` from the read
+(the kernel refused to frame a packet and has already discarded it), and a
+received frame that fails validation (a malformed header or packet, or one
+larger than 64 KiB). Neither reaches the caller and neither spins. A
+segment that does not fit the caller's buffer is `Error::BufferTooSmall`
+and drops that segment only; the next `recv` returns the segment after it.
+Every other error keeps the mapping below.
 
 ### When the device goes away
 
@@ -524,6 +544,84 @@ access: `PacketIo::recv`/`send` take `&self` on every platform this crate
 supports, so sharing one `Handle` clone across threads and calling them
 concurrently is always safe — see `tunnel_lattice::Handle`'s rustdoc and
 `ARCHITECTURE.md`'s "Ownership and concurrency contract."
+
+## 📦 Segmentation offload (Linux TUN)
+
+`DeviceConfig::with_offload(true)` asks the Linux kernel for segmentation
+offload on a TUN device. Offload is off by default, and the request is a
+hint, not a guarantee: on Windows and macOS, and for TAP on Linux, it is
+ignored without an error and the handle uses plain framing. Check
+`Capability::SEGMENTATION_OFFLOAD` on the opened handle (never in
+`TunRsBackend`'s host answer) to learn whether this queue uses offload.
+
+With offload, every packet on the queue carries a 10-byte virtio-net
+header, and the kernel may deliver one TCP or UDP super-packet of up to
+64 KiB in place of many packets. This crate parses that header itself and
+uses none of `tun-rs`'s hidden offload helpers. The caller never sees the
+header or an aggregate:
+
+- **`recv`** returns one IP packet per call. A super-packet is read once
+  into a staging buffer the queue owns (about 64 KiB, allocated only for an
+  offload queue) and split lazily: each `recv` builds its next segment
+  straight into the caller's buffer, with lengths and checksums completed.
+  A segment that does not fit is dropped alone as `Error::BufferTooSmall`.
+  An async `recv` dropped before it completes loses nothing: segments not
+  yet returned stay staged for the next `recv`, and no lock is held across
+  an await. A received super-packet is never dropped for its segment
+  count.
+- **`send`** writes the packet behind an all-zero header and returns the
+  packet's length.
+- **`send_batch`** (sync and async) sends at most 128 packets per call, so
+  a longer list gives a short `Ok(128)`; callers loop. Adjacent packets of
+  one TCP flow (contiguous sequence numbers, otherwise identical headers,
+  no SYN, FIN, RST, URG, or CWR, PSH on the last packet only, valid
+  checksums), or of one UDP flow with equal-sized datagrams (the last may
+  be shorter) when `tun-rs` reports UDP segmentation offload, go out as one
+  super-packet in a single gather write that copies no payload; the kernel
+  splits it back into exactly those packets. Every other packet goes out
+  alone, as with `send`. If the kernel refuses a super-packet with
+  `EINVAL`, nothing of it was sent, and its packets are sent again one by
+  one, so a kernel without UDP segmentation offload degrades to per-packet
+  sends instead of failing. The prefix contract holds: `Ok(n)` means the
+  first `n` packets were sent whole and in order; an error after at least
+  one packet becomes that count, and the next call returns the error,
+  mapped as for `send`; `Err` means nothing was sent. A dropped async
+  `send_batch` has sent an unknown prefix, each packet whole and at most
+  once.
+- A queue without offload framing (Windows, macOS, TAP, or a Linux TUN
+  queue that did not get offload) uses the trait's per-packet
+  `send_batch`, without the 128-packet limit.
+
+The kernel's header flag (`IFF_VNET_HDR`) is device-wide, and a queue
+attached to a multi-queue device that already has queues does not get its
+own request applied. So after every open and every `additional_queue`,
+the backend reads the queue's real framing back (`TUNGETIFF`,
+`TUNGETVNETHDRSZ`) and follows the device, not the request:
+
+| Device | Queue framing | `SEGMENTATION_OFFLOAD` |
+|---|---|---|
+| header flag set, header size 10 | offload, even if this open did not ask for it | reported |
+| header flag set, other header size | none: `open` fails with `Error::Unsupported` | — |
+| header flag clear | plain, even if this open asked for offload; the offload mask this open set is cleared again (`TUNSETOFFLOAD(0)`) | not reported |
+
+Up to 0.5, a queue attached without offload to a multi-queue device that
+has the header flag handed every packet to the caller with a 10-byte
+header in front of it; it now strips and parses the header.
+
+**Device-wide side effect.** The kernel's offload mask (`TUNSETOFFLOAD`)
+is device-wide too, and affects every queue and process using the device.
+An offload open sets it (checksum, TCP over IPv4 and IPv6, and UDP where
+the kernel supports it). `tun-rs` clears it on **every** Linux open without
+offload, so opening a plain queue on a shared multi-queue offload device
+turns super-packets off for all of that device's queues, as does the
+repair in the table above. Those queues stay framed and correct; each read
+then just carries a single packet. Nothing restores the mask when a handle
+is dropped; on a persistent device it stays as the last open left it.
+
+The header is read in the host's byte order. A big-endian host whose
+device was switched to little-endian headers by another program is not
+supported, and this is not detected. Offload needs no privilege beyond
+what opening the device already needs.
 
 ## 🏗️ Why this is one shared crate, not three
 

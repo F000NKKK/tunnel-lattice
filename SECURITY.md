@@ -35,7 +35,16 @@ informed as the issue is investigated and resolved.
 
 In scope: `tunnel-lattice-backend-tunrs`'s handling of untrusted packet data
 read from an open device, and any privilege-boundary bug in device creation
-or MTU/administrative-state mutation.
+or MTU/administrative-state mutation. On a Linux TUN queue with
+segmentation offload this includes the backend's own parsing of the
+kernel's virtio-net header and its splitting and coalescing of
+super-packets: a panic, an out-of-bounds read, or a segment built from
+bytes outside the received frame there is a reportable bug.
+
+Changing a device's offload mask is device-wide and affects every queue
+and process using that device (see the backend README), but it needs the
+same privilege as attaching to the device in the first place, so it is not
+a privilege-boundary issue by itself.
 
 Out of scope: `tun-rs` itself (report upstream), and any code path only
 reachable with attacker-controlled `Cargo.toml`/build configuration.

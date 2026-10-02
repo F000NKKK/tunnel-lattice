@@ -32,12 +32,21 @@ contracts; it never inspects or changes the host system.
 - ✅ **`DeviceKind`**: TUN (raw IP) or TAP (Ethernet-framed).
 - ✅ **`DeviceConfig`**: desired intent for creating a device (kind, an
   optional name, an optional MTU, an optional TAP MAC address, a
-  multi-queue request), built with
-  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_mac`/`with_multi_queue`.
+  multi-queue request, a segmentation-offload request), built with
+  `DeviceConfig::new`/`with_name`/`with_mtu`/`with_mac`/`with_multi_queue`/
+  `with_offload`.
   The `name` field's docs list the per-OS name formats a backend accepts
   (anything else is rejected with `Error::InvalidState` before any native
   call) and
   what happens when an interface with that name already exists.
+- ✅ **`DeviceConfig::offload`**: off by default. Like `multi_queue`, it is
+  a request, not a guarantee: a backend ignores it without an error where
+  it has no such concept (the `tun-rs` backend honours it for Linux TUN
+  devices only), and the opened handle's
+  `Capability::SEGMENTATION_OFFLOAD` flag says whether offload is in use.
+  It never changes what a caller sees (each receive still returns one
+  packet and each send takes one, with no offload header), and it is fixed
+  at open: `DeviceConfigPatch` cannot change it.
 - ✅ **`Device`**: an observed, already-open device (id, actual name, kind,
   MTU, administrative state, and a TAP device's MAC address; `None` for
   TUN). `Device::recv_buffer_len` returns a receive
@@ -84,9 +93,11 @@ fn main() -> Result<(), tunnel_lattice_core::Error> {
     let config = DeviceConfig::new(DeviceKind::Tun)
         .with_name("tun0")
         .with_mtu(1500)
-        .with_multi_queue(true);
+        .with_multi_queue(true)
+        .with_offload(true); // a request; the open handle's capability answers
     assert_eq!(config.kind, DeviceKind::Tun);
     assert!(config.multi_queue);
+    assert!(config.offload);
 
     let patch = DeviceConfigPatch::new(DeviceId::new(1), Some(DesiredAdminState::Up), None)?;
     assert_eq!(patch.admin_state(), Some(DesiredAdminState::Up));

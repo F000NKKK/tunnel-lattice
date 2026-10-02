@@ -41,7 +41,11 @@ public API. The workspace
 - ✅ **`DeviceProvider`**: opens a TUN/TAP device, with generic
   `DeviceConfig`/`Device` associated types (this crate never names
   `tunnel_lattice_model` types directly).
-- ✅ **`PacketIo`**: synchronous packet transfer on an open device handle.
+- ✅ **`PacketIo`**: synchronous packet transfer on an open device handle:
+  `recv`, `send`, and a provided `send_batch` that sends a prefix of a
+  packet list (see "Backend Contract" below). The default implementation
+  sends one packet at a time; a backend overrides it when it can send
+  several more cheaply. Adding it keeps the trait dyn-compatible.
 - ✅ **`DeviceObserver`**: reads an open device's current name, MTU, and
   administrative state back, and returns the device identity captured at
   open without a native call.
@@ -61,11 +65,19 @@ public API. The workspace
   path a backend implements when it has real async I/O rather than a
   blocking syscall. See that trait's docs for why it is preferred over
   `tunnel-lattice-async`'s generic thread-based adapter when available.
+  It has the same provided `send_batch`, awaiting `send` once per packet by
+  default.
 
 ### Capabilities
 - 🧩 **`Capability`**: a `bitflags` set of runtime-dependent features:
   `DEVICE_MUTATION`, `PERSISTENT_DEVICES`, `TAP_DEVICES`, `MULTI_QUEUE`,
-  `NATIVE_ASYNC`, `MAC_MUTATION`.
+  `NATIVE_ASYNC`, `MAC_MUTATION`, `SEGMENTATION_OFFLOAD`.
+  `SEGMENTATION_OFFLOAD` is reported on an open handle only, never for the
+  host: it means the handle uses kernel segmentation offload internally
+  (`recv` splits each offloaded super-packet back into single packets, and
+  `send_batch` may coalesce adjacent packets of one flow into one native
+  write), while every receive still returns exactly one packet with no
+  offload header.
 - 🧩 **`CapabilityProvider`**: reports which of them a connected device has.
   A backend may implement it too, answering for the host before any device
   is opened (for example whether a TAP driver is installed); an open
@@ -101,6 +113,22 @@ either the whole packet sent or nothing, never part of it and never twice,
 and must not use `buf` afterwards (copy it first if the write can outlive
 the future). Callers may rely only on "the whole packet at most once;
 unknown after drop".
+
+`send_batch` (sync and async) follows a prefix contract with no deferred
+errors, and an override must keep it:
+
+- `Ok(n)`: `packets[..n]` were each sent whole and in order, and
+  `packets[n..]` were not touched. `n` may be less than `packets.len()` (a
+  short batch), so a caller that must send everything loops from
+  `packets[n]`. An empty slice gives `Ok(0)`.
+- `Err(e)`: nothing was sent, and `e` belongs to `packets[0]`, classified
+  as `send` would classify it. A failure after at least one packet was sent
+  is reported as `Ok(k)`; the next call, starting at `packets[k]`, sees the
+  error.
+- Dropping an `AsyncPacketIo::send_batch` future before it completes leaves
+  an unknown prefix of `packets` sent: each packet whole and at most once,
+  and never a packet after one that was not sent. A caller that must know
+  how many went out awaits the future to completion.
 
 ## 📖 Documentation
 

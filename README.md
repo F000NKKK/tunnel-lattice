@@ -68,11 +68,17 @@ addresses and routes.
   device
 - ✅ **Cheap sharing**: `Handle` is `Clone` and `recv`/`send` take `&self`,
   so one device can be used from many threads
+- ✅ **Batch send**: `send_batch` (and `send_batch_async`) sends a prefix
+  of a packet list in one call on every OS; `Ok(n)` says how many went out
 
 ### Platform-Specific Features
 - 🐧 **Linux persistence**: keep a device after the process exits,
   re-attach to it by name later, and un-persist it
 - 🔀 **Linux multi-queue**: independent kernel-scheduled queues on one device
+- 📦 **Linux TUN segmentation offload**: opt in with `with_offload(true)`;
+  the kernel moves TCP/UDP traffic in super-packets of up to 64 KiB, while
+  `recv` still returns one packet per call and `send_batch` coalesces
+  same-flow packets
 - 🍎 **macOS TAP**: `feth` pairs, with a bounded wait so a destroyed
   interface ends `recv`
 - 🪟 **Windows TUN**: Wintun, with a missing `wintun.dll` reported as
@@ -102,7 +108,8 @@ driver package, without creating an adapter. A separate Linux job checks
 that a persistent device survives its process and that a second process
 re-attaches to it and un-persists it.
 
-Linux also has persistent devices and multi-queue. Only platforms CI tests
+Linux also has persistent devices, multi-queue, and TUN segmentation
+offload. Only platforms CI tests
 are listed: `tun-rs` runs on more (BSD, iOS, Android, ...), but Tunnel
 Lattice does not claim them.
 
@@ -279,6 +286,59 @@ fn main() -> tunnel_lattice::Result<()> {
 `open` does not report whether it attached or created a new device, and a
 kind or multi-queue mismatch fails with `Error::AlreadyExists`.
 
+### Batch Send and Segmentation Offload
+
+`send_batch` sends a prefix of a packet list and returns how many packets
+went out. It may send fewer than you passed (a short batch), so loop:
+
+```rust,no_run
+use tunnel_lattice::{Capability, DeviceConfig, DeviceKind, Tunnel};
+
+fn main() -> tunnel_lattice::Result<()> {
+    let config = DeviceConfig::new(DeviceKind::Tun).with_offload(true); // a request
+    let device = Tunnel::connect().open(config)?;
+    let offload = device.capabilities().contains(Capability::SEGMENTATION_OFFLOAD);
+    println!("segmentation offload in use: {offload}");
+
+    let packets: Vec<&[u8]> = Vec::new(); // whole IP packets, e.g. from recv
+    let mut rest = &packets[..];
+    while !rest.is_empty() {
+        let sent = device.send_batch(rest)?; // Ok(n): packets[..n] went out
+        rest = &rest[sent..];
+    }
+    Ok(())
+}
+```
+
+- **Prefix contract.** `Ok(n)` means the first `n` packets were each sent
+  whole and in order and the rest were not touched. `Err` means nothing
+  was sent and the error belongs to the first packet. A failure after at
+  least one packet was sent is reported as `Ok(k)`; the next call,
+  starting at that packet, returns the error. An empty list gives `Ok(0)`.
+- **Cancellation.** A dropped `send_batch_async` future has sent an
+  unknown prefix of the list: each packet whole and at most once, never a
+  packet after one that was not sent.
+- **Offload is Linux TUN only, opt-in, and a request rather than a
+  guarantee.** It is ignored without an error on Windows, macOS, and for
+  TAP. `Capability::SEGMENTATION_OFFLOAD` on the open handle (never on
+  `Tunnel::capabilities()`) says whether the queue uses it; a queue
+  attached to an existing multi-queue device follows that device's
+  framing, whatever this open asked for.
+- **What offload changes.** Nothing a caller sees: `recv` and
+  `packet_stream` still return one IP packet at a time, split out of the
+  kernel's super-packets, and an async `recv` dropped mid-way loses no
+  segment. On an offload queue `send_batch` sends at most 128 packets per
+  call and merges adjacent packets of one TCP or UDP flow into one write;
+  if the kernel refuses a merged write, those packets are resent one by
+  one. Without offload, and on every other OS, `send_batch` sends packet
+  by packet.
+- **Device-wide side effect.** The kernel's offload setting belongs to
+  the whole device, not one queue. Opening the device without offload,
+  including a plain queue on a shared multi-queue offload device, turns
+  super-packets off for every queue of it, and nothing restores the
+  setting when a handle is dropped. Those queues keep working, one packet
+  per read.
+
 ### Assigning an Address with net-lattice
 
 Tunnel Lattice creates the interface; `net-lattice` configures it. The two
@@ -368,7 +428,9 @@ not have yet.
 | **TAP MAC address** | ✅ Set at open; changed on an open device on Linux and macOS | Inherited | ✅ |
 | **Persistent devices (Linux)** | ✅ Persist, re-attach by name, un-persist | Persist inherited; un-persist is Tunnel Lattice | ⚠️ Persist only |
 | **Multi-queue (Linux)** | ✅ `additional_queue` | Inherited | ✅ |
-| **Batch I/O and GSO/GRO offload** | 🚧 Planned for 0.6 | — | ✅ Linux |
+| **Batch send** | ✅ `send_batch`, every OS; coalesced only on a Linux TUN offload queue | Tunnel Lattice | ✅ Linux (`send_multiple`) |
+| **GSO/GRO offload** | ✅ Linux TUN, opt-in; one packet per `recv` | Tunnel Lattice (its own header parsing, segmentation, and coalescing) | ✅ Linux |
+| **Batch receive** | ❌ One packet per `recv` | — | ✅ Linux (`recv_multiple`) |
 | **Address and route setup** | ➖ Delegated to net-lattice | — | ✅ Built in |
 | **Throughput** | Measured against `tun-rs` in the same run; see [Benchmarks](#-benchmarks) | — | Baseline |
 | **Platforms** | Linux, Windows, macOS | — | 11+, including BSD, iOS, Android |
@@ -381,14 +443,17 @@ not have yet.
 | `Tunnel::new(backend)` | Use any backend, including your own or a test double |
 | `Tunnel::capabilities` | What the host supports before opening a device |
 | `Tunnel::open(DeviceConfig)` | Create a TUN/TAP device and return a `Handle` |
+| `DeviceConfig::with_offload` | Request Linux TUN segmentation offload (a hint; read `Capability::SEGMENTATION_OFFLOAD` back) |
 | `Handle::id` / `kind` | The identity and kind captured at open (no native call) |
 | `Handle::recv` / `send` | Blocking packet transfer |
+| `Handle::send_batch` | Blocking send of a prefix of a packet list; returns how many were sent |
 | `Handle::snapshot` | Current name, MTU, administrative state, and TAP MAC address |
 | `Handle::apply(DeviceConfigPatch)` | Change MTU, TAP MAC address (Linux, macOS), or up/down |
 | `Handle::capabilities` | What this device supports at runtime |
 | `Handle::persist` / `unpersist` / `additional_queue` | Linux persistence and multi-queue |
 | `Handle::packet_stream` | Async `Stream` of pooled packets (`tokio` / `async-io`) |
 | `Handle::send_async` | Non-blocking send for async code (`tokio` / `async-io`) |
+| `Handle::send_batch_async` | Non-blocking batch send for async code (`tokio` / `async-io`) |
 
 ### Workspace Crates
 
