@@ -12,6 +12,7 @@ tunnel-lattice-core             errors, IDs — no OS dependency
 tunnel-lattice-model             DeviceKind/DeviceConfig/Device/DeviceConfigPatch — no OS dependency
 tunnel-lattice-platform          generic provider traits + Capability — depends on core only, never on model
 tunnel-lattice-backend-tunrs     tun-rs-backed implementation of the platform traits
+tunnel-lattice-backend-linux     native Linux backend (/dev/net/tun + sync rtnetlink) — in development, no public API yet; empty off Linux
 tunnel-lattice-async             futures::Stream adapter over a synchronous PacketIo device
 tunnel-lattice                   facade: binds platform traits to model types, selects a backend
 ```
@@ -88,8 +89,11 @@ public API:
   backend-crate-only change: nothing in `tunnel-lattice-model` or
   `tunnel-lattice-platform` needs to move.
 
-No per-OS backend exists yet — this section records the intended shape, not
-completed work.
+The first per-OS backend, `tunnel-lattice-backend-linux`, is in development:
+the crate exists (Linux-only, empty on other targets) and holds its raw-errno
+error mapping and synchronous rtnetlink control plane, but it exports no
+public API yet, cannot open a device, and no facade feature selects it. Until
+it does, this section records the intended shape, not completed work.
 
 ## Error model
 

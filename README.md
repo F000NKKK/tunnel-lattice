@@ -478,6 +478,7 @@ not have yet.
 | [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Shared errors, results, and IDs |
 | [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Runtime-independent packet `Stream` and `PacketPool` |
 | [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | `tun-rs`-backed TUN/TAP implementation |
+| [`tunnel-lattice-backend-linux`](crates/tunnel-lattice-backend-linux/README.md) | Native Linux backend (`/dev/net/tun` + rtnetlink) — in development, no public API yet |
 
 ## 📖 Documentation
 

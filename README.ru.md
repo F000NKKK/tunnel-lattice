@@ -487,6 +487,7 @@ sudo setcap cap_net_admin+ep ./your-app    # или запуск через sudo
 | [`tunnel-lattice-core`](crates/tunnel-lattice-core/README.md) | Общие ошибки, результаты и идентификаторы |
 | [`tunnel-lattice-async`](crates/tunnel-lattice-async/README.md) | Независимый от рантайма `Stream` пакетов и `PacketPool` |
 | [`tunnel-lattice-backend-tunrs`](crates/tunnel-lattice-backend-tunrs/README.md) | Реализация TUN/TAP на базе `tun-rs` |
+| [`tunnel-lattice-backend-linux`](crates/tunnel-lattice-backend-linux/README.md) | Нативный Linux-backend (`/dev/net/tun` + rtnetlink) — в разработке, публичного API пока нет |
 
 ## 📖 Документация
 

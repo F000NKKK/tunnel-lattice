@@ -42,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next `recv` or `recv_batch` on that handle returns `BufferTooSmall`
   first, once. A dropped async `recv_batch` has received nothing. Windows
   and macOS keep one packet per call.
+- **New crate `tunnel-lattice-backend-linux` (in development, 0.1.0).**
+  The start of a native Linux backend built directly on `/dev/net/tun`
+  and a synchronous rtnetlink socket (`netlink-packet-route` 0.33,
+  `netlink-packet-core` 0.9, `netlink-sys` 0.9, default features off: no
+  tokio, mio, or smol). It is Linux-only and compiles to an empty crate on
+  other targets. This version holds internal foundations only, with no
+  public API yet: the raw-`errno` error mapping (never by
+  `io::ErrorKind`; a missing `/dev/net/tun` is `DriverUnavailable` and the
+  device node is never created) and the rtnetlink control plane for link
+  lookups and single-attribute changes. The facade does not select it
+  yet.
 
 ### Changed
 

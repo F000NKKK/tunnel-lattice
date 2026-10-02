@@ -11,6 +11,7 @@ tunnel-lattice-core             ошибки, ID — без зависимост
 tunnel-lattice-model             DeviceKind/DeviceConfig/Device/DeviceConfigPatch — без зависимости от ОС
 tunnel-lattice-platform          обобщённые provider-трейты + Capability — зависит только от core, никогда от model
 tunnel-lattice-backend-tunrs     реализация platform-трейтов поверх tun-rs
+tunnel-lattice-backend-linux     нативный Linux-backend (/dev/net/tun + синхронный rtnetlink) — в разработке, публичного API пока нет; вне Linux пустой
 tunnel-lattice-async             адаптер futures::Stream поверх синхронного PacketIo-устройства
 tunnel-lattice                   фасад: связывает platform-трейты с типами model, выбирает backend
 ```
@@ -88,8 +89,12 @@ cfg), Tunnel Lattice начинает с одного общего крейта 
   изменением только в крейте backend'а — ничего в `tunnel-lattice-model`
   или `tunnel-lattice-platform` переносить не придётся.
 
-Backend для конкретной ОС пока не существует — этот раздел фиксирует
-намеченную форму, а не выполненную работу.
+Первый backend для конкретной ОС, `tunnel-lattice-backend-linux`, в
+разработке: крейт уже есть (только Linux, на других целях пустой) и содержит
+отображение сырых errno в ошибки и синхронный control plane на rtnetlink, но
+публичного API пока не экспортирует, открыть устройство не может, и ни одна
+фича фасада его не выбирает. До тех пор этот раздел фиксирует намеченную
+форму, а не выполненную работу.
 
 ## Модель ошибок
 
