@@ -377,36 +377,411 @@ fn assert_send_reaches_the_host(device: &TunRsDevice, subnet: [u8; 3]) {
 /// An IPv4/UDP packet from `src:4000` to `dst:port` carrying `payload`,
 /// with valid IPv4 and UDP checksums.
 fn udp_packet(src: [u8; 4], dst: [u8; 4], port: u16, payload: &[u8]) -> Vec<u8> {
-    let total = u16::try_from(HDR_LEN + payload.len()).expect("a short packet");
-    let udp_len = total - 20;
-    let mut packet = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 17, 0, 0];
+    ipv4_packet(src, dst, 0, &udp_header(4000, port, payload.len()), payload)
+}
+
+/// A UDP header from `sport` to `dport` for a `payload_len`-byte payload,
+/// checksum zero (filled in by [`ipv4_packet`]).
+fn udp_header(sport: u16, dport: u16, payload_len: usize) -> Vec<u8> {
+    let udp_len = u16::try_from(8 + payload_len).expect("a short packet");
+    let mut header = sport.to_be_bytes().to_vec();
+    header.extend_from_slice(&dport.to_be_bytes());
+    header.extend_from_slice(&udp_len.to_be_bytes());
+    header.extend_from_slice(&[0, 0]);
+    header
+}
+
+/// A 20-byte TCP header from `sport` to `dport` with sequence number
+/// `seq`, ACK set, checksum zero (filled in by [`ipv4_packet`]).
+fn tcp_header(sport: u16, dport: u16, seq: u32) -> Vec<u8> {
+    let mut header = sport.to_be_bytes().to_vec();
+    header.extend_from_slice(&dport.to_be_bytes());
+    header.extend_from_slice(&seq.to_be_bytes());
+    header.extend_from_slice(&1u32.to_be_bytes());
+    header.extend_from_slice(&[0x50, 0x10, 0x20, 0, 0, 0, 0, 0]);
+    header
+}
+
+/// An IPv4 packet from `src` to `dst` with IPv4 id `id`, carrying the L4
+/// header `l4` (UDP if it is 8 bytes long, TCP otherwise) and `payload`,
+/// with valid IPv4 and L4 checksums.
+fn ipv4_packet(src: [u8; 4], dst: [u8; 4], id: u16, l4: &[u8], payload: &[u8]) -> Vec<u8> {
+    let (proto, csum_at) = if l4.len() == 8 { (17, 26) } else { (6, 36) };
+    let total = u16::try_from(20 + l4.len() + payload.len()).expect("a short packet");
+    let l4_len = total - 20;
+    let mut packet = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, proto, 0, 0];
     packet[2..4].copy_from_slice(&total.to_be_bytes());
+    packet[4..6].copy_from_slice(&id.to_be_bytes());
     packet.extend_from_slice(&src);
     packet.extend_from_slice(&dst);
-    packet.extend_from_slice(&4000u16.to_be_bytes());
-    packet.extend_from_slice(&port.to_be_bytes());
-    packet.extend_from_slice(&udp_len.to_be_bytes());
-    packet.extend_from_slice(&[0, 0]);
+    packet.extend_from_slice(l4);
     packet.extend_from_slice(payload);
     if packet.len() % 2 == 1 {
         packet.push(0);
     }
     let ip_sum = !ones_complement_sum(&packet[..20]);
     packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
-    let [l0, l1] = udp_len.to_be_bytes();
-    let pseudo = [0, 17, l0, l1];
+    let [l0, l1] = l4_len.to_be_bytes();
+    let pseudo = [0, proto, l0, l1];
     let sum = u32::from(ones_complement_sum(&packet[12..20]))
         + u32::from(ones_complement_sum(&pseudo))
         + u32::from(ones_complement_sum(&packet[20..]));
     let folded = (sum & 0xffff) + (sum >> 16);
     let folded = (folded & 0xffff) + (folded >> 16);
-    let udp_sum = match !u16::try_from(folded).expect("folded into 16 bits") {
-        0 => 0xffff,
+    let l4_sum = match !u16::try_from(folded).expect("folded into 16 bits") {
+        0 if proto == 17 => 0xffff,
         sum => sum,
     };
-    packet[26..28].copy_from_slice(&udp_sum.to_be_bytes());
+    packet[csum_at..csum_at + 2].copy_from_slice(&l4_sum.to_be_bytes());
     packet.truncate(usize::from(total));
     packet
+}
+
+/// The `send_batch` flavors this build has: blocking, and async with an
+/// async feature.
+fn batch_modes() -> &'static [bool] {
+    if cfg!(feature = "async") {
+        &[false, true]
+    } else {
+        &[false]
+    }
+}
+
+/// One `send_batch` call, blocking or (with an async feature) async.
+fn send_batch_once(
+    device: &TunRsDevice,
+    packets: &[&[u8]],
+    asynchronous: bool,
+) -> tunnel_lattice_core::Result<usize> {
+    if !asynchronous {
+        return PacketIo::send_batch(device, packets);
+    }
+    #[cfg(feature = "tokio")]
+    {
+        tokio::runtime::Handle::current().block_on(
+            tunnel_lattice_platform::AsyncPacketIo::send_batch(device, packets),
+        )
+    }
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    {
+        futures::executor::block_on(tunnel_lattice_platform::AsyncPacketIo::send_batch(
+            device, packets,
+        ))
+    }
+    #[cfg(not(feature = "async"))]
+    {
+        unreachable!("no async send_batch without an async feature")
+    }
+}
+
+/// Sends every packet with `send_batch`, starting each call after the
+/// packets the previous one sent, and returns each call's count. Fails on
+/// an error or an empty call.
+fn send_all(device: &TunRsDevice, packets: &[Vec<u8>], asynchronous: bool) -> Vec<usize> {
+    let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+    let mut counts = Vec::new();
+    let mut sent = 0;
+    while sent < refs.len() {
+        match send_batch_once(device, &refs[sent..], asynchronous) {
+            Ok(n) if n > 0 => {
+                counts.push(n);
+                sent += n;
+            }
+            other => panic!("send_batch at packet {sent} (async {asynchronous}): {other:?}"),
+        }
+    }
+    counts
+}
+
+/// The UDP payload of packet `k` of round `round`: `len` bytes.
+fn round_payload(round: u8, k: usize, len: usize) -> Vec<u8> {
+    let mut payload = vec![round, u8::try_from(k).expect("fewer than 256 packets")];
+    payload.extend((2..len).map(|i| (i * 13 + k) as u8));
+    payload
+}
+
+/// Addresses `device` with `subnet.1` and binds a host UDP socket there.
+fn host_udp_socket(device: &TunRsDevice, subnet: [u8; 3]) -> UdpSocket {
+    let name = device.snapshot().expect("snapshot").name;
+    route_traffic_into(DeviceKind::Tun, &name, subnet);
+    let [a, b, c] = subnet;
+    let host = UdpSocket::bind(format!("{a}.{b}.{c}.1:0")).expect("bind the host socket");
+    host.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set a read timeout");
+    host
+}
+
+/// Sends rounds of `count` UDP datagrams of `len` payload bytes from
+/// `subnet.2` to `host` through `device` with `send_batch`, until one round
+/// arrives (the first may be sent before the route is usable). Datagram `k`
+/// comes from source port `4000 + k % flows`, so `flows > 1` interleaves
+/// flows that cannot be coalesced. Each round's datagrams must arrive
+/// whole, in order, and from the right port; `check_counts` sees each
+/// round's `send_batch` counts.
+fn assert_udp_batch_arrives(
+    device: &TunRsDevice,
+    host: &UdpSocket,
+    subnet: [u8; 3],
+    shape: (usize, usize, u16),
+    check_counts: impl Fn(&[usize]),
+) {
+    let (count, len, flows) = shape;
+    let [a, b, c] = subnet;
+    let port = host.local_addr().expect("the host address").port();
+    let mut round: u8 = 0;
+    for &asynchronous in batch_modes() {
+        let mut arrived = false;
+        for _ in 0..10 {
+            round = round.wrapping_add(1);
+            let packets: Vec<Vec<u8>> = (0..count)
+                .map(|k| {
+                    let payload = round_payload(round, k, len);
+                    let flow = u16::try_from(k % usize::from(flows)).expect("few flows");
+                    let id = u16::from(round).wrapping_mul(1000).wrapping_add(k as u16);
+                    let l4 = udp_header(4000 + flow, port, len);
+                    ipv4_packet([a, b, c, 2], [a, b, c, 1], id, &l4, &payload)
+                })
+                .collect();
+            check_counts(&send_all(device, &packets, asynchronous));
+            let mut next = 0;
+            let mut buf = vec![0u8; 65_536];
+            while next < count {
+                let Ok((n, from)) = host.recv_from(&mut buf) else {
+                    break;
+                };
+                if buf.first() != Some(&round) {
+                    continue;
+                }
+                assert_eq!(
+                    &buf[..n],
+                    round_payload(round, next, len),
+                    "round {round} (async {asynchronous}): datagram {next}"
+                );
+                let flow = u16::try_from(next % usize::from(flows)).expect("few flows");
+                assert_eq!(from.port(), 4000 + flow, "datagram {next}");
+                next += 1;
+            }
+            assert!(
+                next == 0 || next == count,
+                "round {round} (async {asynchronous}): only {next} of {count} datagrams arrived"
+            );
+            if next == count {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived, "async {asynchronous}: no round arrived");
+    }
+}
+
+/// A batch of UDP datagrams of one flow sent with `send_batch` on an
+/// offload-framed queue reaches a host socket complete and in order,
+/// whether the kernel takes them as one super-packet (with USO) or one by
+/// one.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn a_udp_batch_reaches_the_host_whole_and_in_order() {
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    assert!(has_offload(&device));
+    eprintln!("udp_gso: {}", device.handle.udp_gso());
+    let subnet = [10, 210, subnet_octet()];
+    let host = host_udp_socket(&device, subnet);
+    assert_udp_batch_arrives(&device, &host, subnet, (32, GSO_SIZE, 1), |counts| {
+        assert_eq!(counts, [32], "one call sends a batch below the limit");
+    });
+}
+
+/// A batch of more than 128 packets is sent in short batches of at most
+/// 128: the first call reports exactly 128, and every packet arrives.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn a_batch_over_the_limit_is_sent_in_short_batches() {
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    let subnet = [10, 211, subnet_octet()];
+    let host = host_udp_socket(&device, subnet);
+    let count = crate::offload::MAX_SEGMENTS + 12;
+    assert_udp_batch_arrives(&device, &host, subnet, (count, 64, 1), |counts| {
+        assert_eq!(counts, [crate::offload::MAX_SEGMENTS, 12]);
+    });
+}
+
+/// Interleaved flows cannot be coalesced, so `send_batch` sends them one
+/// by one; they still arrive complete and in order.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device"]
+fn a_batch_of_interleaved_flows_is_sent_packet_by_packet() {
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    let subnet = [10, 212, subnet_octet()];
+    let host = host_udp_socket(&device, subnet);
+    assert_udp_batch_arrives(&device, &host, subnet, (24, 500, 2), |counts| {
+        assert_eq!(counts, [24]);
+    });
+}
+
+/// A raw IPv4 socket for TCP bound to one host address: it receives a
+/// copy of every TCP packet delivered to that address, before TCP itself
+/// sees it (which answers our unsolicited segments with resets, harmlessly).
+struct RawTcp(std::os::fd::OwnedFd);
+
+impl RawTcp {
+    fn bind(addr: [u8; 4]) -> Self {
+        use std::os::fd::FromRawFd;
+
+        // SAFETY: a plain `socket` call with constant arguments; it reads
+        // and writes no memory.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        assert!(
+            fd >= 0,
+            "create a raw TCP socket: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just returned by `socket` and is owned by
+        // nothing else; the `OwnedFd` closes it when dropped.
+        let socket = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let sin = libc::sockaddr_in {
+            sin_family: libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET fits"),
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: `sin` is a live, initialized `sockaddr_in`, and the length
+        // passed is its size; `bind` only reads it.
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                (&raw const sin).cast(),
+                libc::socklen_t::try_from(size_of::<libc::sockaddr_in>()).expect("a small size"),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "bind the raw socket: {}",
+            std::io::Error::last_os_error()
+        );
+        let timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 500_000,
+        };
+        // SAFETY: `SO_RCVTIMEO` reads one `timeval` from the pointer, which
+        // points at `timeout`, a live `timeval`, and the length passed is
+        // its size.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const timeout).cast(),
+                libc::socklen_t::try_from(size_of::<libc::timeval>()).expect("a small size"),
+            )
+        };
+        assert_eq!(rc, 0, "set a timeout: {}", std::io::Error::last_os_error());
+        socket
+    }
+
+    /// The next IPv4 packet, or `None` after the 500 ms timeout.
+    fn recv(&self, buf: &mut [u8]) -> Option<usize> {
+        // SAFETY: the descriptor is open for the call, and `buf` is
+        // `buf.len()` writable bytes that live across it.
+        let n = unsafe { libc::recv(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        usize::try_from(n).ok()
+    }
+}
+
+/// A batch of TCP segments of one flow sent with `send_batch` on an
+/// offload-framed queue reaches the host complete and in order: the data
+/// a raw socket sees for the flow, packet by packet (as one super-packet
+/// or several), is the byte stream sent, with contiguous sequence numbers.
+#[test]
+#[ignore = "requires CAP_NET_ADMIN to open and address a TUN device, and CAP_NET_RAW for a raw socket"]
+fn a_tcp_batch_reaches_the_host_whole_and_in_order() {
+    const COUNT: usize = 32;
+    const SEGMENT: usize = 1000;
+    const PORT: u16 = 9;
+    enter_runtime!();
+    let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
+    assert!(has_offload(&device));
+    let name = device.snapshot().expect("snapshot").name;
+    let subnet = [10, 213, subnet_octet()];
+    route_traffic_into(DeviceKind::Tun, &name, subnet);
+    let [a, b, c] = subnet;
+    let raw = RawTcp::bind([a, b, c, 1]);
+    let mut round: u8 = 0;
+    for &asynchronous in batch_modes() {
+        let mut arrived = false;
+        for _ in 0..10 {
+            round = round.wrapping_add(1);
+            let base = u32::from(round) * 1_000_000;
+            let stream: Vec<u8> = (0..COUNT)
+                .flat_map(|k| round_payload(round, k, SEGMENT))
+                .collect();
+            let packets: Vec<Vec<u8>> = stream
+                .chunks(SEGMENT)
+                .enumerate()
+                .map(|(k, payload)| {
+                    let offset = u32::try_from(k * SEGMENT).expect("a short stream");
+                    let l4 = tcp_header(4000, PORT, base + offset);
+                    let id = u16::from(round).wrapping_mul(1000).wrapping_add(k as u16);
+                    ipv4_packet([a, b, c, 2], [a, b, c, 1], id, &l4, payload)
+                })
+                .collect();
+            assert_eq!(send_all(&device, &packets, asynchronous), [COUNT]);
+
+            let mut received = Vec::new();
+            let mut buf = vec![0u8; 70_000];
+            while received.len() < stream.len() {
+                let Some(n) = raw.recv(&mut buf) else { break };
+                let packet = &buf[..n];
+                let ihl = usize::from(packet[0] & 0x0f) * 4;
+                let ours = packet.len() >= ihl + 20
+                    && packet[9] == 6
+                    && packet[12..16] == [a, b, c, 2]
+                    && packet[ihl..ihl + 2] == 4000u16.to_be_bytes()
+                    && packet[ihl + 2..ihl + 4] == PORT.to_be_bytes();
+                if !ours {
+                    continue;
+                }
+                let seq = u32::from_be_bytes(packet[ihl + 4..ihl + 8].try_into().unwrap());
+                let Some(offset) = seq.checked_sub(base) else {
+                    continue; // An earlier round.
+                };
+                let offset = usize::try_from(offset).expect("a small offset");
+                if offset >= stream.len() {
+                    continue;
+                }
+                let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+                let data_at = ihl + usize::from(packet[ihl + 12] >> 4) * 4;
+                assert_eq!(
+                    offset,
+                    received.len(),
+                    "round {round} (async {asynchronous}): a gap or reordering"
+                );
+                received.extend_from_slice(&packet[data_at..total.min(n)]);
+            }
+            assert!(
+                received.is_empty() || received == stream,
+                "round {round} (async {asynchronous}): {} of {} bytes arrived, or they differ",
+                received.len(),
+                stream.len()
+            );
+            if received == stream {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived, "{name} (async {asynchronous}): no round arrived");
+    }
 }
 
 /// A queue attached to a multi-queue device that already has a queue takes

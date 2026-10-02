@@ -219,8 +219,28 @@ impl TunRsBackend {
 ///   reach the caller and never spin.
 /// - `send` writes the packet behind an all-zero header (no checksum or
 ///   segmentation request), and returns the packet's length.
+/// - `send_batch` (sync and async) sends at most 128 packets per call, in
+///   order. A run of adjacent packets of one TCP flow (contiguous
+///   sequence numbers, the same headers otherwise, no SYN, FIN, RST, URG
+///   or CWR, PSH on the last packet only, valid checksums), or of one UDP
+///   flow with equal-sized datagrams when the kernel accepts UDP
+///   segmentation offload, goes out as one super-packet in a single
+///   gather write that copies no payload; the kernel splits it back into
+///   exactly those packets. Every other packet goes out alone, as with
+///   `send`. If the kernel refuses a super-packet (`EINVAL`), nothing of it
+///   was sent, and its packets are sent again one by one. `Ok(n)` means
+///   the first `n` packets were sent whole and in order; an error after at
+///   least one packet was sent is reported as that count, and the next
+///   call, starting at the packet that failed, returns the error, mapped as
+///   for `send`. A write that reports fewer bytes than it was given counts
+///   as a failed send of all its packets; the kernel writes a whole frame
+///   or nothing, so this does not happen in practice. A queue without
+///   offload framing sends a batch one packet at a time, without the
+///   128-packet limit, and so does every other OS and TAP.
 /// - An async `recv` dropped before it completes loses nothing: segments
-///   not yet returned stay in the staging buffer for the next `recv`.
+///   not yet returned stay in the staging buffer for the next `recv`. An
+///   async `send_batch` dropped before it completes has sent an unknown
+///   prefix of its packets, each whole and at most once.
 ///
 /// What the queue really uses is checked after every open and every
 /// `additional_queue`, because the kernel's header flag (`IFF_VNET_HDR`) is
@@ -711,6 +731,63 @@ impl TunRsDevice {
         }
         recv_contract::send_async(open_contract::HOST_OS, self.kind, || self.handle.send(buf)).await
     }
+
+    /// Blocking `send_batch`; see [`Self::blocking_recv`] for how the async
+    /// builds block. An offload-framed queue coalesces runs (see
+    /// `offload_queue`); a plain one sends the packets one by one, exactly
+    /// as the provided `PacketIo::send_batch` does.
+    #[cfg(target_os = "linux")]
+    fn blocking_send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
+        #[cfg(feature = "tokio")]
+        {
+            tokio::runtime::Handle::current().block_on(self.async_send_batch(packets))
+        }
+        #[cfg(all(feature = "async", not(feature = "tokio")))]
+        {
+            futures::executor::block_on(self.async_send_batch(packets))
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            if self.offload.is_none() {
+                for (sent, packet) in packets.iter().enumerate() {
+                    if let Err(error) = self.blocking_send(packet) {
+                        return if sent == 0 { Err(error) } else { Ok(sent) };
+                    }
+                }
+                return Ok(packets.len());
+            }
+            offload_queue::send_batch_blocking(
+                open_contract::HOST_OS,
+                self.kind,
+                packets,
+                self.handle.udp_gso(),
+                |iov| self.handle.send_vectored(iov),
+            )
+        }
+    }
+
+    /// Async `send_batch`: coalescing on an offload-framed queue (see
+    /// `offload_queue`), otherwise one `async_send` per packet, exactly as
+    /// the provided `AsyncPacketIo::send_batch` does.
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    async fn async_send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
+        if self.offload.is_none() {
+            for (sent, packet) in packets.iter().enumerate() {
+                if let Err(error) = self.async_send(packet).await {
+                    return if sent == 0 { Err(error) } else { Ok(sent) };
+                }
+            }
+            return Ok(packets.len());
+        }
+        offload_queue::send_batch_async(
+            open_contract::HOST_OS,
+            self.kind,
+            packets,
+            self.handle.udp_gso(),
+            &self.handle,
+        )
+        .await
+    }
 }
 
 /// One plain packet as an offload-framed queue's `writev` takes it: an
@@ -779,6 +856,15 @@ impl PacketIo for TunRsDevice {
     fn send(&self, buf: &[u8]) -> Result<usize> {
         self.blocking_send(buf)
     }
+
+    /// On an offload-framed Linux TUN queue, coalesces runs of adjacent
+    /// packets into fewer writes and sends at most 128 packets per call;
+    /// see [`TunRsDevice`], "Segmentation offload". Every other queue sends
+    /// the packets one by one, as the provided method does.
+    #[cfg(target_os = "linux")]
+    fn send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
+        self.blocking_send_batch(packets)
+    }
 }
 
 #[cfg(feature = "async")]
@@ -789,6 +875,15 @@ impl AsyncPacketIo for TunRsDevice {
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
         self.async_send(buf).await
+    }
+
+    /// As [`PacketIo::send_batch`] on this type. A future dropped before
+    /// it completes leaves an unknown prefix of `packets` sent, each packet
+    /// whole and at most once: the only awaits are the writes themselves,
+    /// and each write sends its packets whole or not at all.
+    #[cfg(target_os = "linux")]
+    async fn send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
+        self.async_send_batch(packets).await
     }
 }
 

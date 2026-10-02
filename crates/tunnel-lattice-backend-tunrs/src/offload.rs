@@ -860,10 +860,6 @@ pub(crate) struct Run {
     header_len: usize,
 }
 
-#[cfg_attr(
-    all(target_os = "linux", not(test)),
-    expect(dead_code, reason = "the batch-send path is not wired up yet")
-)]
 impl Run {
     /// How many packets from the head of the batch the run covers (2 to
     /// [`MAX_SEGMENTS`]).
@@ -903,10 +899,6 @@ impl Run {
 /// first, or would exceed [`MAX_SEGMENTS`] packets or 64 KiB (and any IP or
 /// UDP length field); it stops after a TCP packet with PSH and after any
 /// packet shorter than the first.
-#[cfg_attr(
-    all(target_os = "linux", not(test)),
-    expect(dead_code, reason = "the batch-send path is not wired up yet")
-)]
 pub(crate) fn plan_run(packets: &[&[u8]], udp_gso: bool) -> Option<Run> {
     let first: &[u8] = packets.first()?;
     let flow = coalescible(first)?;

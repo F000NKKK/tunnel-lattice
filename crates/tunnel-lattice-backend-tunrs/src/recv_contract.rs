@@ -26,6 +26,7 @@
 //! | Linux (send) | raw `EIO` (5): the device is administratively down (`apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | Linux, offload-framed TUN queue only (recv) | raw `EINVAL` (22): the kernel could not put a packet behind a virtio-net header (an unexpected GSO type) and has already freed it | retried ([`offload_recv_error_step`]) |
 //! | Linux, offload-framed TUN queue only (recv) | a frame that fails the virtio-net header and super-packet validation, or that filled the staging sentinel (longer than 64 KiB) | dropped, and the read retried (see `offload_queue`) |
+//! | Linux, offload-framed TUN queue only (`send_batch`, a coalesced run's write) | raw `EINVAL` (22): the kernel refused the run's virtio-net header and wrote nothing | not reported: the run's packets are written again one by one ([`is_refused_offload_write`]) |
 //! | Windows, TAP only (recv) | the first raw 995 (`ERROR_OPERATION_ABORTED`) in a call while the adapter's operational status reads `Up`: a read cancelled because the thread that issued it exited, on a healthy adapter | retried once ([`tap_abort_retries`]) |
 //! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`) otherwise (on `recv`: the status is not `Up`, the status read fails, or the call already retried): a call made while the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it; a read already waiting is not ended by it), or the adapter was disabled outside this crate | [`Error::InvalidState`] |
 //! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
@@ -33,7 +34,8 @@
 //! `WriteZero` and `EIO` are remapped on `send` only, so the same signal
 //! from any other operation keeps its generic meaning. The `EINVAL` retry
 //! applies to a read on an offload-framed queue only: on a plain queue, and
-//! on every `send`, `EINVAL` keeps its generic meaning. Neither offload
+//! on every other write (a plain `send`, or one packet of a batch),
+//! `EINVAL` keeps its generic meaning. Neither offload
 //! retry ever spins: each one is a packet the kernel produced and the read
 //! consumed, and the next read waits as usual. The Windows 995 rule
 //! takes the [`DeviceKind`] as well: it applies to a TAP handle only, on
@@ -228,6 +230,21 @@ pub(crate) fn offload_recv_error_step(os: HostOs, kind: DeviceKind, err: io::Err
     recv_step(os, kind, usize::MAX, Err(err), &mut false, || {
         Ok(AdminState::Unknown)
     })
+}
+
+/// Whether a failed write of a coalesced run (several packets as one GSO
+/// super-packet) on an offload-framed Linux TUN queue was refused whole:
+/// a raw `EINVAL`.
+///
+/// The kernel's `tun_get_user` returns `EINVAL` for a virtio-net header it
+/// cannot accept (a GSO type the device does not take, such as UDP on a
+/// kernel without USO), either before it builds the packet or by freeing
+/// the packet it built, so nothing of the run reached the network stack,
+/// and its packets can be written again one by one. Only a
+/// run's write is matched: for a single packet, `EINVAL` keeps its generic
+/// meaning through [`send_step`].
+pub(crate) fn is_refused_offload_write(os: HostOs, err: &io::Error) -> bool {
+    os == HostOs::Linux && err.raw_os_error() == Some(EINVAL)
 }
 
 /// Maps one native `send` attempt on a `kind` handle.

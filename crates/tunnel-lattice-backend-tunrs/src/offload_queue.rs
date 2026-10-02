@@ -34,14 +34,36 @@
 //! never await between a successful read and the return: a dropped `recv`
 //! future therefore never loses a frame it read, because its remaining
 //! segments stay in the staging buffer for the next `recv`.
+//!
+//! # Sending a batch on an offload-framed queue
+//!
+//! [`send_batch_blocking`] and `send_batch_async` send at most
+//! [`MAX_SEGMENTS`] packets per call, walking them in order. At each
+//! position, [`plan_run`] looks for a run of adjacent packets of one flow
+//! that the kernel will split back into exactly those packets (UDP only
+//! when the queue has USO); a run goes out as one gather write of the run
+//! header and each packet's payload, with no payload copied, and anything
+//! else as one packet behind an all-zero header. Results follow the
+//! `send_batch` prefix contract: `Ok(n)` means the first `n` packets were
+//! written whole, in order, and nothing after them; an error on the first
+//! write is returned as is; an error after `k > 0` packets gives `Ok(k)`.
+//!
+//! A raw `EINVAL` on a run's write means the kernel refused the header and
+//! wrote nothing (a kernel without USO, for example), so the run's packets
+//! are written again one by one. A write that reports fewer bytes than it
+//! was given is an error like any other failed write: the kernel's TUN
+//! write takes the whole frame or nothing, so this never happens on a real
+//! queue, but if it did, no packet of that write is counted as sent.
 
-use std::io;
+use std::io::{self, IoSlice};
 use std::sync::{Mutex, MutexGuard};
 
 use tunnel_lattice_core::{Error, Result};
 use tunnel_lattice_model::DeviceKind;
 
-use crate::offload::{STAGING_LEN, Segment, SplitCursor, VNET_HDR_LEN};
+use crate::offload::{
+    MAX_SEGMENTS, Run, STAGING_LEN, Segment, SplitCursor, VNET_HDR_LEN, VNET_HDR_NONE, plan_run,
+};
 use crate::open_contract::HostOs;
 use crate::recv_contract::{self, Step};
 
@@ -332,6 +354,225 @@ impl Staging {
     }
 }
 
+/// The most I/O slices one batch write uses: a run's header, then one
+/// payload per packet of the run.
+const BATCH_IOV: usize = MAX_SEGMENTS + 1;
+
+/// The error a batch write that reported fewer bytes than it was given
+/// becomes, before the `send` error rules map it (see the module docs).
+const SHORT_WRITE: &str = "short write to an offload-framed queue";
+
+/// One native write of a send batch.
+#[derive(Clone, Copy, Debug)]
+enum BatchWrite {
+    /// The next `run.count()` packets as one super-packet.
+    Run(Run),
+    /// The next packet alone, behind [`VNET_HDR_NONE`].
+    Single,
+}
+
+impl BatchWrite {
+    /// How many packets the write carries.
+    fn count(&self) -> usize {
+        match self {
+            Self::Run(run) => run.count(),
+            Self::Single => 1,
+        }
+    }
+
+    /// The length of the frame the write carries for the head of `rest`,
+    /// header included: what a complete write reports.
+    fn frame_len(&self, rest: &[&[u8]]) -> usize {
+        let packet_len = match self {
+            Self::Run(run) => run.total_len(),
+            Self::Single => rest.first().map_or(0, |packet| packet.len()),
+        };
+        VNET_HDR_LEN.saturating_add(packet_len)
+    }
+
+    /// Fills `iov` with what to write for the head of `rest` and returns
+    /// how many slices it used: the run header and each packet's payload,
+    /// or the all-zero header and the packet.
+    fn iovecs<'s>(&'s self, rest: &[&'s [u8]], iov: &mut [IoSlice<'s>; BATCH_IOV]) -> usize {
+        let mut used = 0;
+        let mut push = |slice: &'s [u8]| {
+            if let Some(entry) = iov.get_mut(used) {
+                *entry = IoSlice::new(slice);
+                used += 1;
+            }
+        };
+        match self {
+            Self::Run(run) => {
+                push(run.header());
+                for &packet in rest.iter().take(run.count()) {
+                    push(run.payload(packet));
+                }
+            }
+            Self::Single => {
+                push(&VNET_HDR_NONE);
+                push(rest.first().copied().unwrap_or_default());
+            }
+        }
+        used
+    }
+}
+
+/// The progress of one `send_batch` call on an offload-framed queue.
+struct BatchSend<'a, 'p> {
+    /// The packets this call may send: at most [`MAX_SEGMENTS`].
+    packets: &'a [&'p [u8]],
+    /// Whether the queue has USO, so UDP runs may be coalesced.
+    udp_gso: bool,
+    /// How many packets from the head were written whole.
+    sent: usize,
+    /// How many of the next packets go out one by one, because the kernel
+    /// refused their coalesced write.
+    singles: usize,
+}
+
+impl<'a, 'p> BatchSend<'a, 'p> {
+    fn new(packets: &'a [&'p [u8]], udp_gso: bool) -> Self {
+        Self {
+            packets: packets.get(..MAX_SEGMENTS).unwrap_or(packets),
+            udp_gso,
+            sent: 0,
+            singles: 0,
+        }
+    }
+
+    /// The packets not written yet.
+    fn rest(&self) -> &'a [&'p [u8]] {
+        self.packets.get(self.sent..).unwrap_or_default()
+    }
+
+    /// The next write, or `None` once every packet of the call is written.
+    fn next_write(&self) -> Option<BatchWrite> {
+        let rest = self.rest();
+        if rest.is_empty() {
+            return None;
+        }
+        if self.singles > 0 {
+            return Some(BatchWrite::Single);
+        }
+        Some(plan_run(rest, self.udp_gso).map_or(BatchWrite::Single, BatchWrite::Run))
+    }
+
+    /// Takes the `result` of `write`, which was given `expected` bytes.
+    /// `None` means "go on with the next write" (the same one again after
+    /// a transient error); `Some` is the call's result.
+    fn finish(
+        &mut self,
+        os: HostOs,
+        kind: DeviceKind,
+        write: &BatchWrite,
+        expected: usize,
+        result: io::Result<usize>,
+    ) -> Option<Result<usize>> {
+        let failure = match result {
+            Ok(written) if written == expected => {
+                self.sent = self.sent.saturating_add(write.count());
+                self.singles = self.singles.saturating_sub(write.count());
+                return None;
+            }
+            Ok(_) => io::Error::new(io::ErrorKind::WriteZero, SHORT_WRITE),
+            Err(err) => {
+                if let BatchWrite::Run(run) = write
+                    && recv_contract::is_refused_offload_write(os, &err)
+                {
+                    self.singles = run.count();
+                    return None;
+                }
+                err
+            }
+        };
+        match recv_contract::send_step(os, kind, Err(failure)) {
+            Step::Retry => None,
+            Step::Done(Err(err)) if self.sent == 0 => Some(Err(err)),
+            Step::Done(_) => Some(Ok(self.sent)),
+        }
+    }
+}
+
+/// Blocking `send_batch` on an offload-framed queue (see the module docs):
+/// `writev` is one blocking gather write to the queue.
+#[cfg_attr(
+    all(target_os = "linux", feature = "async", not(test)),
+    expect(dead_code, reason = "async builds block on `send_batch_async`")
+)]
+pub(crate) fn send_batch_blocking(
+    os: HostOs,
+    kind: DeviceKind,
+    packets: &[&[u8]],
+    udp_gso: bool,
+    mut writev: impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
+) -> Result<usize> {
+    let mut batch = BatchSend::new(packets, udp_gso);
+    while let Some(write) = batch.next_write() {
+        let mut iov = [IoSlice::new(&[]); BATCH_IOV];
+        let used = write.iovecs(batch.rest(), &mut iov);
+        let expected = write.frame_len(batch.rest());
+        let result = writev(iov.get(..used).unwrap_or_default());
+        if let Some(result) = batch.finish(os, kind, &write, expected, result) {
+            return result;
+        }
+    }
+    Ok(batch.sent)
+}
+
+/// One async gather write to a queue, as [`send_batch_async`] uses it.
+/// Compiled where an async handle exists, and for the unit tests.
+#[cfg(any(feature = "async", test))]
+pub(crate) trait AsyncGatherWrite {
+    /// Writes `bufs` as one frame, waiting for the queue to be writable.
+    /// Dropping the future before it completes writes nothing.
+    fn write_gather(
+        &self,
+        bufs: &[IoSlice<'_>],
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
+}
+
+#[cfg(all(target_os = "linux", feature = "async"))]
+impl AsyncGatherWrite for tun_rs::AsyncDevice {
+    fn write_gather(
+        &self,
+        bufs: &[IoSlice<'_>],
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+        self.send_vectored(bufs)
+    }
+}
+
+/// Async `send_batch` on an offload-framed queue (see the module docs).
+///
+/// The only await is each write itself, and nothing is locked. A future
+/// dropped before it completes has written an unknown prefix of
+/// `packets`: each write wrote its packets whole or not at all, and no
+/// packet was written twice.
+#[cfg(any(feature = "async", test))]
+pub(crate) async fn send_batch_async<W>(
+    os: HostOs,
+    kind: DeviceKind,
+    packets: &[&[u8]],
+    udp_gso: bool,
+    queue: &W,
+) -> Result<usize>
+where
+    W: AsyncGatherWrite + Sync + ?Sized,
+{
+    let mut batch = BatchSend::new(packets, udp_gso);
+    while let Some(write) = batch.next_write() {
+        let mut iov = [IoSlice::new(&[]); BATCH_IOV];
+        let used = write.iovecs(batch.rest(), &mut iov);
+        let expected = write.frame_len(batch.rest());
+        let result = queue
+            .write_gather(iov.get(..used).unwrap_or_default())
+            .await;
+        if let Some(result) = batch.finish(os, kind, &write, expected, result) {
+            return result;
+        }
+    }
+    Ok(batch.sent)
+}
+
 /// Hand-built offload frames shared by the receive tests here and in the
 /// async receive paths.
 #[cfg(test)]
@@ -376,6 +617,94 @@ pub(crate) mod test_frames {
         assert_eq!(&packet[28..], segment_payload(k, len), "segment {k}");
         let id = u16::from_be_bytes([packet[4], packet[5]]);
         assert_eq!(id, 7u16.wrapping_add(k as u16), "segment {k}");
+    }
+
+    /// TCP ACK, the flag every [`tcp4_packet`] of a run carries.
+    pub(crate) const TCP_ACK: u8 = 0x10;
+    /// TCP PSH, which ends a coalesced run.
+    pub(crate) const TCP_PSH: u8 = 0x08;
+
+    /// Fills in the IPv4 total length and header checksum and the L4
+    /// checksum of an IPv4 packet with a 20-byte header.
+    fn finish_ipv4(mut packet: Vec<u8>, csum_offset: usize) -> Vec<u8> {
+        use crate::offload::{checksum, sum_words};
+
+        let total = u16::try_from(packet.len()).expect("a short packet");
+        packet[2..4].copy_from_slice(&total.to_be_bytes());
+        let ip_sum = checksum(&packet[..20], 0);
+        packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+        let l4_len = u16::try_from(packet.len() - 20).expect("a short packet");
+        let [l0, l1] = l4_len.to_be_bytes();
+        let pseudo = sum_words(&[0, packet[9], l0, l1], sum_words(&packet[12..20], 0));
+        let l4_sum = match checksum(&packet[20..], pseudo) {
+            0 if packet[9] == 17 => 0xffff,
+            sum => sum,
+        };
+        packet[20 + csum_offset..22 + csum_offset].copy_from_slice(&l4_sum.to_be_bytes());
+        packet
+    }
+
+    /// An IPv4/UDP packet 10.0.0.1:`sport` → 10.0.0.2:4789 with IPv4 id
+    /// `id`, carrying `payload`, with valid checksums.
+    pub(crate) fn udp4_packet(id: u16, sport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x45, 0, 0, 0];
+        packet.extend_from_slice(&id.to_be_bytes());
+        packet.extend_from_slice(&[0x40, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+        packet.extend_from_slice(&sport.to_be_bytes());
+        packet.extend_from_slice(&4789u16.to_be_bytes());
+        let udp_len = u16::try_from(8 + payload.len()).expect("a short payload");
+        packet.extend_from_slice(&udp_len.to_be_bytes());
+        packet.extend_from_slice(&[0, 0]);
+        packet.extend_from_slice(payload);
+        finish_ipv4(packet, 6)
+    }
+
+    /// An IPv4/TCP packet 10.0.0.1:40000 → 10.0.0.2:5201 (20-byte headers)
+    /// with IPv4 id `id`, sequence number `seq` and `flags`, carrying
+    /// `payload`, with valid checksums.
+    pub(crate) fn tcp4_packet(id: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x45, 0, 0, 0];
+        packet.extend_from_slice(&id.to_be_bytes());
+        packet.extend_from_slice(&[0x40, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]);
+        packet.extend_from_slice(&40000u16.to_be_bytes());
+        packet.extend_from_slice(&5201u16.to_be_bytes());
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&1u32.to_be_bytes());
+        packet.extend_from_slice(&[0x50, flags, 0x20, 0, 0, 0, 0, 0]);
+        packet.extend_from_slice(payload);
+        finish_ipv4(packet, 16)
+    }
+
+    /// `count` packets of one TCP flow that coalesce into one run: `len`
+    /// payload bytes each, contiguous sequence numbers, consecutive ids,
+    /// and PSH on the last one only.
+    pub(crate) fn tcp4_flow(count: usize, len: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|k| {
+                let flags = if k + 1 == count {
+                    TCP_ACK | TCP_PSH
+                } else {
+                    TCP_ACK
+                };
+                let id = 100u16.wrapping_add(k as u16);
+                let seq = 1000u32.wrapping_add((k * len) as u32);
+                tcp4_packet(id, seq, flags, &segment_payload(k, len))
+            })
+            .collect()
+    }
+
+    /// Splits one written frame back into its IP packets, as the kernel
+    /// would on the receiving side.
+    pub(crate) fn split(frame: &[u8]) -> Vec<Vec<u8>> {
+        use crate::offload::{Segment, SplitCursor};
+
+        let mut cursor = SplitCursor::new(frame).expect("a valid frame");
+        let mut packets = Vec::new();
+        let mut out = vec![0u8; 65_536];
+        while let Segment::Packet(len) = cursor.write_next(frame, &mut out).expect("a segment") {
+            packets.push(out[..len].to_vec());
+        }
+        packets
     }
 }
 
@@ -582,6 +911,490 @@ mod tests {
         let len = recv(&rx, &mut reads, &mut out).unwrap();
         assert_segment(&out[..len], 0, 100);
         assert!(!rx.0.is_poisoned());
+    }
+}
+
+/// The batch send over a scripted queue, through both the blocking and the
+/// async driver.
+#[cfg(test)]
+mod batch_tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    use tunnel_lattice_core::PlatformErrorCode;
+
+    use super::test_frames::{
+        TCP_ACK, segment_payload, split, tcp4_flow, tcp4_packet, udp4_packet,
+    };
+    use super::*;
+
+    const TUN: DeviceKind = DeviceKind::Tun;
+    const EIO: i32 = 5;
+    const EINTR: i32 = 4;
+    const EINVAL: i32 = 22;
+    const EBADFD: i32 = 77;
+
+    /// What the queue does with one write.
+    #[derive(Clone, Copy, Debug)]
+    enum Reply {
+        /// Takes the whole frame.
+        Full,
+        /// Reports one byte fewer than it was given, and records nothing.
+        Short,
+        /// Fails with this raw OS error, writing nothing.
+        Fail(i32),
+        /// Never completes (async only), writing nothing.
+        Pending,
+    }
+
+    /// A queue that answers each write with the next scripted reply (then
+    /// `Full`), and records every frame it took whole.
+    struct Queue {
+        replies: Mutex<VecDeque<Reply>>,
+        frames: Mutex<Vec<Vec<u8>>>,
+        writes: Mutex<usize>,
+    }
+
+    impl Queue {
+        fn new(replies: impl IntoIterator<Item = Reply>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into_iter().collect()),
+                frames: Mutex::new(Vec::new()),
+                writes: Mutex::new(0),
+            }
+        }
+
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.frames.lock().unwrap().clone()
+        }
+
+        fn writes(&self) -> usize {
+            *self.writes.lock().unwrap()
+        }
+
+        /// One write; `None` while the scripted reply is `Pending`.
+        fn write(&self, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
+            let mut replies = self.replies.lock().unwrap();
+            let reply = replies.front().copied().unwrap_or(Reply::Full);
+            if let Reply::Pending = reply {
+                return None;
+            }
+            replies.pop_front();
+            *self.writes.lock().unwrap() += 1;
+            let frame: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+            Some(match reply {
+                Reply::Full => {
+                    let len = frame.len();
+                    self.frames.lock().unwrap().push(frame);
+                    Ok(len)
+                }
+                Reply::Short => Ok(frame.len() - 1),
+                Reply::Fail(code) => Err(io::Error::from_raw_os_error(code)),
+                Reply::Pending => unreachable!(),
+            })
+        }
+    }
+
+    impl AsyncGatherWrite for Queue {
+        /// Decides only when polled, so a future dropped while `Pending`
+        /// wrote nothing.
+        fn write_gather(
+            &self,
+            bufs: &[IoSlice<'_>],
+        ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+            std::future::poll_fn(move |_| match self.write(bufs) {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            })
+        }
+    }
+
+    fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
+        pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Sends `packets` through the blocking driver and, on a fresh copy of
+    /// the script, through the async one; checks both agree and returns
+    /// the result and the frames written.
+    fn send(
+        replies: &[Reply],
+        packets: &[Vec<u8>],
+        udp_gso: bool,
+    ) -> (Result<usize>, Vec<Vec<u8>>) {
+        let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        let sync_queue = Queue::new(replies.iter().copied());
+        let sync = send_batch_blocking(HostOs::Linux, TUN, &refs, udp_gso, |iov| {
+            sync_queue
+                .write(iov)
+                .expect("no pending reply in a blocking test")
+        });
+        let async_queue = Queue::new(replies.iter().copied());
+        let Poll::Ready(asynchronous) = poll_once(send_batch_async(
+            HostOs::Linux,
+            TUN,
+            &refs,
+            udp_gso,
+            &async_queue,
+        )) else {
+            panic!("the scripted queue never waits here");
+        };
+        assert_eq!(
+            format!("{sync:?}"),
+            format!("{asynchronous:?}"),
+            "both drivers agree"
+        );
+        assert_eq!(sync_queue.frames(), async_queue.frames());
+        assert_eq!(sync_queue.writes(), async_queue.writes());
+        (sync, sync_queue.frames())
+    }
+
+    /// The packets the frames carry, in order.
+    fn unframe(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        frames.iter().flat_map(|frame| split(frame)).collect()
+    }
+
+    /// One frame per packet, each behind the all-zero header.
+    fn singles(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        packets
+            .iter()
+            .map(|packet| [VNET_HDR_NONE.as_slice(), packet].concat())
+            .collect()
+    }
+
+    /// `count` UDP packets of one flow, `len` payload bytes each.
+    fn udp_flow(count: usize, len: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|k| udp4_packet(7u16.wrapping_add(k as u16), 40000, &segment_payload(k, len)))
+            .collect()
+    }
+
+    /// Packets that never coalesce: each from another UDP source port.
+    fn mixed_flows(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|k| udp4_packet(7, 40000 + k as u16, &segment_payload(k, 100)))
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_batch_writes_nothing() {
+        let (result, frames) = send(&[Reply::Fail(EIO)], &[], true);
+        assert_eq!(result.unwrap(), 0);
+        assert!(frames.is_empty());
+    }
+
+    /// A TCP run is one write of the run header and the payloads, which the
+    /// kernel splits back into exactly the packets sent.
+    #[test]
+    fn a_tcp_run_is_one_write() {
+        let packets = tcp4_flow(6, 700);
+        for udp_gso in [false, true] {
+            let (result, frames) = send(&[], &packets, udp_gso);
+            assert_eq!(result.unwrap(), 6);
+            assert_eq!(frames.len(), 1, "one write for the run");
+            assert_eq!(frames[0].len(), VNET_HDR_LEN + 40 + 6 * 700);
+            assert_eq!(unframe(&frames), packets);
+        }
+    }
+
+    /// A UDP run is coalesced only on a queue with USO; without it every
+    /// datagram goes out alone behind the all-zero header.
+    #[test]
+    fn a_udp_run_needs_uso() {
+        let packets = udp_flow(5, 500);
+        let (result, frames) = send(&[], &packets, true);
+        assert_eq!(result.unwrap(), 5);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(unframe(&frames), packets);
+
+        let (result, frames) = send(&[], &packets, false);
+        assert_eq!(result.unwrap(), 5);
+        assert_eq!(frames, singles(&packets));
+    }
+
+    /// Packets that do not coalesce go out one by one, in order, and runs
+    /// form again wherever they can.
+    #[test]
+    fn mixed_flows_go_out_one_by_one() {
+        let packets = mixed_flows(6);
+        let (result, frames) = send(&[], &packets, true);
+        assert_eq!(result.unwrap(), 6);
+        assert_eq!(frames, singles(&packets));
+
+        let mut packets = mixed_flows(1);
+        packets.extend(tcp4_flow(3, 100));
+        packets.extend(mixed_flows(2));
+        let (result, frames) = send(&[], &packets, true);
+        assert_eq!(result.unwrap(), 6);
+        assert_eq!(frames.len(), 4, "single, run of 3, single, single");
+        assert_eq!(unframe(&frames), packets);
+    }
+
+    /// A call sends at most `MAX_SEGMENTS` packets, coalesced or not; the
+    /// caller sends the rest with the next call.
+    #[test]
+    fn a_call_sends_at_most_max_segments() {
+        let total = MAX_SEGMENTS + 72;
+        let packets = udp_flow(total, 10);
+        let (result, frames) = send(&[], &packets, true);
+        assert_eq!(result.unwrap(), MAX_SEGMENTS);
+        assert_eq!(frames.len(), 1, "one run of MAX_SEGMENTS");
+        assert_eq!(unframe(&frames), packets[..MAX_SEGMENTS]);
+        let (result, frames) = send(&[], &packets[MAX_SEGMENTS..], true);
+        assert_eq!(result.unwrap(), 72);
+        assert_eq!(unframe(&frames), packets[MAX_SEGMENTS..]);
+
+        let packets = mixed_flows(total);
+        let (result, frames) = send(&[], &packets, true);
+        assert_eq!(result.unwrap(), MAX_SEGMENTS);
+        assert_eq!(frames, singles(&packets[..MAX_SEGMENTS]));
+    }
+
+    /// A run the kernel refuses (`EINVAL`) wrote nothing: its packets are
+    /// written again one by one, and the batch goes on after them.
+    #[test]
+    fn a_refused_run_is_resent_packet_by_packet() {
+        let mut packets = tcp4_flow(4, 300);
+        packets.extend(tcp4_flow(3, 200).into_iter().map(|mut packet| {
+            packet[23] ^= 1; // another destination port: a second flow
+            packet
+        }));
+        // The changed port invalidates the second flow's checksums, so its
+        // packets go out one by one; only the first run is refused.
+        let (result, frames) = send(&[Reply::Fail(EINVAL)], &packets, true);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(frames, singles(&packets));
+
+        // Refused, then the first single fails: nothing was sent.
+        let packets = tcp4_flow(4, 300);
+        let (result, frames) = send(&[Reply::Fail(EINVAL), Reply::Fail(EIO)], &packets, true);
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+        assert!(frames.is_empty());
+
+        // Refused, two singles sent, then a failure: the sent prefix.
+        let replies = [
+            Reply::Fail(EINVAL),
+            Reply::Full,
+            Reply::Full,
+            Reply::Fail(EBADFD),
+        ];
+        let (result, frames) = send(&replies, &packets, true);
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(frames, singles(&packets[..2]));
+    }
+
+    /// A failure on the first write is the call's error, mapped like a
+    /// `send` error; after `k` packets were written it is `Ok(k)`, and the
+    /// next call, starting at the failed packet, reports the error.
+    #[test]
+    fn errors_follow_the_prefix_contract() {
+        let packets = mixed_flows(4);
+        let (result, frames) = send(&[Reply::Fail(EBADFD)], &packets, true);
+        assert!(matches!(result, Err(Error::Disconnected)), "{result:?}");
+        assert!(frames.is_empty());
+
+        let replies = [Reply::Full, Reply::Full, Reply::Fail(EIO)];
+        let (result, frames) = send(&replies, &packets, true);
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(frames, singles(&packets[..2]));
+        let (result, _) = send(&[Reply::Fail(EIO)], &packets[2..], true);
+        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
+
+        // A run, then a failure: the run's packets were sent.
+        let mut packets = tcp4_flow(3, 100);
+        packets.extend(mixed_flows(2));
+        let (result, frames) = send(&[Reply::Full, Reply::Fail(EIO)], &packets, true);
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(unframe(&frames), packets[..3]);
+    }
+
+    /// `EINVAL` on a single packet is not a refused run: it keeps its
+    /// generic meaning, and nothing is retried.
+    #[test]
+    fn einval_on_a_single_packet_is_an_error() {
+        let packets = mixed_flows(2);
+        let (result, frames) = send(&[Reply::Fail(EINVAL)], &packets, true);
+        assert!(matches!(result, Err(Error::Platform(_))), "{result:?}");
+        assert!(frames.is_empty());
+        let queue = Queue::new([Reply::Fail(EINVAL)]);
+        let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        let _ = send_batch_blocking(HostOs::Linux, TUN, &refs, true, |iov| {
+            queue.write(iov).unwrap()
+        });
+        assert_eq!(queue.writes(), 1);
+    }
+
+    /// `EINTR` repeats the same write, for a run and for a single packet.
+    #[test]
+    fn eintr_repeats_the_write() {
+        let mut packets = tcp4_flow(3, 100);
+        packets.extend(mixed_flows(1));
+        let replies = [Reply::Fail(EINTR), Reply::Full, Reply::Fail(EINTR)];
+        let (result, frames) = send(&replies, &packets, true);
+        assert_eq!(result.unwrap(), 4);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(unframe(&frames), packets);
+    }
+
+    /// A write that reports fewer bytes than it was given fails like any
+    /// other write: none of its packets counts as sent.
+    #[test]
+    fn a_short_write_is_an_error() {
+        let packets = tcp4_flow(3, 100);
+        let (result, _) = send(&[Reply::Short], &packets, true);
+        assert!(
+            matches!(result, Err(Error::Platform(PlatformErrorCode::Unknown))),
+            "{result:?}"
+        );
+        let packets = mixed_flows(3);
+        let (result, frames) = send(&[Reply::Full, Reply::Short], &packets, true);
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(frames, singles(&packets[..1]));
+    }
+
+    /// An async batch dropped while a write waits has written a prefix of
+    /// whole packets: here the first packet, alone, then nothing of the
+    /// run it was waiting to write.
+    #[test]
+    fn a_dropped_async_batch_leaves_a_whole_prefix() {
+        let mut packets = mixed_flows(1);
+        packets.extend(tcp4_flow(3, 100));
+        let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        let queue = Queue::new([Reply::Full, Reply::Pending]);
+        let pending = poll_once(send_batch_async(HostOs::Linux, TUN, &refs, true, &queue));
+        assert!(pending.is_pending());
+        assert_eq!(queue.frames(), singles(&packets[..1]));
+
+        // The caller resumes after the sent prefix; nothing is written twice.
+        queue.replies.lock().unwrap().clear();
+        let Poll::Ready(result) = poll_once(send_batch_async(
+            HostOs::Linux,
+            TUN,
+            &refs[1..],
+            true,
+            &queue,
+        )) else {
+            panic!("the queue no longer waits");
+        };
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(unframe(&queue.frames()), packets);
+    }
+
+    /// The run header and payload slices are passed to the write as they
+    /// are: one slice for the header, then one per packet, no copies.
+    #[test]
+    fn a_run_is_written_as_header_and_payload_slices() {
+        let packets = tcp4_flow(3, 100);
+        let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        let mut seen = Vec::new();
+        let result = send_batch_blocking(HostOs::Linux, TUN, &refs, true, |iov| {
+            seen = iov
+                .iter()
+                .map(|slice| (slice.as_ptr(), slice.len()))
+                .collect();
+            Ok(iov.iter().map(|slice| slice.len()).sum())
+        });
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0].1, VNET_HDR_LEN + 40);
+        for (k, packet) in packets.iter().enumerate() {
+            assert_eq!(seen[k + 1], (packet[40..].as_ptr(), 100), "payload {k}");
+        }
+        // A packet that cannot coalesce is the zero header and the packet.
+        let lone = tcp4_packet(1, 1, TCP_ACK, b"x");
+        let result = send_batch_blocking(HostOs::Linux, TUN, &[&lone], true, |iov| {
+            seen = iov
+                .iter()
+                .map(|slice| (slice.as_ptr(), slice.len()))
+                .collect();
+            Ok(iov.iter().map(|slice| slice.len()).sum())
+        });
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].1, VNET_HDR_LEN);
+        assert_eq!(seen[1], (lone.as_ptr(), 41), "the packet itself");
+    }
+}
+
+/// The batch send through real `tun-rs` handles over a datagram socket
+/// standing in for an offload-framed queue (one datagram per write, like a
+/// tun write).
+#[cfg(all(test, target_os = "linux"))]
+mod batch_handle_tests {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixDatagram;
+
+    use super::test_frames::{split, tcp4_flow, udp4_packet};
+    use super::*;
+
+    /// A datagram pair: ours is handed to `tun-rs`, the peer reads.
+    fn pair() -> (std::os::fd::RawFd, UnixDatagram) {
+        let (ours, theirs) = UnixDatagram::pair().expect("create a datagram pair");
+        ours.set_nonblocking(true).expect("make it non-blocking");
+        theirs
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("set a read timeout");
+        (ours.into_raw_fd(), theirs)
+    }
+
+    /// A TCP run then a lone UDP packet: two writes, which the peer reads
+    /// as two frames that split back into the packets sent.
+    fn batch() -> Vec<Vec<u8>> {
+        let mut packets = tcp4_flow(5, 500);
+        packets.push(udp4_packet(1, 1, b"lone"));
+        packets
+    }
+
+    fn assert_received(peer: &UnixDatagram, packets: &[Vec<u8>]) {
+        let mut buf = vec![0u8; 65_536];
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let n = peer.recv(&mut buf).expect("a frame");
+            received.extend(split(&buf[..n]));
+        }
+        assert_eq!(received, packets);
+    }
+
+    #[cfg(not(feature = "async"))]
+    #[test]
+    fn a_sync_handle_writes_runs_and_singles() {
+        let (fd, peer) = pair();
+        // SAFETY: `fd` is an open descriptor whose sole ownership passes to
+        // the handle, which closes it when dropped.
+        let device = unsafe { tun_rs::SyncDevice::from_fd(fd) }.expect("wrap the descriptor");
+        let packets = batch();
+        let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        let sent = send_batch_blocking(HostOs::Linux, DeviceKind::Tun, &refs, true, |iov| {
+            device.send_vectored(iov)
+        });
+        assert_eq!(sent.unwrap(), packets.len());
+        assert_received(&peer, &packets);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn an_async_handle_writes_runs_and_singles() {
+        let (fd, peer) = pair();
+        let packets = batch();
+        let send = async {
+            // SAFETY: `fd` is an open descriptor whose sole ownership
+            // passes to the handle, which closes it when dropped.
+            let device = unsafe { tun_rs::AsyncDevice::from_fd(fd) }.expect("wrap the descriptor");
+            let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+            send_batch_async(HostOs::Linux, DeviceKind::Tun, &refs, true, &device).await
+        };
+        #[cfg(feature = "tokio")]
+        let sent = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("build a Tokio runtime")
+            .block_on(send);
+        #[cfg(not(feature = "tokio"))]
+        let sent = futures::executor::block_on(send);
+        assert_eq!(sent.unwrap(), packets.len());
+        assert_received(&peer, &packets);
     }
 }
 
