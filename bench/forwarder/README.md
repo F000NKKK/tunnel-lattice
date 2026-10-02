@@ -74,14 +74,33 @@ features.
 | `tl-async-tokio-shared-pool` | tokio | as above, but both directions receive into one shared `PacketPool` of 256 slots (`packet_stream_with_pool`) | `tunrs-async-tokio` |
 | `tunrs-async-asyncio` | async-io | `tun_rs::AsyncDevice`, one `async_io::block_on` thread per direction | — |
 | `tl-async-asyncio` | async-io | facade `packet_stream` + `send_async`, one `async_io::block_on` thread per direction | `tunrs-async-asyncio` |
+| `tunrs-sync-offload` | sync | `tunrs-sync --offload`: `offload(true)`, `recv_multiple`/`send_multiple` with 128 preallocated buffers and a `GROTable` per thread | — |
+| `tl-sync-offload` | sync | `tl-sync --offload`: `with_offload(true)`; `Handle::recv` splits each kernel super-packet, `Handle::send` writes one packet per call | `tunrs-sync-offload` |
+| `tunrs-async-tokio-offload` | tokio | `tunrs-async-tokio --offload`: as `tunrs-sync-offload`, one Tokio task per direction | — |
+| `tl-async-tokio-offload` | tokio | `tl-async-tokio --offload`: `with_offload(true)`; `packet_stream` to receive, then every packet already ready (up to 128) in one `Handle::send_batch_async` | `tunrs-async-tokio-offload` |
+| `tunrs-async-asyncio-offload` | async-io | `tunrs-async-asyncio --offload`, one `async_io::block_on` thread per direction | — |
+| `tl-async-asyncio-offload` | async-io | `tl-async-asyncio --offload`, as `tl-async-tokio-offload` on async-io | `tunrs-async-asyncio-offload` |
 
 The `tunnel-lattice` variants use the public facade only. The raw tun-rs
 variants assign their addresses themselves, as tun-benchmark2 does. The
 script assigns the same addresses for every variant, because
 `tunnel-lattice` has no address API.
 
+The offload rows open both devices with Linux TUN segmentation offload, so
+the kernel hands the forwarder TCP super-packets of up to 64 KiB and
+accepts coalesced ones back. Each `tunnel-lattice` offload row is compared
+with tun-rs's own offload path in the same build set; compare its
+throughput with the plain row of the same binary for the gain from offload
+itself. A forwarder started with `--offload` exits with an error if the
+device did not grant offload (`Capability::SEGMENTATION_OFFLOAD` for
+`tunnel-lattice`, `tcp_gso()` for tun-rs), so an offload row can never
+silently measure the plain path. The sync `tunnel-lattice` row has no
+batch send: a blocking loop cannot tell whether another packet is ready
+without waiting for it, and `tunnel-lattice` has no batch receive, so that
+row measures the receive-side split alone.
+
 Every forwarder accepts the same command line:
-`--iface1 <name> --ip1 <ipv4> --iface2 <name> --ip2 <ipv4> [--threads N] [--mtu M]`.
+`--iface1 <name> --ip1 <ipv4> --iface2 <name> --ip2 <ipv4> [--threads N] [--mtu M] [--offload]`.
 It prints `ready <iface1> <iface2>` once both devices are open, and exits
 the whole process on any unexpected receive or send error, so a failed copy
 loop can never be recorded as a low number.
@@ -113,9 +132,10 @@ files next to it (`runs/<variant>/<rep>/iperf3.json`, `samples.tsv`,
 `forwarder.log`, `run.json`), and the table footer records the commit,
 versions, host and method.
 
-While tun-rs is the only backend, tunnel-lattice can at best match tun-rs
-minus its own overhead. Going faster needs batch/offload I/O and native
-per-OS backends.
+While tun-rs is the only backend, a plain tunnel-lattice row can at best
+match tun-rs minus its own overhead. The offload rows show what Linux TUN
+segmentation offload adds on top; going further needs native per-OS
+backends.
 
 ## Development
 

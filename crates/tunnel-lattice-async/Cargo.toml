@@ -32,6 +32,12 @@ harness = false
 name = "pool"
 harness = false
 
+# The provided per-packet `send_batch` path at several batch sizes, over an
+# in-memory sink (no privilege, no real device).
+[[bench]]
+name = "batch_send"
+harness = false
+
 # Counts heap allocations per received packet with a counting global
 # allocator, which needs its own binary (no libtest harness allocating
 # concurrently on the main thread).

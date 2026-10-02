@@ -6,7 +6,10 @@
 # offload (0|1), family, mode, runtime, layer, buffers, label.
 #
 # A baseline row (baseline "-") is raw tun-rs; every other row is compared
-# with the baseline it names, measured in the same repetition.
+# with the baseline it names, measured in the same repetition. Offload rows
+# (args --offload, offload 1) open both devices with Linux TUN segmentation
+# offload; each tunnel-lattice offload row is compared with the raw tun-rs
+# offload row of its build set, and with its plain row by throughput.
 tunrs-sync	sync	tunrs-sync	-	-	0	tun-rs	sync	threads	tun-rs	stack-64k	tun-rs sync
 tl-sync	sync	tl-sync	-	tunrs-sync	0	tunnel-lattice	sync	threads	facade	recv-buffer-len	tunnel-lattice sync (Handle::recv/send)
 tunrs-async-tokio	tokio	tunrs-async-tokio	-	-	0	tun-rs	async	tokio	tun-rs	vec-64k	tun-rs async (Tokio)
@@ -14,3 +17,9 @@ tl-async-tokio	tokio	tl-async-tokio	-	tunrs-async-tokio	0	tunnel-lattice	async	t
 tl-async-tokio-shared-pool	tokio	tl-async-tokio-shared-pool	-	tunrs-async-tokio	0	tunnel-lattice	async	tokio	facade	pool-shared-256	tunnel-lattice async (Tokio, one shared PacketPool)
 tunrs-async-asyncio	async-io	tunrs-async-asyncio	-	-	0	tun-rs	async	async-io	tun-rs	vec-64k	tun-rs async (async-io)
 tl-async-asyncio	async-io	tl-async-asyncio	-	tunrs-async-asyncio	0	tunnel-lattice	async	async-io	facade	pool-default	tunnel-lattice async (async-io, packet_stream + send_async)
+tunrs-sync-offload	sync	tunrs-sync	--offload	-	1	tun-rs	sync	threads	tun-rs	batch-128	tun-rs sync offload (recv_multiple/send_multiple)
+tl-sync-offload	sync	tl-sync	--offload	tunrs-sync-offload	1	tunnel-lattice	sync	threads	facade	recv-buffer-len	tunnel-lattice sync offload (Handle::recv split, per-packet Handle::send)
+tunrs-async-tokio-offload	tokio	tunrs-async-tokio	--offload	-	1	tun-rs	async	tokio	tun-rs	batch-128	tun-rs async offload (Tokio, recv_multiple/send_multiple)
+tl-async-tokio-offload	tokio	tl-async-tokio	--offload	tunrs-async-tokio-offload	1	tunnel-lattice	async	tokio	facade	pool-default	tunnel-lattice async offload (Tokio, packet_stream + send_batch_async)
+tunrs-async-asyncio-offload	async-io	tunrs-async-asyncio	--offload	-	1	tun-rs	async	async-io	tun-rs	batch-128	tun-rs async offload (async-io, recv_multiple/send_multiple)
+tl-async-asyncio-offload	async-io	tl-async-asyncio	--offload	tunrs-async-asyncio-offload	1	tunnel-lattice	async	async-io	facade	pool-default	tunnel-lattice async offload (async-io, packet_stream + send_batch_async)

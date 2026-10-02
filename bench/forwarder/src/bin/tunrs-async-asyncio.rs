@@ -4,6 +4,10 @@
 //! tun-benchmark2 has no async-io forwarder; this gives the async-io
 //! tunnel-lattice row a baseline on the same runtime. `--threads` is
 //! ignored.
+//!
+//! With `--offload`, both devices are built with `offload(true)` and each
+//! thread uses `recv_multiple`/`send_multiple` with its own preallocated
+//! batch buffers and `GROTable`.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -15,7 +19,8 @@ fn main() {
     ready(&args);
     let threads = [(dev1.clone(), dev2.clone(), "1->2"), (dev2, dev1, "2->1")].map(
         |(src, dst, direction)| {
-            std::thread::spawn(move || async_io::block_on(tunrs(src, dst, direction)))
+            let offload = args.offload;
+            std::thread::spawn(move || async_io::block_on(tunrs(src, dst, direction, offload)))
         },
     );
     for thread in threads {

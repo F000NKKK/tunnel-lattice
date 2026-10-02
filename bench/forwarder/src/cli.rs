@@ -4,12 +4,19 @@
 //! tun-benchmark2's forwarders:
 //!
 //! ```text
-//! --iface1 <name> --ip1 <ipv4> --iface2 <name> --ip2 <ipv4> [--threads N] [--mtu M]
+//! --iface1 <name> --ip1 <ipv4> --iface2 <name> --ip2 <ipv4> [--threads N] [--mtu M] [--offload]
 //! ```
 //!
 //! The raw tun-rs binaries assign `--ip1`/`--ip2` (prefix 24) themselves.
 //! The tunnel-lattice binaries accept but ignore them: tunnel-lattice has
 //! no address API, so the run script assigns addresses for every variant.
+//!
+//! `--offload` (no value) opens both devices with Linux TUN segmentation
+//! offload and switches every binary to its batch/offload loop: tun-rs's
+//! `recv_multiple`/`send_multiple`, or the tunnel-lattice facade's `recv`
+//! (which splits the kernel's super-packets) with `send_batch`. A binary
+//! exits with an error if the device did not grant offload, so a run can
+//! never silently measure the plain path under an offload label.
 
 use std::fmt;
 use std::io::Write;
@@ -18,6 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default MTU of both devices, matching the run script.
 pub const DEFAULT_MTU: u16 = 1500;
+
+/// Most packets one `--offload` copy loop hands to a single batch send:
+/// tun-rs's `IDEAL_BATCH_SIZE`, and the most packets the tunnel-lattice
+/// tun-rs backend's `send_batch` accepts per call.
+pub const OFFLOAD_BATCH: usize = 128;
 
 /// Exit code of a forwarder binary built for a platform other than Linux.
 pub const EXIT_UNSUPPORTED: i32 = 2;
@@ -38,6 +50,8 @@ pub struct Args {
     pub threads: Option<usize>,
     /// MTU of both devices.
     pub mtu: u16,
+    /// Open with segmentation offload and use the batch/offload loop.
+    pub offload: bool,
 }
 
 /// A rejected command line.
@@ -58,7 +72,8 @@ impl Args {
     /// # Errors
     ///
     /// A missing or repeated required option, an unknown option, a missing
-    /// value, an invalid IPv4 address, a zero `--threads`, or a zero MTU.
+    /// value, an invalid IPv4 address, a zero `--threads`, a zero MTU, or a
+    /// repeated `--offload`.
     pub fn parse<I, S>(args: I) -> Result<Self, ArgsError>
     where
         I: IntoIterator<Item = S>,
@@ -70,9 +85,15 @@ impl Args {
         let mut ip2 = None;
         let mut threads = None;
         let mut mtu = None;
+        let mut offload = None;
 
         let mut args = args.into_iter().map(Into::into);
         while let Some(flag) = args.next() {
+            // The only option without a value.
+            if flag == "--offload" {
+                set_once(&mut offload, &flag, true)?;
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| ArgsError(format!("{flag} needs a value")))?;
@@ -99,6 +120,7 @@ impl Args {
             ip2: ip2.ok_or_else(|| missing("--ip2"))?,
             threads,
             mtu: mtu.unwrap_or(DEFAULT_MTU),
+            offload: offload.unwrap_or(false),
         })
     }
 
@@ -109,7 +131,7 @@ impl Args {
             eprintln!("{error}");
             eprintln!(
                 "usage: --iface1 <name> --ip1 <ipv4> --iface2 <name> --ip2 <ipv4> \
-                 [--threads N] [--mtu M]"
+                 [--threads N] [--mtu M] [--offload]"
             );
             std::process::exit(64)
         })
@@ -208,6 +230,7 @@ mod tests {
         assert_eq!(args.ip2, Ipv4Addr::new(10, 0, 2, 1));
         assert_eq!(args.threads, None);
         assert_eq!(args.mtu, DEFAULT_MTU);
+        assert!(!args.offload);
     }
 
     #[test]
@@ -217,6 +240,23 @@ mod tests {
         let args = Args::parse(argv).expect("valid");
         assert_eq!(args.threads, Some(2));
         assert_eq!(args.mtu, 9000);
+    }
+
+    #[test]
+    fn offload_is_a_flag_without_a_value() {
+        for argv in [
+            [vec!["--offload"], base()].concat(),
+            [base(), vec!["--offload"]].concat(),
+            [
+                vec!["--iface1", "tun11", "--offload", "--ip1", "10.0.1.1"],
+                base()[4..].to_vec(),
+            ]
+            .concat(),
+        ] {
+            let args = Args::parse(argv.clone()).expect("valid");
+            assert!(args.offload, "{argv:?}");
+            assert_eq!(args.ip1, Ipv4Addr::new(10, 0, 1, 1), "{argv:?}");
+        }
     }
 
     #[test]
@@ -235,6 +275,12 @@ mod tests {
             ([base(), vec!["--iface1", "x"]].concat(), "more than once"),
             ([base(), vec!["--threads"]].concat(), "needs a value"),
             ([base(), vec!["--gso", "1"]].concat(), "unknown option"),
+            (
+                [base(), vec!["--offload", "--offload"]].concat(),
+                "--offload given more than once",
+            ),
+            // `--offload` takes no value, so a following word is a flag.
+            ([base(), vec!["--offload", "1"]].concat(), "1 needs a value"),
         ];
         for (argv, expected) in cases {
             let error = Args::parse(argv.clone()).expect_err("invalid");

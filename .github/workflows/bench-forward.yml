@@ -5,8 +5,10 @@ name: Forwarder benchmark
 # measured the same way in the same run.
 #
 # Manual `workflow_dispatch` only: the benchmark needs root for the TUN
-# devices and the network namespace, takes about a quarter of an hour, and
-# its numbers are only meaningful as a recorded artifact. Building, linting
+# devices and the network namespace, takes about half an hour with every
+# variant at the defaults (13 variants, plain and segmentation offload), and
+# its numbers are only meaningful as a recorded artifact. The `variants`
+# input selects a subset, for example only the offload rows. Building, linting
 # and testing the standalone bench/forwarder workspace on every push and
 # pull request is ci.yml's `bench-forwarder` job.
 
@@ -38,7 +40,7 @@ jobs:
     # Pinned rather than -latest so the kernel and image stay comparable
     # between recorded runs (both are recorded in the results).
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     concurrency:
       group: bench-forward
     steps:

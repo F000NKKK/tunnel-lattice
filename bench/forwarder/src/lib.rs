@@ -3,7 +3,9 @@
 //! - [`cli`]: the one command line every forwarder binary accepts, and the
 //!   small process helpers they share (readiness line, fatal exit).
 //! - `forward` (Linux, `tokio` or `async-io` builds): the async forwarding
-//!   loops, raw tun-rs and the tunnel-lattice facade.
+//!   loops, raw tun-rs and the tunnel-lattice facade, plain and `--offload`.
+//! - `tunrs_offload` (Linux, any build set): the preallocated buffers of the
+//!   raw tun-rs `--offload` loops.
 //! - [`report`]: turns a run directory written by
 //!   `scripts/bench-forward.sh run` into `results.json` and a Markdown
 //!   table.
@@ -26,3 +28,8 @@ pub mod cli;
 #[cfg(all(target_os = "linux", any(feature = "tokio", feature = "async-io")))]
 pub mod forward;
 pub mod report;
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "sync", feature = "tokio", feature = "async-io")
+))]
+pub mod tunrs_offload;

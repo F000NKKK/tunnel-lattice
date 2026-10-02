@@ -3,8 +3,8 @@
 //! `Handle::packet_stream_with_pool` for each device, `Handle::send_async`
 //! to send.
 //!
-//! Otherwise identical to `tl-async-tokio`. `--ip1`/`--ip2` are ignored:
-//! the run script assigns the addresses.
+//! Otherwise identical to `tl-async-tokio`, `--offload` included.
+//! `--ip1`/`--ip2` are ignored: the run script assigns the addresses.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -23,8 +23,9 @@ fn main() {
         let from1 = dev1.packet_stream_with_pool(pool.clone());
         let from2 = dev2.packet_stream_with_pool(pool);
         ready(&args);
-        let one = tokio::spawn(async move { facade(from1, dev2, "1->2").await });
-        let two = tokio::spawn(async move { facade(from2, dev1, "2->1").await });
+        let offload = args.offload;
+        let one = tokio::spawn(async move { facade(from1, dev2, "1->2", offload).await });
+        let two = tokio::spawn(async move { facade(from2, dev1, "2->1", offload).await });
         let (one, two) = (one.await, two.await);
         if let Err(error) = one.and(two) {
             fatal("copy task", error);

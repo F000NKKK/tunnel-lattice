@@ -87,7 +87,8 @@ fn shipped_registry_is_valid_and_uses_the_facade() {
     let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("variants.tsv"))
         .expect("variants.tsv");
     let variants = parse_variants(&text).expect("valid registry");
-    assert_eq!(variants.len(), 7);
+    assert_eq!(variants.len(), 13);
+    assert_eq!(variants.iter().filter(|v| v.offload).count(), 6);
     for variant in &variants {
         match variant.family.as_str() {
             "tun-rs" => {
@@ -100,11 +101,27 @@ fn shipped_registry_is_valid_and_uses_the_facade() {
                 // Compared on the same build set, so both link the same
                 // tun-rs with the same features.
                 assert_eq!(base.build_set, variant.build_set, "{}", variant.id);
+                // An offload row is compared with tun-rs's own offload
+                // path, a plain row with tun-rs's plain path.
+                assert_eq!(base.offload, variant.offload, "{}", variant.id);
                 assert_eq!(variant.layer, "facade", "{}", variant.id);
             }
             other => panic!("{}: unknown family {other}", variant.id),
         }
-        assert!(!variant.offload, "{}", variant.id);
+        // The offload column and the forwarder flag agree, and an offload
+        // row runs the same binary as a plain row of its build set.
+        let expected_args = if variant.offload { "--offload" } else { "" };
+        assert_eq!(variant.args, expected_args, "{}", variant.id);
+        if variant.offload {
+            assert!(
+                variants.iter().any(|plain| !plain.offload
+                    && plain.binary == variant.binary
+                    && plain.build_set == variant.build_set),
+                "{}: no plain row runs {}",
+                variant.id,
+                variant.binary
+            );
+        }
     }
 }
 

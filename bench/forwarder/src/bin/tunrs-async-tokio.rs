@@ -3,6 +3,10 @@
 //! `--threads 1` runs a `current_thread` runtime, `--threads N` a
 //! multi-thread runtime with `N` workers, and no `--threads` Tokio's
 //! default multi-thread runtime, as in tun-benchmark2.
+//!
+//! With `--offload`, both devices are built with `offload(true)` and each
+//! task uses `recv_multiple`/`send_multiple` with its own preallocated batch
+//! buffers and `GROTable`.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -13,8 +17,8 @@ fn main() {
     tokio_runtime(args.threads).block_on(async {
         let (dev1, dev2) = open_tunrs(&args);
         ready(&args);
-        let one = tokio::spawn(tunrs(dev1.clone(), dev2.clone(), "1->2"));
-        let two = tokio::spawn(tunrs(dev2, dev1, "2->1"));
+        let one = tokio::spawn(tunrs(dev1.clone(), dev2.clone(), "1->2", args.offload));
+        let two = tokio::spawn(tunrs(dev2, dev1, "2->1", args.offload));
         // Both loops only end by exiting the process; a join error means
         // a task panicked.
         let (one, two) = (one.await, two.await);

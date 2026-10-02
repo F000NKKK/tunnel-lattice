@@ -12,6 +12,10 @@
 //! slab and slot flags, thread spawn, channel and box setup, the pool's
 //! waiter lists growing on their first use) cancel out, leaving the
 //! per-packet cost of `K2 - K1` packets, which must be zero.
+//!
+//! The send case needs no difference: the provided `send_batch` (sync, and
+//! async under a warmed-up `block_on`) has no per-call setup, so sending
+//! `K2` packets in batches must not allocate at all.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::{Future, ready};
@@ -441,6 +445,38 @@ fn bridge_stream_zero_alloc_steady_state() {
     assert_eq!(d, 0, "the thread bridge must not allocate per packet");
 }
 
+/// Packets per `send_batch` call in [`send_batch_zero_alloc`].
+const SEND_BATCH: usize = 64;
+
+/// The provided `PacketIo::send_batch` and `AsyncPacketIo::send_batch`
+/// send `K2` packets, in batches, without a single allocation.
+fn send_batch_zero_alloc() {
+    let (device, _dropped) = FiniteDevice::new(0);
+    let payload = [0xA5u8; PAYLOAD];
+    let refs: [&[u8]; SEND_BATCH] = [&payload; SEND_BATCH];
+    for asynchronous in [false, true] {
+        let before = allocs();
+        let mut sent = 0;
+        while sent < K2 {
+            let packets = &refs[..SEND_BATCH.min(K2 - sent)];
+            let n = if asynchronous {
+                block_on(AsyncPacketIo::send_batch(&*device, black_box(packets)))
+            } else {
+                PacketIo::send_batch(&*device, black_box(packets))
+            }
+            .expect("the mock accepts every send");
+            assert_eq!(n, packets.len(), "the default sends the whole batch");
+            sent += n;
+        }
+        let d = allocs() - before;
+        println!("send_batch_zero_alloc: async={asynchronous} packets={sent} allocs={d}");
+        assert_eq!(
+            d, 0,
+            "send_batch (async {asynchronous}) must not allocate per packet"
+        );
+    }
+}
+
 /// Stride of a 1500-byte slot: `align_up(1500 + 1, 64)`.
 const STRIDE: usize = 1536;
 
@@ -496,5 +532,6 @@ fn main() {
     native_stream_zero_alloc_steady_state();
     native_stream_exhausted_zero_alloc();
     bridge_stream_zero_alloc_steady_state();
+    send_batch_zero_alloc();
     stream_owned_peak_bytes();
 }

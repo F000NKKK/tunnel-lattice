@@ -5,6 +5,10 @@
 //! Runtime selection follows `--threads` exactly as the
 //! `tunrs-async-tokio` baseline does. `--ip1`/`--ip2` are ignored: the run
 //! script assigns the addresses.
+//!
+//! With `--offload`, both devices are opened with segmentation offload,
+//! and each task sends every packet its stream already has ready with one
+//! `Handle::send_batch_async` call instead of one `send_async` per packet.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -21,8 +25,9 @@ fn main() {
         };
         let (from1, from2) = (stream(&dev1), stream(&dev2));
         ready(&args);
-        let one = tokio::spawn(async move { facade(from1, dev2, "1->2").await });
-        let two = tokio::spawn(async move { facade(from2, dev1, "2->1").await });
+        let offload = args.offload;
+        let one = tokio::spawn(async move { facade(from1, dev2, "1->2", offload).await });
+        let two = tokio::spawn(async move { facade(from2, dev1, "2->1", offload).await });
         let (one, two) = (one.await, two.await);
         if let Err(error) = one.and(two) {
             fatal("copy task", error);

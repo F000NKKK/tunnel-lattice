@@ -5,6 +5,11 @@
 //!
 //! `--threads` and `--ip1`/`--ip2` are ignored: the run script assigns the
 //! addresses.
+//!
+//! With `--offload`, both devices are opened with segmentation offload,
+//! and each thread sends every packet its stream already has ready with
+//! one `Handle::send_batch_async` call instead of one `send_async` per
+//! packet.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -22,7 +27,8 @@ fn main() {
     ready(&args);
     let threads =
         [(from1, dev2, "1->2"), (from2, dev1, "2->1")].map(|(packets, dst, direction)| {
-            std::thread::spawn(move || async_io::block_on(facade(packets, dst, direction)))
+            let offload = args.offload;
+            std::thread::spawn(move || async_io::block_on(facade(packets, dst, direction, offload)))
         });
     for thread in threads {
         if thread.join().is_err() {
