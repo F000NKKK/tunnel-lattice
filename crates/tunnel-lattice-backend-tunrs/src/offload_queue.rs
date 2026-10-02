@@ -267,10 +267,15 @@ impl OffloadRx {
         }
     }
 
-    /// The `async-io` receive loop: waits for readiness on the `tun-rs`
-    /// handle, then does one non-blocking read into the staging buffer. A
-    /// `WouldBlock` read waits again (`async-io` re-arms the readiness
-    /// wait).
+    /// The `async-io` receive loop: does one non-blocking read into the
+    /// staging buffer first, and waits for readiness on the `tun-rs` handle
+    /// only after that read found the queue empty (`WouldBlock`), as
+    /// `async-io`'s own `read_with` and the plain receive path do.
+    ///
+    /// The read must come first: a fresh `async-io` readiness wait never
+    /// completes on its first poll, only once the reactor has delivered an
+    /// event, so waiting before every read would cost a reactor round trip
+    /// per frame even while frames are queued.
     #[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
     pub(crate) async fn recv_async_io(
         &self,
@@ -279,29 +284,36 @@ impl OffloadRx {
         handle: &tun_rs::AsyncDevice,
         out: &mut [u8],
     ) -> Result<usize> {
+        // The outcome of the last readiness wait; an error is handled
+        // like a failed read.
+        let mut ready = Ok(());
         loop {
-            if let Some(result) = self.lock().next_pending(out) {
-                return result;
-            }
-            let ready = handle.readable().await;
-            // From here to the return, or to the next iteration, nothing
+            // From the lock to the return, or to the readiness wait, nothing
             // awaits: the lock is never held across an `.await`, and a
             // frame that was read is in the staging buffer before this
             // future can be dropped.
-            let mut staging = self.lock();
-            if let Some(result) = staging.next_pending(out) {
-                return result;
+            {
+                let mut staging = self.lock();
+                if let Some(result) = staging.next_pending(out) {
+                    return result;
+                }
+                let result = match std::mem::replace(&mut ready, Ok(())) {
+                    Ok(()) => handle.try_recv(staging.read_buf()),
+                    Err(err) => Err(err),
+                };
+                match result {
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                    result => {
+                        if let Some(result) = staging.finish_read(os, kind, result, out) {
+                            return result;
+                        }
+                        continue;
+                    }
+                }
             }
-            let result = match ready {
-                Ok(()) => match handle.try_recv(staging.read_buf()) {
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                    result => result,
-                },
-                Err(err) => Err(err),
-            };
-            if let Some(result) = staging.finish_read(os, kind, result, out) {
-                return result;
-            }
+            // The queue is empty: `async-io` re-arms its readiness
+            // registration, and the next frame wakes this wait.
+            ready = handle.readable().await;
         }
     }
 }
@@ -1526,5 +1538,54 @@ mod async_io_tests {
             .expect("a pending segment is served without waiting")
             .expect("segment 2");
         assert_segment(&out[..n], 2, 100);
+    }
+
+    /// A frame that is already queued is read on the first poll, with no
+    /// readiness wait first: every `recv` here, the first of each frame
+    /// included, completes without ever returning `Pending`. A wait on
+    /// every read would cost a reactor round trip per frame even on a busy
+    /// queue (`async-io` reports readiness only through the reactor, never
+    /// from a fresh wait), which starved a forwarder of throughput.
+    #[test]
+    fn a_queued_frame_is_read_without_waiting_for_readiness() {
+        let (device, peer) = queue();
+        let rx = OffloadRx::new();
+        for _ in 0..3 {
+            peer.send(&udp4_frame(100, 2, 60)).expect("send a frame");
+        }
+        let mut out = vec![0u8; 1500];
+        for _ in 0..3 {
+            for (k, len) in [(0, 100), (1, 60)] {
+                let n = rx
+                    .recv_async_io(HostOs::Linux, DeviceKind::Tun, &device, &mut out)
+                    .now_or_never()
+                    .expect("a queued frame is read on the first poll")
+                    .expect("a segment");
+                assert_segment(&out[..n], k, len);
+            }
+        }
+        let waiting = rx
+            .recv_async_io(HostOs::Linux, DeviceKind::Tun, &device, &mut out)
+            .now_or_never();
+        assert!(waiting.is_none(), "an empty queue waits for readiness");
+    }
+
+    /// A `recv` that found the queue empty waits for readiness and is
+    /// woken by a frame that arrives later.
+    #[test]
+    fn a_recv_on_an_empty_queue_is_woken_by_a_later_frame() {
+        let (device, peer) = queue();
+        let rx = OffloadRx::new();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            peer.send(&udp4_frame(100, 2, 40)).expect("send a frame");
+            peer
+        });
+        let mut out = vec![0u8; 1500];
+        let n = recv(&rx, &device, &mut out).expect("segment 0");
+        assert_segment(&out[..n], 0, 100);
+        let _peer = sender.join().expect("the sender thread");
+        let n = recv(&rx, &device, &mut out).expect("segment 1");
+        assert_segment(&out[..n], 1, 40);
     }
 }
