@@ -24,12 +24,18 @@
 //! | Windows (send) | code-less `WriteZero` (Wintun `ERROR_HANDLE_EOF`: the adapter is terminating) | [`Error::Disconnected`] |
 //! | Windows | code-less `Other`, message exactly `"The interface has been disabled"` (Wintun session ended by `apply(Down)`; `apply(Up)` recovers it) | [`Error::InvalidState`] |
 //! | Linux (send) | raw `EIO` (5): the device is administratively down (`apply(Up)` recovers it) | [`Error::InvalidState`] |
+//! | Linux, offload-framed TUN queue only (recv) | raw `EINVAL` (22): the kernel could not put a packet behind a virtio-net header (an unexpected GSO type) and has already freed it | retried ([`offload_recv_error_step`]) |
+//! | Linux, offload-framed TUN queue only (recv) | a frame that fails the virtio-net header and super-packet validation, or that filled the staging sentinel (longer than 64 KiB) | dropped, and the read retried (see `offload_queue`) |
 //! | Windows, TAP only (recv) | the first raw 995 (`ERROR_OPERATION_ABORTED`) in a call while the adapter's operational status reads `Up`: a read cancelled because the thread that issued it exited, on a healthy adapter | retried once ([`tap_abort_retries`]) |
 //! | Windows, TAP only | raw 995 (`ERROR_OPERATION_ABORTED`) otherwise (on `recv`: the status is not `Up`, the status read fails, or the call already retried): a call made while the tap-windows adapter's media is disconnected, which `apply(Down)` does (`apply(Up)` recovers it; a read already waiting is not ended by it), or the adapter was disabled outside this crate | [`Error::InvalidState`] |
 //! | anything else | | [`io_error`], so every other `UnexpectedEof` (the shutdown pipe's `"close"`, Wintun's `ERROR_HANDLE_EOF` on receive) stays [`Error::Disconnected`] and a code-less `Interrupted` (`"cancel"`) is not retried |
 //!
 //! `WriteZero` and `EIO` are remapped on `send` only, so the same signal
-//! from any other operation keeps its generic meaning. The Windows 995 rule
+//! from any other operation keeps its generic meaning. The `EINVAL` retry
+//! applies to a read on an offload-framed queue only: on a plain queue, and
+//! on every `send`, `EINVAL` keeps its generic meaning. Neither offload
+//! retry ever spins: each one is a packet the kernel produced and the read
+//! consumed, and the next read waits as usual. The Windows 995 rule
 //! takes the [`DeviceKind`] as well: it applies to a TAP handle only, on
 //! both directions, and a Wintun (TUN) 995 keeps its generic meaning.
 //!
@@ -117,6 +123,11 @@ const EFAULT: i32 = 14;
 /// Mapped on Linux `send` only; see [`send_error`].
 const EIO: i32 = 5;
 
+/// Linux `EINVAL` (asserted against `libc` by the unit tests on Linux).
+/// Retried on a read from an offload-framed queue only; see
+/// [`offload_recv_error_step`].
+const EINVAL: i32 = 22;
+
 /// Windows `ERROR_OPERATION_ABORTED` (asserted against `windows-sys` by the
 /// unit tests on Windows). Mapped for a TAP handle only; see
 /// [`lifecycle_error`].
@@ -198,6 +209,27 @@ pub(crate) fn recv_step(
     }
 }
 
+/// Maps one failed native read on an offload-framed Linux TUN queue (a
+/// queue that reads through a virtio-net header into the backend's own
+/// staging buffer).
+///
+/// A raw `EINVAL` there means the kernel's `tun_put_user` could not
+/// express one packet behind the header (an unexpected GSO type) or was
+/// handed a buffer shorter than the header, which the staging buffer never
+/// is. Either way the kernel has already freed that packet, so the read is
+/// retried and the packet is lost, like a malformed super-packet. Every
+/// other error goes through the ordinary `recv` rules ([`recv_step`]); a
+/// read into the staging buffer can never be too small for a packet, so
+/// [`Error::BufferTooSmall`] does not come from here.
+pub(crate) fn offload_recv_error_step(os: HostOs, kind: DeviceKind, err: io::Error) -> Step {
+    if os == HostOs::Linux && err.raw_os_error() == Some(EINVAL) {
+        return Step::Retry;
+    }
+    recv_step(os, kind, usize::MAX, Err(err), &mut false, || {
+        Ok(AdminState::Unknown)
+    })
+}
+
 /// Maps one native `send` attempt on a `kind` handle.
 pub(crate) fn send_step(os: HostOs, kind: DeviceKind, result: io::Result<usize>) -> Step {
     match result {
@@ -224,10 +256,12 @@ fn recv_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
     // deleted with `EFAULT` (the socket's `RCV_SHUTDOWN`, which only the
     // device teardown sets on an attached file); every later read returns
     // `EBADFD`. The read path's only other `EFAULT` sources are user-copy
-    // faults, which a safe `&mut [u8]` cannot cause: the packet-information
-    // header and the virtio-net header, neither of which this backend
-    // enables. Re-examine this rule if packet information or offload is
-    // ever enabled. Matched on the raw code only, never on `kind()`: `std`
+    // faults, which a safe `&mut [u8]` cannot cause. That still holds on an
+    // offload-framed queue, which reads the virtio-net header and the
+    // packet into the backend's own staging buffer, always valid memory of
+    // the full size, so an `EFAULT` there is the teardown too. Packet
+    // information is never enabled; re-examine this rule if it ever is.
+    // Matched on the raw code only, never on `kind()`: `std`
     // decodes the code with the running host's table. Not applied to
     // `send` (an `EFAULT` there is only a copy fault; teardown is
     // `EBADFD`) nor to macOS (a BPF `EFAULT` is a `copyout` fault).
@@ -254,9 +288,10 @@ fn send_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
     // `!(dev->flags & IFF_UP)` check, `tun.c:1895` in Linux 7.0). The check
     // is on the common path, so TUN and TAP behave alike, and applying `Up`
     // on the same handle makes it send again: `InvalidState`, like a
-    // disabled Wintun adapter. Re-examine this rule if the virtio-net
-    // header, napi frags or an XDP program is ever enabled, or a kernel adds
-    // another `EIO` to that path. Matched on the raw code only; never on
+    // disabled Wintun adapter. It holds on an offload-framed queue too: the
+    // kernel rejects a virtio-net header it cannot accept with `EINVAL`,
+    // never `EIO`. Re-examine this rule if napi frags or an XDP program is
+    // ever enabled, or a kernel adds another `EIO` to that path. Matched on the raw code only; never on
     // `recv` (the read path has no `EIO`: a down device makes `recv` wait)
     // nor on macOS (where `EIO` has unrelated meanings).
     if os == HostOs::Linux && err.raw_os_error() == Some(EIO) {
@@ -549,6 +584,49 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn eio_matches_libc_on_linux() {
         assert_eq!(EIO, libc::EIO);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn einval_matches_libc_on_linux() {
+        assert_eq!(EINVAL, libc::EINVAL);
+    }
+
+    fn offload_step(os: HostOs, err: io::Error) -> Option<Result<usize>> {
+        match offload_recv_error_step(os, TUN, err) {
+            Step::Retry => None,
+            Step::Done(result) => Some(result),
+        }
+    }
+
+    /// On an offload-framed Linux queue a raw `EINVAL` read is a packet the
+    /// kernel already dropped: retried. Everywhere else it keeps its
+    /// generic meaning, and the ordinary `recv` rules still apply.
+    #[test]
+    fn offload_read_retries_einval_on_linux_only() {
+        let einval = || io::Error::from_raw_os_error(EINVAL);
+        assert!(offload_step(HostOs::Linux, einval()).is_none());
+        for os in [HostOs::Macos, HostOs::Windows, HostOs::Other] {
+            let result = offload_step(os, einval());
+            assert!(
+                matches!(result, Some(Err(Error::Platform(_)))),
+                "{os:?}: {result:?}"
+            );
+        }
+        // The ordinary rules: EINTR is retried, teardown is Disconnected.
+        assert!(offload_step(HostOs::Linux, eintr()).is_none());
+        for code in [EFAULT, EBADFD] {
+            let result = offload_step(HostOs::Linux, io::Error::from_raw_os_error(code));
+            assert!(
+                matches!(result, Some(Err(Error::Disconnected))),
+                "{code}: {result:?}"
+            );
+        }
+        // A plain queue's EINVAL read is not retried.
+        assert!(matches!(
+            recv_result(HostOs::Linux, 64, Err(einval())),
+            Some(Err(Error::Platform(_)))
+        ));
     }
 
     /// A send to an administratively down Linux device fails with raw

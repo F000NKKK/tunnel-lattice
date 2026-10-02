@@ -27,7 +27,11 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
+use tunnel_lattice_core::Result;
+use tunnel_lattice_model::DeviceKind;
 
+use crate::offload_queue::OffloadRx;
+use crate::open_contract::HostOs;
 use crate::recv_contract;
 
 /// A duplicate of a device descriptor, registered with the current Tokio
@@ -58,6 +62,50 @@ impl ErrorAwareReader {
     /// Registers an already-owned non-blocking descriptor.
     fn from_owned(fd: OwnedFd) -> io::Result<Self> {
         AsyncFd::with_interest(File::from(fd), Interest::READABLE | Interest::ERROR).map(Self)
+    }
+
+    /// `recv` on an offload-framed queue: serves the next pending segment
+    /// of `rx`, or waits for readable or error readiness and reads one frame
+    /// into `rx`'s staging buffer (see `offload_queue`).
+    ///
+    /// The cooperative budget is spent before anything is served or read,
+    /// so a yield never happens after a segment was taken or a frame was
+    /// read. The staging lock is taken only between awaits, and nothing
+    /// awaits between a successful read and the return, so a dropped
+    /// future leaves every unserved segment pending for the next `recv`.
+    pub(crate) async fn recv_offload(
+        &self,
+        os: HostOs,
+        kind: DeviceKind,
+        rx: &OffloadRx,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        tokio::task::coop::consume_budget().await;
+        loop {
+            if let Some(result) = rx.lock().next_pending(out) {
+                return result;
+            }
+            let ready = self.0.ready(Interest::READABLE | Interest::ERROR).await;
+            let mut staging = rx.lock();
+            if let Some(result) = staging.next_pending(out) {
+                return result;
+            }
+            let result = match ready {
+                Ok(mut guard) => match guard.try_io(|fd| {
+                    let mut file: &File = fd.get_ref();
+                    file.read(staging.read_buf())
+                }) {
+                    Ok(result) => result,
+                    // As in `recv_native`: the readiness was cleared, wait
+                    // again.
+                    Err(_would_block) => continue,
+                },
+                Err(err) => Err(err),
+            };
+            if let Some(result) = staging.finish_read(os, kind, result, out) {
+                return result;
+            }
+        }
     }
 }
 
@@ -254,6 +302,73 @@ mod tests {
         });
         assert!(first_poll_pending, "the budget did not force a yield");
         assert_eq!(&buf[..n], b"keep");
+    }
+
+    /// The offload receive loop over a datagram socket standing in for an
+    /// offload-framed queue: segments in order, and a `recv` cancelled by
+    /// an exhausted budget, or while it waits for readiness, loses no
+    /// segment.
+    #[test]
+    fn offload_recv_serves_segments_and_survives_cancellation() {
+        use crate::offload_queue::test_frames::{assert_segment, udp4_frame};
+
+        let served = with_watchdog("offload recv", || {
+            let (ours, theirs) = datagram_pair();
+            runtime().block_on(async move {
+                tokio::spawn(async move {
+                    let reader = ErrorAwareReader::from_owned(OwnedFd::from(ours))
+                        .expect("register the socket");
+                    let rx = OffloadRx::new();
+                    let mut out = vec![0u8; 1500];
+                    macro_rules! recv {
+                        ($out:expr) => {
+                            reader.recv_offload(HostOs::Linux, DeviceKind::Tun, &rx, $out)
+                        };
+                    }
+                    let mut served = Vec::new();
+
+                    // Cancelled while waiting for readiness.
+                    {
+                        let mut waiting = std::pin::pin!(recv!(&mut out));
+                        let pending = std::future::poll_fn(|cx| {
+                            Poll::Ready(waiting.as_mut().poll(cx).is_pending())
+                        })
+                        .await;
+                        assert!(pending, "nothing to read yet");
+                    }
+                    theirs.send(&udp4_frame(100, 3, 100)).expect("send a frame");
+                    let n = recv!(&mut out).await.expect("segment 0");
+                    served.push(out[..n].to_vec());
+
+                    // Cancelled by the budget, mid-split.
+                    while tokio::task::coop::has_budget_remaining() {
+                        tokio::task::coop::consume_budget().await;
+                    }
+                    {
+                        let mut yielding = std::pin::pin!(recv!(&mut out));
+                        let pending = std::future::poll_fn(|cx| {
+                            Poll::Ready(yielding.as_mut().poll(cx).is_pending())
+                        })
+                        .await;
+                        assert!(pending, "the budget did not force a yield");
+                    }
+                    tokio::task::yield_now().await;
+                    for k in 1..3 {
+                        let n = recv!(&mut out).await.unwrap_or_else(|err| {
+                            panic!("segment {k}: {err:?}");
+                        });
+                        served.push(out[..n].to_vec());
+                    }
+                    served
+                })
+                .await
+                .expect("the task does not panic")
+            })
+        });
+        assert_eq!(served.len(), 3);
+        for (k, packet) in served.iter().enumerate() {
+            assert_segment(packet, k, 100);
+        }
     }
 
     /// Canary for the reason this reader exists: a plain `READABLE` wait is

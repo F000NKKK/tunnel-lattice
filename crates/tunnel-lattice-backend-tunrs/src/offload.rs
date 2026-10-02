@@ -43,9 +43,14 @@ pub(crate) const MAX_PACKET_LEN: usize = 65_536;
 /// and one sentinel byte that only an oversized read can fill.
 pub(crate) const STAGING_LEN: usize = VNET_HDR_LEN + MAX_PACKET_LEN + 1;
 
-/// The most segments one super-packet may carry, in either direction. This
-/// is the kernel's `UDP_MAX_SEGMENTS`; it also bounds TCP so one receive or
-/// one coalesced write never covers more than this many packets.
+/// The most packets one coalesced write may carry. This is the kernel's
+/// `UDP_MAX_SEGMENTS`, which it enforces on a UDP super-packet written to a
+/// TUN device; TCP runs use the same bound.
+///
+/// It does not bound receiving: the split is lazy, so a received
+/// super-packet of any segment count costs nothing extra, and dropping one
+/// that splits into more segments (TCP with a small MSS) would lose data.
+/// A received frame is bounded only by its length checks.
 pub(crate) const MAX_SEGMENTS: usize = 128;
 
 /// The header of a plain (non-GSO, no checksum offload) packet.
@@ -65,6 +70,9 @@ pub(crate) const GSO_ECN: u8 = 0x80;
 /// is partial and must be completed at `csum_start + csum_offset`.
 pub(crate) const F_NEEDS_CSUM: u8 = 1;
 /// `VIRTIO_NET_HDR_F_DATA_VALID`: the checksum was already verified.
+/// Accepted by the split without a check of its own, so only the tests
+/// name it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const F_DATA_VALID: u8 = 2;
 
 const PROTO_TCP: u8 = 6;
@@ -134,8 +142,6 @@ pub(crate) enum DropReason {
     ZeroGsoSize,
     /// A super-packet with headers but no payload.
     EmptyPayload,
-    /// The super-packet splits into more than [`MAX_SEGMENTS`] segments.
-    TooManySegments,
     /// A segment's length does not fit its IP or UDP length field.
     SegmentTooLarge,
     /// [`SplitCursor::write_next`] was given a frame other than the one the
@@ -485,6 +491,7 @@ impl SplitCursor {
     }
 
     /// How many packets the frame carries in total.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn segments(&self) -> usize {
         self.count
     }
@@ -603,10 +610,10 @@ fn gso_plan(
     if payload_len == 0 {
         return Err(DropReason::EmptyPayload);
     }
+    // No segment-count cap: the payload is at most 64 KiB, so even one-byte
+    // segments stay countable, and every per-segment field (IPv4 id, TCP
+    // sequence) is computed with wrapping or checked arithmetic.
     let count = payload_len.div_ceil(gso_size);
-    if count > MAX_SEGMENTS {
-        return Err(DropReason::TooManySegments);
-    }
     let largest = hdr_len.saturating_add(min(gso_size, payload_len));
     if !lengths_fit(ip, l4, l4_off, largest) {
         return Err(DropReason::SegmentTooLarge);
@@ -657,7 +664,8 @@ fn write_segment(plan: Plan, pkt: &[u8], dst: &mut [u8], k: usize, last: bool) -
     match ip {
         Ip::V4 => {
             put_be16(dst, 2, u16::try_from(seg_len).ok()?)?;
-            let id = be16(pkt, 4)?.wrapping_add(u16::try_from(k).ok()?);
+            // The id is modulo 2^16, like the kernel's per-segment increment.
+            let id = be16(pkt, 4)?.wrapping_add(u16::try_from(k & 0xffff).ok()?);
             put_be16(dst, 4, id)?;
             put_be16(dst, 10, 0)?;
             let sum = checksum(dst.get(..l4_off)?, 0);
@@ -854,6 +862,10 @@ pub(crate) struct Run {
     header_len: usize,
 }
 
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    expect(dead_code, reason = "the batch-send path is not wired up yet")
+)]
 impl Run {
     /// How many packets from the head of the batch the run covers (2 to
     /// [`MAX_SEGMENTS`]).
@@ -893,6 +905,10 @@ impl Run {
 /// first, or would exceed [`MAX_SEGMENTS`] packets or 64 KiB (and any IP or
 /// UDP length field); it stops after a TCP packet with PSH and after any
 /// packet shorter than the first.
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    expect(dead_code, reason = "the batch-send path is not wired up yet")
+)]
 pub(crate) fn plan_run(packets: &[&[u8]], udp_gso: bool) -> Option<Run> {
     let first: &[u8] = packets.first()?;
     let flow = coalescible(first)?;
@@ -1614,12 +1630,35 @@ mod tests {
         assert_golden(TCP4, 1, 1, ACK | TCP_FIN | TCP_PSH, 1000, 999);
         assert_golden(UDP6, 0, 0, 0, 1000, 1001);
         assert_golden(UDP4, 0, 0, 0, 1000, usize::from(u16::MAX));
-        // One-byte segments up to the cap.
+        // The send-side coalescing cap does not bound receiving: more than
+        // 128 one-byte (or small) segments split like any other frame.
         assert_golden(TCP6, 0, 5, ACK, MAX_SEGMENTS, 1);
-        let frame = super_frame(TCP6, 0, 5, ACK, &payload(MAX_SEGMENTS + 1), 1);
-        assert_eq!(SplitCursor::new(&frame), Err(DropReason::TooManySegments));
-        let frame = super_frame(UDP4, 0, 0, 0, &payload(MAX_SEGMENTS * 3 + 1), 3);
-        assert_eq!(SplitCursor::new(&frame), Err(DropReason::TooManySegments));
+        assert_golden(TCP6, 0, 5, ACK, MAX_SEGMENTS + 1, 1);
+        assert_golden(UDP4, 0, 0, 0, MAX_SEGMENTS * 3 + 1, 3);
+    }
+
+    /// A TCP super-packet with a small MSS splits into far more than
+    /// [`MAX_SEGMENTS`] segments, all delivered: the receive side has no
+    /// segment cap. Covers a near-64 KiB IPv4 frame at an MSS of 88 (the
+    /// kernel's `TCP_MIN_MSS`), with sequence-number and IPv4-id wraparound,
+    /// and the extreme of one-byte segments.
+    #[test]
+    fn receive_split_is_not_capped_at_the_coalescing_limit() {
+        let (_, hdr4) = TCP4.offsets();
+        let data_len = 65_535 - hdr4;
+        let count = data_len.div_ceil(88);
+        assert!(count > MAX_SEGMENTS * 5, "{count}");
+        assert_golden(
+            TCP4,
+            u16::MAX - 3,
+            u32::MAX - 1000,
+            ACK | TCP_PSH,
+            data_len,
+            88,
+        );
+        assert_golden(UDP6, 0, 0, 0, 4000, 1);
+        let frame = super_frame(TCP4, 0, 1, ACK, &payload(data_len), 88);
+        assert_eq!(SplitCursor::new(&frame).map(|c| c.segments()), Ok(count));
     }
 
     #[test]
@@ -2000,8 +2039,8 @@ mod tests {
                 continue;
             };
             accepted += 1;
-            assert!((1..=MAX_SEGMENTS).contains(&cursor.segments()));
-            for step in 0..=MAX_SEGMENTS {
+            assert!((1..=MAX_PACKET_LEN).contains(&cursor.segments()));
+            for step in 0..=cursor.segments() {
                 let len = if rng.below(4) == 0 {
                     rng.below(1600)
                 } else {

@@ -22,11 +22,13 @@ mod admin_state;
 #[cfg(any(all(target_os = "macos", feature = "async"), all(test, unix)))]
 mod macos_tap;
 // Pure and I/O-free, so it compiles and is unit-tested on every OS; only
-// the Linux TUN receive and batch-send paths are meant to call it. Nothing
-// outside its tests calls it yet: once the Linux paths do, narrow this
-// allowance to `not(target_os = "linux")`.
-#[cfg_attr(not(test), allow(dead_code))]
+// the Linux TUN receive and send paths call it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod offload;
+// The queue-level half of offload: compiled and unit-tested on every OS,
+// called only by the Linux TUN paths.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod offload_queue;
 mod open_contract;
 mod recv_contract;
 #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -196,6 +198,48 @@ impl TunRsBackend {
 /// wait, so it never spins. Every other end-of-file, such as the device
 /// being closed or a Wintun session ending, is [`Error::Disconnected`].
 ///
+/// # Segmentation offload
+///
+/// On Linux, a TUN device opened with `DeviceConfig::offload` asks the
+/// kernel for segmentation offload: every packet on the queue then carries
+/// a 10-byte virtio-net header, and the kernel may hand over one TCP or
+/// UDP super-packet of up to 64 KiB where it would otherwise have sent
+/// many packets. The request is ignored, with plain framing and no error,
+/// on every other OS and for TAP. None of this is visible to the caller:
+///
+/// - `recv` returns one IP packet per call, as on any queue. A
+///   super-packet is read once into a private 64 KiB staging buffer owned
+///   by the handle and split lazily: each `recv` returns its next segment,
+///   with its lengths and checksums completed. A segment that does not fit
+///   the buffer is dropped alone, as [`Error::BufferTooSmall`], and the
+///   next `recv` returns the segment after it. A received frame the split
+///   does not accept (a malformed header or packet, or one larger than the
+///   staging buffer), and a raw `EINVAL` from the read (the kernel refusing
+///   to frame a packet), are dropped and the read retried: they never
+///   reach the caller and never spin.
+/// - `send` writes the packet behind an all-zero header (no checksum or
+///   segmentation request), and returns the packet's length.
+/// - An async `recv` dropped before it completes loses nothing: segments
+///   not yet returned stay in the staging buffer for the next `recv`.
+///
+/// What the queue really uses is checked after every open and every
+/// `additional_queue`, because the kernel's header flag (`IFF_VNET_HDR`) is
+/// device-wide, and a queue attached to a multi-queue device that already
+/// has queues does not get its own request applied. So the framing follows
+/// the device, not the request:
+///
+/// | Device | Queue framing | `SEGMENTATION_OFFLOAD` on the handle |
+/// |---|---|---|
+/// | header flag set, header size 10 | offload, even if this open did not ask for it | reported |
+/// | header flag set, any other header size | none: `open` fails with [`Error::Unsupported`] | — |
+/// | header flag clear | plain, even if this open asked for offload; an offload mask this open set is cleared again (`TUNSETOFFLOAD(0)`), since the device has no header to describe super-packets | not reported |
+///
+/// `Capability::SEGMENTATION_OFFLOAD` is therefore reported per handle
+/// only, never by [`TunRsBackend`]'s host-level answer. The kernel's offload
+/// mask is device-wide too: opening a plain queue on an offload device (or
+/// clearing a stray mask as above) turns super-packets off for every queue
+/// of it, which changes only how many packets each read carries.
+///
 /// # When the device goes away
 ///
 /// `recv` and `send` also map the native errors that mean the device is
@@ -263,6 +307,10 @@ pub struct TunRsDevice {
     /// first.
     #[cfg(all(target_os = "macos", feature = "async"))]
     tap_wait: Option<macos_tap::BpfWait>,
+    /// The receive staging of an offload-framed Linux TUN queue (see
+    /// "Segmentation offload"); `None` for a plainly framed queue.
+    #[cfg(target_os = "linux")]
+    offload: Option<offload_queue::OffloadRx>,
     #[cfg(feature = "async")]
     handle: tun_rs::AsyncDevice,
     #[cfg(not(feature = "async"))]
@@ -399,6 +447,16 @@ impl DeviceProvider for TunRsBackend {
         {
             builder = builder.multi_queue(config.multi_queue);
         }
+        // Likewise `DeviceBuilder::offload` is Linux-only; the request is
+        // also ignored for TAP (see `offload_queue::offload_request`).
+        #[cfg(target_os = "linux")]
+        {
+            builder = builder.offload(offload_queue::offload_request(
+                open_contract::HOST_OS,
+                config.kind,
+                config.offload,
+            ));
+        }
         if let Some(name) = config.name.as_deref() {
             builder = builder.name(name);
         }
@@ -428,10 +486,14 @@ impl DeviceProvider for TunRsBackend {
         if let Some(mac) = config.mac {
             confirm_requested_mac(&handle, mac)?;
         }
+        #[cfg(target_os = "linux")]
+        let offload = queue_framing(config.kind, &handle)?;
 
         Ok(TunRsDevice {
             kind: config.kind,
             id,
+            #[cfg(target_os = "linux")]
+            offload,
             // On failure `handle` drops: a new device is torn down, an
             // attached persistent one is detached.
             #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -465,6 +527,23 @@ fn confirm_requested_mac(handle: &tun_rs::DeviceImpl, requested: MacAddress) -> 
     } else {
         Err(Error::Unsupported)
     }
+}
+
+/// Checks the framing a Linux queue really has (see
+/// `offload_queue::verify_queue`) and returns its receive staging when it is
+/// offload-framed. Only a TUN queue is checked: a TAP queue keeps plain
+/// framing, as its offload request is never passed on.
+#[cfg(target_os = "linux")]
+fn queue_framing(
+    kind: DeviceKind,
+    handle: &tun_rs::DeviceImpl,
+) -> Result<Option<offload_queue::OffloadRx>> {
+    use std::os::fd::AsRawFd;
+
+    if kind != DeviceKind::Tun {
+        return Ok(None);
+    }
+    offload_queue::verify_queue(handle.as_raw_fd(), handle.tcp_gso())
 }
 
 fn device_id_from_index(index: std::io::Result<u32>) -> Result<DeviceId> {
@@ -514,6 +593,12 @@ impl TunRsDevice {
         }
         #[cfg(not(feature = "async"))]
         {
+            #[cfg(target_os = "linux")]
+            if let Some(rx) = &self.offload {
+                return rx.recv_blocking(open_contract::HOST_OS, self.kind, buf, |staging| {
+                    self.handle.recv(staging)
+                });
+            }
             recv_contract::recv_blocking(
                 open_contract::HOST_OS,
                 self.kind,
@@ -552,6 +637,12 @@ impl TunRsDevice {
         }
         #[cfg(not(feature = "async"))]
         {
+            #[cfg(target_os = "linux")]
+            if self.offload.is_some() {
+                return recv_contract::send_blocking(open_contract::HOST_OS, self.kind, || {
+                    framed_len(self.handle.send_vectored(&framed(buf)))
+                });
+            }
             recv_contract::send_blocking(open_contract::HOST_OS, self.kind, || {
                 self.handle.send(buf)
             })
@@ -581,6 +672,19 @@ impl TunRsDevice {
             .await;
         }
         #[cfg(all(target_os = "linux", feature = "tokio"))]
+        if let Some(rx) = &self.offload {
+            return self
+                .reader
+                .recv_offload(open_contract::HOST_OS, self.kind, rx, buf)
+                .await;
+        }
+        #[cfg(all(target_os = "linux", not(feature = "tokio")))]
+        if let Some(rx) = &self.offload {
+            return rx
+                .recv_async_io(open_contract::HOST_OS, self.kind, &self.handle, buf)
+                .await;
+        }
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
         let source = &self.reader;
         #[cfg(not(all(target_os = "linux", feature = "tokio")))]
         let source = &self.handle;
@@ -594,11 +698,37 @@ impl TunRsDevice {
         .await
     }
 
-    /// Async send, retrying transient errors.
+    /// Async send, retrying transient errors. On an offload-framed queue the
+    /// packet goes out behind an all-zero virtio-net header.
     #[cfg(feature = "async")]
     async fn async_send(&self, buf: &[u8]) -> Result<usize> {
+        #[cfg(target_os = "linux")]
+        if self.offload.is_some() {
+            return recv_contract::send_async(open_contract::HOST_OS, self.kind, || async {
+                framed_len(self.handle.send_vectored(&framed(buf)).await)
+            })
+            .await;
+        }
         recv_contract::send_async(open_contract::HOST_OS, self.kind, || self.handle.send(buf)).await
     }
+}
+
+/// One plain packet as an offload-framed queue's `writev` takes it: an
+/// all-zero virtio-net header (no checksum or segmentation request), then
+/// the packet.
+#[cfg(target_os = "linux")]
+fn framed(buf: &[u8]) -> [std::io::IoSlice<'_>; 2] {
+    [
+        std::io::IoSlice::new(&offload::VNET_HDR_NONE),
+        std::io::IoSlice::new(buf),
+    ]
+}
+
+/// The packet length of a framed write: the header is not part of what the
+/// caller sent.
+#[cfg(target_os = "linux")]
+fn framed_len(written: std::io::Result<usize>) -> std::io::Result<usize> {
+    written.map(|n| n.saturating_sub(offload::VNET_HDR_LEN))
 }
 
 /// One blocking native read. On unix it reads into `[buf, 1-byte
@@ -888,11 +1018,18 @@ impl PersistentDevice for TunRsDevice {
 
 #[cfg(target_os = "linux")]
 impl MultiQueueProvider for TunRsDevice {
+    /// The new queue's framing is checked like an `open`'s (see
+    /// [`TunRsDevice`], "Segmentation offload"), so it reports
+    /// `SEGMENTATION_OFFLOAD` exactly when it is offload-framed; it gets its
+    /// own receive staging and never shares this handle's.
     fn additional_queue(&self) -> Result<Self> {
+        // On failure `handle` drops, which detaches the new queue.
         let handle = self.handle.try_clone().map_err(io_error)?;
+        let offload = queue_framing(self.kind, &handle)?;
         Ok(TunRsDevice {
             kind: self.kind,
             id: self.id,
+            offload,
             #[cfg(all(target_os = "linux", feature = "tokio"))]
             reader: tokio_linux::ErrorAwareReader::new(&*handle).map_err(io_error)?,
             handle,
@@ -936,7 +1073,9 @@ fn host_capabilities() -> Capability {
 ///
 /// `MAC_MUTATION` is never part of this answer: it is a property of an open
 /// TAP handle, reported by [`TunRsDevice`]'s own `capabilities()` (Linux and
-/// macOS only).
+/// macOS only). Neither is `SEGMENTATION_OFFLOAD`: whether a device uses
+/// offload is only known once it is open (see [`TunRsDevice`],
+/// "Segmentation offload"), so only a handle reports it.
 ///
 /// On Windows the driver is detected on the first call with the same
 /// SetupAPI driver lookup `tun-rs` performs before creating a TAP adapter,
@@ -957,6 +1096,7 @@ fn host_capabilities() -> Capability {
 /// let capabilities = TunRsBackend::new().capabilities();
 /// assert!(capabilities.contains(Capability::DEVICE_MUTATION));
 /// assert!(!capabilities.contains(Capability::MAC_MUTATION));
+/// assert!(!capabilities.contains(Capability::SEGMENTATION_OFFLOAD));
 /// ```
 impl CapabilityProvider for TunRsBackend {
     fn capabilities(&self) -> Capability {
@@ -968,10 +1108,18 @@ impl CapabilityProvider for TunRsBackend {
 /// [`CapabilityProvider`] impl) plus what depends on this handle:
 /// `MAC_MUTATION` on a TAP handle on Linux and macOS, and `TAP_DEVICES` on
 /// any TAP handle, since its successful open proves TAP works here even if
-/// the Windows driver lookup did not find the driver.
+/// the Windows driver lookup did not find the driver; and
+/// `SEGMENTATION_OFFLOAD` on an offload-framed Linux TUN queue (see
+/// [`TunRsDevice`], "Segmentation offload").
 impl CapabilityProvider for TunRsDevice {
     fn capabilities(&self) -> Capability {
         let base = host_capabilities();
+        #[cfg(target_os = "linux")]
+        let base = if self.offload.is_some() {
+            base | Capability::SEGMENTATION_OFFLOAD
+        } else {
+            base
+        };
         if self.kind != DeviceKind::Tap {
             return base;
         }
@@ -1004,6 +1152,10 @@ mod capability_tests {
         let capabilities = TunRsBackend::new().capabilities();
         assert!(capabilities.contains(Capability::DEVICE_MUTATION));
         assert!(!capabilities.contains(Capability::MAC_MUTATION));
+        assert!(
+            !capabilities.contains(Capability::SEGMENTATION_OFFLOAD),
+            "offload is a property of an open queue, never of the host"
+        );
         assert_eq!(capabilities, host_capabilities());
         assert_eq!(
             capabilities.contains(Capability::NATIVE_ASYNC),
@@ -1693,6 +1845,9 @@ mod privileged_tests {
     use tunnel_lattice_platform::{DeviceMutator, DeviceObserver, DeviceProvider, PacketIo};
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    mod offload_tests;
 
     /// Under the `tokio` feature, `tun-rs`'s Tokio-backed `AsyncDevice`
     /// registers its file descriptor with `tokio::runtime::Handle::
