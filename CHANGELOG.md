@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     flow with equal-sized datagrams when the kernel supports UDP
     segmentation offload, into one gather write that copies no payload.
   - Plain (non-offload) handles read and write exactly as before.
+- **Offload benchmarks.** The forwarder benchmark gained `--offload`
+  variants that compare Tunnel Lattice with `tun-rs`'s own
+  `recv_multiple`/`send_multiple`, and new micro-benchmarks cover
+  `send_batch` and the segmentation offload split and coalesce. In the
+  recorded run the async offload rows reached 111 % (Tokio) and 124 %
+  (async-io) of `tun-rs`'s offload path; the README tables were refreshed.
 
 ### Fixed
 

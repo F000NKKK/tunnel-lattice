@@ -136,22 +136,31 @@ of tun-rs's [tun-benchmark2](https://github.com/tun-rs/tun-benchmark2): a
 forwarder copies packets between two TUN devices while `iperf3` measures
 TCP throughput across them. Every run measures raw `tun-rs` (sync, Tokio,
 and async-io) next to Tunnel Lattice on the same machine, and each Tunnel
-Lattice row is compared with the `tun-rs` row above it. Neither side uses
-offload. The table and its notes are copied unchanged from the recorded
-[workflow run](https://github.com/F000NKKK/tunnel-lattice/actions/runs/36855227427):
+Lattice row is compared with the `tun-rs` row above it. The first seven
+rows use no offload. The six offload rows open both devices with GSO/GRO
+offload (Linux TUN only) and compare Tunnel Lattice with `tun-rs`'s own
+offload path, `recv_multiple`/`send_multiple`. The table and its notes are
+copied unchanged from the recorded
+[workflow run](https://github.com/F000NKKK/tunnel-lattice/actions/runs/36986771210):
 
 | Configuration | Throughput (median Gbps) | vs tun-rs, same run | CPU avg | RSS max | Retransmissions |
 |---|---:|---:|---:|---:|---:|
-| tun-rs sync | 2.87 | — | 173 % | 2.7 MB | 79 |
-| tunnel-lattice sync (Handle::recv/send) | 2.73 | 94.9 % (94.4–96.6) | 173 % | 2.5 MB | 74 |
-| tun-rs async (Tokio) | 2.35 | — | 179 % | 3.6 MB | 64 |
-| tunnel-lattice async (Tokio, packet_stream + send_async) | 2.20 | 93.6 % (90.2–96.1) | 181 % | 3.5 MB | 57 |
-| tunnel-lattice async (Tokio, one shared PacketPool) | 2.18 | 92.9 % (88.3–97.2) | 180 % | 3.5 MB | 61 |
-| tun-rs async (async-io) | 3.04 | — | 187 % | 2.8 MB | 90 |
-| tunnel-lattice async (async-io, packet_stream + send_async) | 2.58 | 86.2 % (80.3–92.3) | 183 % | 2.8 MB | 55 |
+| tun-rs sync | 2.72 | — | 181 % | 2.6 MB | 83 |
+| tunnel-lattice sync (Handle::recv/send) | 2.51 | 90.9 % (89.8–92.6) | 181 % | 2.4 MB | 66 |
+| tun-rs async (Tokio) | 1.85 | — | 178 % | 3.6 MB | 55 |
+| tunnel-lattice async (Tokio, packet_stream + send_async) | 1.70 | 92.2 % (89.5–94.0) | 181 % | 3.5 MB | 48 |
+| tunnel-lattice async (Tokio, one shared PacketPool) | 1.72 | 93.7 % (89.3–93.9) | 180 % | 3.5 MB | 48 |
+| tun-rs async (async-io) | 2.82 | — | 190 % | 2.8 MB | 78 |
+| tunnel-lattice async (async-io, packet_stream + send_async) | 2.58 | 95.8 % (90.1–102.3) | 192 % | 2.7 MB | 71 |
+| tun-rs sync offload (recv_multiple/send_multiple) | 9.58 | — | 135 % | 6.2 MB | 0 |
+| tunnel-lattice sync offload (Handle::recv split, per-packet Handle::send) | 2.74 | 28.6 % (26.3–30.0) | 163 % | 2.5 MB | 0 |
+| tun-rs async offload (Tokio, recv_multiple/send_multiple) | 9.84 | — | 144 % | 7.2 MB | 0 |
+| tunnel-lattice async offload (Tokio, packet_stream + send_batch_async) | 10.95 | 111.3 % (109.7–112.9) | 150 % | 4.1 MB | 0 |
+| tun-rs async offload (async-io, recv_multiple/send_multiple) | 9.19 | — | 144 % | 6.5 MB | 0 |
+| tunnel-lattice async offload (async-io, packet_stream + send_batch_async) | 11.47 | 124.2 % (119.9–137.0) | 137 % | 3.1 MB | 0 |
 
-Recorded 2026-10-01T11:26:41Z on GitHub Actions ubuntu24 20260927.320.1 runner, AMD EPYC 9V74 80-Core Processor, 4 CPUs, Linux 6.17.0-1022-azure.
-Code 9f5d286; tun-rs 2.8.11, tunnel-lattice 0.4.0, iperf3 3.16; rustc 1.98.1 (48a229cea 2026-09-01), RUSTFLAGS `-C target-cpu=native`.
+Recorded 2026-10-02T08:56:32Z on GitHub Actions ubuntu24 20260927.320.1 runner, AMD EPYC 7763 64-Core Processor, 4 CPUs, Linux 6.17.0-1022-azure.
+Code fdfc0e1; tun-rs 2.8.11, tunnel-lattice 0.5.0, iperf3 3.16; rustc 1.99.0 (b940084d7 2026-09-28), RUSTFLAGS `-C target-cpu=native`.
 Method: two TUN devices (one moved into a network namespace) joined by the forwarder; `iperf3 -t 10` TCP from the host to a server in the namespace. Each row is the median of 5 runs (order rotated every repetition, 1 warm-up run(s) discarded). Throughput is iperf3's receiver rate. "vs tun-rs, same run" is the median (min–max) of the per-repetition ratio to the tun-rs baseline above it, measured in the same repetition. CPU is the forwarder process's user+system time per second sampled at 1 Hz (100 % = one core); RSS is the largest resident set sampled.
 Reproduce: `scripts/bench-forward.sh build && sudo scripts/bench-forward.sh run && scripts/bench-forward.sh report <dir>`.
 Absolute Gbps from shared or virtual runners are not comparable with numbers published on other hardware; compare the same-run ratio.
@@ -164,15 +173,19 @@ root, `iperf3`, and Linux. CI's `bench-forwarder` job (in
 `.github/workflows/ci.yml`) only builds, lints, and tests the harness on
 every push and pull request; it does not run the benchmark.
 
-**What this can and cannot show.** While the only backend wraps `tun-rs`,
-Tunnel Lattice can at best match `tun-rs` minus its own overhead; the ratio
-column measures that overhead. The range in brackets is the spread over
-the repetitions of this one recorded run only; it says nothing about how
-much the ratio varies between runs or machines. Going beyond `tun-rs`
-needs batched I/O and GSO/GRO offload, planned for 0.6, and native per-OS
-backends after that.
-`tun-rs`'s own published numbers come from different hardware, and its
-headline figures use offload, so they are not comparable with this table.
+**What this can and cannot show.** Without offload, while the only backend
+wraps `tun-rs`, Tunnel Lattice can at best match `tun-rs` minus its own
+overhead; the ratio column measures that overhead. With offload, Tunnel
+Lattice splits and coalesces super-packets itself, so the async offload
+rows are not bounded by `tun-rs`'s offload path and exceeded it in this
+run. The sync offload row receives one packet per call and sends each
+packet on its own, so nothing is coalesced on the way out; batched receive
+is not part of this release. The range in brackets is the spread over the
+repetitions of this one recorded run only; it says nothing about how much
+the ratio varies between runs or machines. Native per-OS backends are
+planned after this.
+`tun-rs`'s own published numbers come from different hardware, so they are
+not comparable with this table.
 
 #### Micro-benchmarks
 
