@@ -203,13 +203,11 @@ impl VirtioNetHdr {
 /// cannot wrap for any slice shorter than 2^34 bytes.
 pub(crate) fn sum_words(data: &[u8], initial: u64) -> u64 {
     let mut acc = initial;
-    let mut quads = data.chunks_exact(4);
-    for quad in &mut quads {
-        if let &[a, b, c, d] = quad {
-            acc = acc.wrapping_add(u64::from(u32::from_be_bytes([a, b, c, d])));
-        }
+    let (quads, remainder) = data.as_chunks::<4>();
+    for quad in quads {
+        acc = acc.wrapping_add(u64::from(u32::from_be_bytes(*quad)));
     }
-    let tail = match *quads.remainder() {
+    let tail = match *remainder {
         [a, b, c] => u64::from(u16::from_be_bytes([a, b])) + u64::from(u16::from_be_bytes([c, 0])),
         [a, b] => u64::from(u16::from_be_bytes([a, b])),
         [a] => u64::from(u16::from_be_bytes([a, 0])),
