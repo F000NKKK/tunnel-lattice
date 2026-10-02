@@ -1,0 +1,33 @@
+[package]
+name = "tunnel-lattice-backend-linux"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tunnel-lattice-backend-linux"
+authors.workspace = true
+categories = ["network-programming", "os::linux-apis"]
+keywords = ["linux", "tun", "tap", "netlink", "tunnel"]
+description = "Native Linux TUN/TAP backend for Tunnel Lattice, built directly on /dev/net/tun and a synchronous rtnetlink socket. Compiles to an empty crate on other targets."
+readme = "README.md"
+
+[dependencies]
+tunnel-lattice-core = { workspace = true }
+
+# Everything native is Linux-only: `src/lib.rs` is `#![cfg(target_os =
+# "linux")]`, so on Windows and macOS this crate compiles empty and pulls in
+# nothing beyond the workspace crates above (net-lattice's pattern).
+#
+# The netlink crates are the versions `rtnetlink 0.23.0` (net-lattice)
+# resolves, so the Lattice graphs stay aligned. They are used synchronously
+# through a blocking socket: `default-features = false` keeps tokio, mio and
+# smol out of the graph (netlink-sys's socket integrations are all opt-in).
+# MSRV of all three is 1.77 or lower. No `rtnetlink` (async only) and no
+# `nix`.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
+netlink-packet-core = { version = "0.9.0", default-features = false }
+netlink-packet-route = { version = "0.33.0", default-features = false }
+netlink-sys = { version = "0.9.0", default-features = false }
