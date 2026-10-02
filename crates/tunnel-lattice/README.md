@@ -37,14 +37,15 @@ Main surface:
   for any backend implementing the `tunnel-lattice-platform` traits;
   `Tunnel::capabilities()` answers for the host before anything is opened.
 - `Tunnel::open(DeviceConfig)` returns a `Handle`: `recv`/`send`,
-  `send_batch`, `snapshot` (name, MTU, admin state, TAP MAC), and
+  `recv_batch`/`send_batch`, `snapshot` (name, MTU, admin state, TAP MAC), and
   `apply(DeviceConfigPatch)` (MTU, admin state, TAP MAC where
   `Capability::MAC_MUTATION` is reported: Linux and macOS).
 - Linux only: `Handle::persist`/`unpersist`/`additional_queue`, and opt-in
   TUN segmentation offload via `DeviceConfig::with_offload(true)`.
 - With `tokio` or `async-io`: `packet_stream`/`packet_stream_with_pool` (a
   `futures::Stream` of `PacketBuf` views into a `PacketPool`, no allocation
-  or copy per packet), `send_async`, and `send_batch_async`.
+  or copy per packet), `send_async`, `send_batch_async`, and
+  `recv_batch_async`.
 
 `Handle` is `Clone`: clones share one device, `recv`/`send` take `&self`,
 and the device closes when the last clone (and any stream) is dropped.
@@ -95,6 +96,14 @@ fn main() -> Result<()> {
 `recv` never truncates: an oversize packet is discarded as
 `Error::BufferTooSmall` and the next `recv` works. `recv_buffer_len()` (MTU
 for TUN, MTU + 18 for TAP) fits any packet except a double-tagged TAP frame.
+
+`recv_batch(bufs, lens)` (and `recv_batch_async`) receives up to
+`min(bufs.len(), lens.len())` packets into caller-provided buffers, one per
+buffer, and returns how many: packet `i` is `bufs[i][..lens[i]]`, and only
+those bytes are meaningful. It waits for the first packet only and never
+truncates; how many packets one call returns is up to the backend, and the
+default takes exactly one. `Err` means nothing was received; a failure
+after some packets is reported as that count and appears on the next call.
 
 Forwarding inside async code (Tokio feature); a `PacketBuf` derefs to `[u8]`:
 

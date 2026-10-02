@@ -529,9 +529,12 @@ starting at `packets[k]`, sees the error. Dropping a `send_batch` future
 extends the single-packet rule: an unknown prefix was sent, each packet
 whole and at most once, never a packet after one that was not sent. Only a
 Linux TUN offload queue overrides the default (see "Segmentation offload"
-above); every other backend, OS, and queue sends packet by packet. There
-is no batch receive: the offload receive path splits super-packets behind
-the ordinary one-packet `recv`, which keeps the pool and stream unchanged.
+above); every other backend, OS, and queue sends packet by packet. `recv_batch`
+mirrors it on receive: it waits for the first packet only, returns a
+prefix, and reports an error after `k` packets on the next call. Its
+default receives exactly one packet, and every backend currently keeps that
+default; the offload receive path splits super-packets behind the ordinary
+one-packet `recv`, which keeps the pool and stream unchanged.
 A downstream type that implements both `PacketIo` and `AsyncPacketIo` and
 calls `send_batch` with both traits in scope must name the trait, as it
 already must for `recv` and `send`.

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Batch receive API: `recv_batch`.** `PacketIo::recv_batch(bufs, lens)`
+  and `AsyncPacketIo::recv_batch` are new provided trait methods (no
+  required method was added, and `PacketIo` stays dyn-compatible) that
+  receive up to `min(bufs.len(), lens.len())` packets into caller-provided
+  buffers, one packet per buffer, and return how many. The contract is a
+  prefix: `Ok(n)` means packet `i` is `bufs[i][..lens[i]]` for `i < n`, in
+  device order; `Ok(0)` only for zero capacity; the call waits for the
+  first packet only and then returns a short batch rather than wait again;
+  `Err` means nothing was received, and a failure after some packets is
+  reported as that count and seen by the next call. Only the reported
+  bytes are meaningful: a backend may write anywhere in every buffer. The
+  default implementation receives exactly one packet with `recv`. The
+  facade passes them through as `Handle::recv_batch` and, with `async-io`
+  or `tokio`, `Handle::recv_batch_async`. A downstream type that
+  implements both traits and calls `recv_batch` with both in scope has to
+  name the trait, as for `send_batch`.
+
+### Changed
+
+- **`AsyncPacketIo::recv` cancellation.** Its documentation now states
+  the backend obligation that a future dropped while waiting loses no
+  packet, and that a backend which cannot guarantee this on some OS
+  documents what a dropped receive may lose there.
+
 ## [0.6.0]
 
 ### Added

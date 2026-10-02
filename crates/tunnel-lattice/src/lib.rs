@@ -41,10 +41,12 @@
 //!   `tunnel-lattice-async`'s thread-based adapter. Either feature also adds
 //!   `Handle::send_async`, which returns the backend's own async send
 //!   future for use inside async code, where the blocking `Handle::send`
-//!   must not be called, and its batch counterpart
-//!   `Handle::send_batch_async`. No async runtime is forced on a caller
-//!   that enables neither feature. `packet_stream`, `send_async`, and
-//!   `send_batch_async` are referenced here as plain text, not intra-doc
+//!   must not be called, its batch counterpart `Handle::send_batch_async`,
+//!   and `Handle::recv_batch_async`, the async counterpart of the blocking
+//!   `Handle::recv_batch`. No async runtime is forced on a caller that
+//!   enables neither feature. `packet_stream`, `send_async`,
+//!   `send_batch_async`, and `recv_batch_async` are referenced here as
+//!   plain text, not intra-doc
 //!   links, because they only exist under these features and this crate's
 //!   default `cargo doc` build (no features beyond `tun-rs`) cannot resolve
 //!   them.
@@ -306,6 +308,58 @@ where
     /// task, `#[tokio::main]`, or `block_on`).
     pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
         self.device.recv(buf)
+    }
+
+    /// Reads up to `min(bufs.len(), lens.len())` packets, one per element,
+    /// returning how many were received.
+    ///
+    /// Passes straight through to the device's [`PacketIo::recv_batch`],
+    /// with its prefix contract: `Ok(n)` means packets were written to
+    /// `bufs[..n]` in device order, with `lens[i]` the length of packet
+    /// `i`, each framed as [`Handle::recv`] frames it. Only
+    /// `bufs[i][..lens[i]]` for `i < n` is meaningful; the device may have
+    /// written anywhere in every buffer. An empty `bufs` or `lens` returns
+    /// `Ok(0)` without a native call.
+    ///
+    /// The call blocks only until the first packet arrives, then takes
+    /// whatever further packets the device has ready without blocking
+    /// again, so `n` may be anything from 1 to the capacity. How many
+    /// packets one call returns is up to the backend: the default takes
+    /// exactly one.
+    ///
+    /// ```no_run
+    /// # use tunnel_lattice::{ConnectedDevice, Handle, Result};
+    /// # fn example<D: ConnectedDevice>(device: &Handle<D>) -> Result<()> {
+    /// let mut storage = vec![[0u8; 1500]; 32];
+    /// let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|buf| &mut buf[..]).collect();
+    /// let mut lens = [0usize; 32];
+    /// let received = device.recv_batch(&mut bufs, &mut lens)?;
+    /// for (buf, &len) in bufs.iter().zip(&lens).take(received) {
+    ///     println!("{len} bytes: {:?}", &buf[..len]);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Blocks the calling thread like [`Handle::recv`], with the same
+    /// runtime requirements; inside async code use `recv_batch_async`
+    /// instead (available with the `async-io` or `tokio` feature).
+    ///
+    /// # Errors
+    ///
+    /// The error that kept the first packet from being received, classified
+    /// as [`Handle::recv`] classifies it; nothing was received. A failure
+    /// after some packets were received is reported as `Ok(k)` instead, and
+    /// appears on the next call. A packet too large for `bufs[0]` is
+    /// discarded as [`Error::BufferTooSmall`]; one too large for a later
+    /// buffer ends the batch, and either it is received by the next call or
+    /// the next call returns `Error::BufferTooSmall` for it.
+    ///
+    /// # Panics
+    ///
+    /// Under the same conditions as [`Handle::recv`].
+    pub fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        self.device.recv_batch(bufs, lens)
     }
 
     /// Writes one packet from `buf`.
@@ -669,6 +723,50 @@ where
         D: Sync,
     {
         AsyncPacketIo::send_batch(&*self.device, packets)
+    }
+
+    /// Reads up to `min(bufs.len(), lens.len())` packets, one per element,
+    /// without blocking the calling thread, returning how many were
+    /// received.
+    ///
+    /// The async counterpart of [`Handle::recv_batch`], with the same
+    /// prefix contract: `Ok(n)` means packets were written to `bufs[..n]`
+    /// in device order, with `lens[i]` the length of packet `i`; only
+    /// `bufs[i][..lens[i]]` for `i < n` is meaningful; an empty `bufs` or
+    /// `lens` gives `Ok(0)`. The future waits only for the first packet,
+    /// then takes whatever further packets are ready without waiting
+    /// again. The returned future is the device's own
+    /// [`AsyncPacketIo::recv_batch`] future, unchanged, and must be polled
+    /// as `send_async`'s is. There is no capability check and no fallback.
+    ///
+    /// This takes caller-owned buffers. For a stream of pooled packets, use
+    /// `packet_stream` instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Handle::recv_batch`]: the error that kept the first packet from
+    /// being received, and nothing was received. A failure after some
+    /// packets were received is reported as `Ok(k)` and appears on the next
+    /// call.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future before it completes is always safe and loses no
+    /// packet beyond what dropping a single-packet receive in the same
+    /// state would lose: packets a backend has taken but not yet returned
+    /// stay queued on the device for the next receive. With the tun-rs
+    /// backend a dropped receive loses nothing on Linux and macOS; on
+    /// Windows, see the backend's documentation for what a read started
+    /// before the drop leaves behind.
+    pub fn recv_batch_async(
+        &self,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+    ) -> impl Future<Output = Result<usize>> + Send
+    where
+        D: Sync,
+    {
+        AsyncPacketIo::recv_batch(&*self.device, bufs, lens)
     }
 }
 

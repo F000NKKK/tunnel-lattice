@@ -42,10 +42,12 @@ public API. The workspace
   `DeviceConfig`/`Device` associated types (this crate never names
   `tunnel_lattice_model` types directly).
 - ✅ **`PacketIo`**: synchronous packet transfer on an open device handle:
-  `recv`, `send`, and a provided `send_batch` that sends a prefix of a
-  packet list (see "Backend Contract" below). The default implementation
-  sends one packet at a time; a backend overrides it when it can send
-  several more cheaply. Adding it keeps the trait dyn-compatible.
+  `recv`, `send`, a provided `send_batch` that sends a prefix of a packet
+  list, and a provided `recv_batch` that receives packets into
+  caller-provided buffers (see "Backend Contract" below). The default
+  `send_batch` sends one packet at a time and the default `recv_batch`
+  receives exactly one packet; a backend overrides them when it can move
+  several packets more cheaply. Both keep the trait dyn-compatible.
 - ✅ **`DeviceObserver`**: reads an open device's current name, MTU, and
   administrative state back, and returns the device identity captured at
   open without a native call.
@@ -66,7 +68,7 @@ public API. The workspace
   blocking syscall. See that trait's docs for why it is preferred over
   `tunnel-lattice-async`'s generic thread-based adapter when available.
   It has the same provided `send_batch`, awaiting `send` once per packet by
-  default.
+  default, and the same provided `recv_batch`, awaiting `recv` once.
 
 ### Capabilities
 - 🧩 **`Capability`**: a `bitflags` set of runtime-dependent features:
@@ -113,6 +115,36 @@ either the whole packet sent or nothing, never part of it and never twice,
 and must not use `buf` afterwards (copy it first if the write can outlive
 the future). Callers may rely only on "the whole packet at most once;
 unknown after drop".
+
+Dropping an `AsyncPacketIo::recv` future while it waits must lose no
+packet: the implementation must not hold a packet it took from the device
+across an `.await`. A backend that cannot guarantee this on some OS
+documents what a dropped receive may lose there.
+
+`recv_batch(bufs, lens)` (sync and async) receives up to
+`min(bufs.len(), lens.len())` packets, and an override must keep this
+contract:
+
+- `Ok(n)`: packets were written to `bufs[..n]` in device order, `lens[i]`
+  is the length of packet `i` (at most `bufs[i].len()`), and each
+  `bufs[i][..lens[i]]` is exactly one packet framed as `recv` frames it.
+  Only those bytes are meaningful: the backend may have written anywhere
+  in every buffer.
+- `Ok(0)` only for zero capacity, without a native call.
+- Wait for the first packet only: once one packet was taken from the
+  device, never wait again and return a short batch instead.
+- `Err(e)`: no packet was received, and `e` is classified as `recv` would
+  classify it. A failure after `k >= 1` packets is reported as `Ok(k)`, and
+  the next call on the same queue must see it; no error is swallowed.
+- A packet too large for `bufs[0]` is discarded as `BufferTooSmall`. One
+  too large for `bufs[k]`, `k >= 1`, ends the batch: either it stays
+  queued, or, if it was already read, the next `recv` or `recv_batch` on
+  that queue returns `BufferTooSmall` first.
+- Dropping an `AsyncPacketIo::recv_batch` future loses no packet beyond
+  what dropping a `recv` future in the same state would: no `.await` after
+  the first packet is taken, and any packet taken but not returned (such as
+  the remaining segments of an offloaded super-packet) stays in state owned
+  by the queue.
 
 `send_batch` (sync and async) follows a prefix contract with no deferred
 errors, and an override must keep it:

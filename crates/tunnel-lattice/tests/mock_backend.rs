@@ -25,6 +25,11 @@ struct State {
     /// The length of every batch passed to either `send_batch` override,
     /// so a test can tell the facade reached the device's own method.
     batches: Mutex<Vec<usize>>,
+    /// The capacity of every batch passed to `PacketIo::recv_batch`.
+    recv_batches: Mutex<Vec<usize>>,
+    /// The capacity of every batch passed to `AsyncPacketIo::recv_batch`.
+    #[cfg(feature = "async")]
+    async_recv_batches: Mutex<Vec<usize>>,
     /// Packets written through `AsyncPacketIo::send`, kept apart so a test
     /// can tell which path a facade method took.
     #[cfg(feature = "async")]
@@ -124,6 +129,48 @@ impl PacketIo for MockDevice {
             PacketIo::send(self, packet)?;
         }
         Ok(limit)
+    }
+
+    fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        self.state
+            .recv_batches
+            .lock()
+            .unwrap()
+            .push(bufs.len().min(lens.len()));
+        self.take_batch(bufs, lens)
+    }
+}
+
+impl MockDevice {
+    /// Follows `recv_batch`'s contract: takes every queued packet that fits,
+    /// up to the capacity, and returns a short batch rather than waiting.
+    /// A packet too large for `bufs[0]` is discarded as `BufferTooSmall`;
+    /// one too large for a later buffer stays queued. An empty inbox after
+    /// `k >= 1` packets gives `Ok(k)`, and the next call `Disconnected`.
+    fn take_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        let capacity = bufs.len().min(lens.len());
+        let mut inbox = self.state.inbox.lock().unwrap();
+        let mut received = 0;
+        while received < capacity {
+            let Some(packet) = inbox.front() else {
+                break;
+            };
+            let Some(slot) = bufs[received].get_mut(..packet.len()) else {
+                if received == 0 {
+                    inbox.pop_front();
+                    return Err(Error::BufferTooSmall);
+                }
+                break;
+            };
+            slot.copy_from_slice(packet);
+            lens[received] = packet.len();
+            inbox.pop_front();
+            received += 1;
+        }
+        if received == 0 && capacity > 0 {
+            return Err(Error::Disconnected);
+        }
+        Ok(received)
     }
 }
 
@@ -248,6 +295,19 @@ impl tunnel_lattice::AsyncPacketIo for MockDevice {
         }
         Ok(limit)
     }
+
+    /// Records the batch, then takes packets like the sync override.
+    async fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize>
+    where
+        Self: Sync,
+    {
+        self.state
+            .async_recv_batches
+            .lock()
+            .unwrap()
+            .push(bufs.len().min(lens.len()));
+        self.take_batch(bufs, lens)
+    }
 }
 
 #[test]
@@ -335,6 +395,80 @@ fn send_batch_passes_through_to_the_device_including_a_short_batch() {
         Err(Error::Disconnected)
     ));
     assert_eq!(*state.batches.lock().unwrap(), [3, 1, 3]);
+}
+
+/// Receive buffers of 8 bytes each.
+fn recv_storage() -> [[u8; 8]; 4] {
+    [[0; 8]; 4]
+}
+
+#[test]
+fn recv_batch_passes_through_to_the_device_including_a_short_batch() {
+    let backend = MockBackend::new();
+    let state = Arc::clone(&backend.state);
+    let handle = Tunnel::new(backend)
+        .open(DeviceConfig::new(DeviceKind::Tun))
+        .expect("open");
+    state
+        .inbox
+        .lock()
+        .unwrap()
+        .extend(BATCH.iter().map(|packet| packet.to_vec()));
+    let mut storage = recv_storage();
+    let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|buf| &mut buf[..]).collect();
+    let mut lens = [0usize; 4];
+
+    // Capacity is the shorter of the two slices.
+    assert_eq!(
+        handle.recv_batch(&mut bufs, &mut lens[..2]).expect("full"),
+        2
+    );
+    assert_eq!(
+        (&bufs[0][..lens[0]], &bufs[1][..lens[1]]),
+        (BATCH[0], BATCH[1])
+    );
+
+    // Fewer packets queued than the capacity: a short batch, no waiting.
+    assert_eq!(handle.recv_batch(&mut bufs, &mut lens).expect("short"), 1);
+    assert_eq!(&bufs[0][..lens[0]], BATCH[2]);
+
+    // Nothing left: the device's error, with nothing received.
+    assert!(matches!(
+        handle.recv_batch(&mut bufs, &mut lens),
+        Err(Error::Disconnected)
+    ));
+
+    // Zero capacity still reaches the device, which returns `Ok(0)`.
+    assert_eq!(handle.recv_batch(&mut [], &mut lens).expect("empty"), 0);
+    assert_eq!(*state.recv_batches.lock().unwrap(), [2, 4, 4, 0]);
+}
+
+#[test]
+fn a_recv_batch_failure_after_k_packets_reaches_the_next_call() {
+    let backend = MockBackend::new();
+    let state = Arc::clone(&backend.state);
+    let handle = Tunnel::new(backend)
+        .open(DeviceConfig::new(DeviceKind::Tun))
+        .expect("open");
+    state
+        .inbox
+        .lock()
+        .unwrap()
+        .extend([b"one".to_vec(), b"too long!".to_vec(), b"two".to_vec()]);
+    let mut storage = recv_storage();
+    let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|buf| &mut buf[..]).collect();
+    let mut lens = [0usize; 4];
+
+    // The oversize packet at position 1 ends the batch and stays queued.
+    assert_eq!(handle.recv_batch(&mut bufs, &mut lens).expect("prefix"), 1);
+    assert_eq!(&bufs[0][..lens[0]], b"one");
+    // The next call reports it at position 0 and discards it.
+    assert!(matches!(
+        handle.recv_batch(&mut bufs, &mut lens),
+        Err(Error::BufferTooSmall)
+    ));
+    assert_eq!(handle.recv_batch(&mut bufs, &mut lens).expect("next"), 1);
+    assert_eq!(&bufs[0][..lens[0]], b"two");
 }
 
 #[test]
@@ -561,6 +695,62 @@ fn send_batch_async_passes_through_to_the_async_device_method() {
         Err(Error::Disconnected)
     ));
     assert_eq!(state.async_sent.lock().unwrap().len(), BATCH_LIMIT);
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn recv_batch_async_passes_through_to_the_async_device_method() {
+    let (handle, state) = async_handle(true);
+    state
+        .inbox
+        .lock()
+        .unwrap()
+        .extend(BATCH.iter().map(|packet| packet.to_vec()));
+    let mut storage = recv_storage();
+    let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|buf| &mut buf[..]).collect();
+    let mut lens = [0usize; 4];
+
+    let received = futures::executor::block_on(handle.recv_batch_async(&mut bufs, &mut lens));
+    assert_eq!(received.expect("short batch"), 3);
+    for (i, packet) in BATCH.iter().enumerate() {
+        assert_eq!(&bufs[i][..lens[i]], *packet);
+    }
+    assert!(matches!(
+        futures::executor::block_on(handle.recv_batch_async(&mut bufs, &mut lens)),
+        Err(Error::Disconnected)
+    ));
+    assert_eq!(
+        futures::executor::block_on(handle.recv_batch_async(&mut [], &mut lens)).expect("empty"),
+        0
+    );
+    assert_eq!(*state.async_recv_batches.lock().unwrap(), [4, 4, 0]);
+    assert!(
+        state.recv_batches.lock().unwrap().is_empty(),
+        "not PacketIo"
+    );
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn the_recv_batch_async_future_is_send_and_runs_on_another_thread() {
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+
+    let (handle, state) = async_handle(true);
+    state.inbox.lock().unwrap().push_back(b"moved".to_vec());
+    let mut storage = recv_storage();
+    let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|buf| &mut buf[..]).collect();
+    let mut lens = [0usize; 4];
+    let future = assert_send(handle.recv_batch_async(&mut bufs, &mut lens));
+    let received = std::thread::scope(|scope| {
+        scope
+            .spawn(move || futures::executor::block_on(future))
+            .join()
+            .expect("the receiving thread does not panic")
+    });
+    assert_eq!(received.expect("recv_batch_async"), 1);
+    assert_eq!(&bufs[0][..lens[0]], b"moved");
 }
 
 #[cfg(feature = "async")]

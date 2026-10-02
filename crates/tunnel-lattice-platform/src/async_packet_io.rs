@@ -29,7 +29,77 @@ pub trait AsyncPacketIo {
     /// usable, and the next `recv` with a large enough buffer receives the
     /// following packet. `tunnel_lattice_model::Device::recv_buffer_len`
     /// gives a buffer size that fits at the device's current MTU.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned future while it is still waiting for a packet
+    /// must be safe and must lose no packet: a packet the device has not
+    /// yet handed over stays queued for the next receive. The
+    /// implementation must not hold a packet it has already taken from the
+    /// device across an `.await`, so a drop cannot lose it. A backend that
+    /// cannot guarantee this on some OS (for example because a native read
+    /// it started can still complete after the future is dropped) must
+    /// document there what a dropped receive may lose.
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send;
+
+    /// Reads up to `min(bufs.len(), lens.len())` packets, one per element,
+    /// returning how many were received.
+    ///
+    /// The async counterpart of [`crate::PacketIo::recv_batch`], with the
+    /// same contract:
+    ///
+    /// - `Ok(n)`: packets were written to `bufs[..n]` in device order, and
+    ///   `lens[i] <= bufs[i].len()` is the length of packet `i`; each
+    ///   `bufs[i][..lens[i]]` holds exactly one packet, framed as
+    ///   [`Self::recv`] frames it.
+    /// - `Ok(0)` only when `bufs` or `lens` is empty, without any native
+    ///   call; the shorter of the two sets the capacity.
+    /// - The future waits only until the first packet is available, and
+    ///   once it has taken that packet it never waits again: a short batch
+    ///   is normal.
+    /// - `Err(e)`: no packet was received, and `e` is classified exactly as
+    ///   [`Self::recv`] would classify it. A failure after at least one
+    ///   packet was received is reported as `Ok(k)`, and the next call on
+    ///   the same queue sees it.
+    /// - Only `bufs[i][..lens[i]]` for `i < n` is meaningful; the
+    ///   implementation may have written anywhere in every element of
+    ///   `bufs`.
+    /// - A packet that does not fit `bufs[0]` is discarded and reported as
+    ///   `Err(BufferTooSmall)`. One that does not fit `bufs[k]`, `k >= 1`,
+    ///   ends the batch with `Ok(k)` and either stays queued or makes the
+    ///   next `recv` or `recv_batch` on that queue return
+    ///   `Err(BufferTooSmall)` first.
+    ///
+    /// The provided implementation awaits [`Self::recv`] once, into
+    /// `bufs[0]`. A backend overrides it when it can take several packets
+    /// that are already waiting without waiting again; an override keeps
+    /// the same contract.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned future before it completes must be safe and
+    /// must lose no packet beyond what dropping a [`Self::recv`] future in
+    /// the same state would lose. The implementation must not `.await`
+    /// after it has taken the first packet from the device, and any packet
+    /// it took but did not return (for example the remaining segments of
+    /// an offloaded super-packet) must stay in state owned by the queue,
+    /// never in the future, so the next receive returns it.
+    fn recv_batch(
+        &self,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+    ) -> impl Future<Output = Result<usize>> + Send
+    where
+        Self: Sync,
+    {
+        async move {
+            let (Some(buf), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
+                return Ok(0);
+            };
+            *len = self.recv(buf).await?;
+            Ok(1)
+        }
+    }
 
     /// Writes one packet from `buf`.
     ///
@@ -87,9 +157,11 @@ pub trait AsyncPacketIo {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::pin;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
     use tunnel_lattice_core::{Error, Result};
@@ -105,10 +177,17 @@ mod tests {
         Hang,
     }
 
-    /// Each send's outcome is `outcome(packets sent so far)`.
+    /// Each send's outcome is `outcome(packets sent so far)`. Receives take
+    /// packets from `inbox` in order and fail with `Error::Disconnected`
+    /// once it is empty.
     struct Mock {
         outcome: fn(usize) -> Outcome,
         sent: Mutex<Vec<Vec<u8>>>,
+        inbox: Mutex<VecDeque<Vec<u8>>>,
+        /// A receive stays `Pending`, taking nothing, while this is set.
+        hold_recv: AtomicBool,
+        /// `recv` polls so far.
+        recv_polls: AtomicUsize,
     }
 
     impl Mock {
@@ -116,17 +195,49 @@ mod tests {
             Self {
                 outcome,
                 sent: Mutex::new(Vec::new()),
+                inbox: Mutex::new(VecDeque::new()),
+                hold_recv: AtomicBool::new(false),
+                recv_polls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_inbox(packets: &[&[u8]]) -> Self {
+            let mock = Self::new(|_| Outcome::Send);
+            mock.inbox
+                .lock()
+                .unwrap()
+                .extend(packets.iter().map(|packet| packet.to_vec()));
+            mock
         }
 
         fn sent(&self) -> Vec<Vec<u8>> {
             self.sent.lock().unwrap().clone()
         }
+
+        fn queued(&self) -> usize {
+            self.inbox.lock().unwrap().len()
+        }
     }
 
     impl AsyncPacketIo for Mock {
-        async fn recv(&self, _buf: &mut [u8]) -> Result<usize> {
-            Err(Error::Disconnected)
+        /// Takes a packet only in the poll that completes, so a future
+        /// dropped while `Pending` took nothing. An oversize packet is
+        /// discarded and reported as `BufferTooSmall`.
+        fn recv(&self, buf: &mut [u8]) -> impl Future<Output = Result<usize>> + Send {
+            std::future::poll_fn(move |_| {
+                self.recv_polls.fetch_add(1, Ordering::SeqCst);
+                if self.hold_recv.load(Ordering::SeqCst) {
+                    return Poll::Pending;
+                }
+                let Some(packet) = self.inbox.lock().unwrap().pop_front() else {
+                    return Poll::Ready(Err(Error::Disconnected));
+                };
+                let Some(slot) = buf.get_mut(..packet.len()) else {
+                    return Poll::Ready(Err(Error::BufferTooSmall));
+                };
+                slot.copy_from_slice(&packet);
+                Poll::Ready(Ok(packet.len()))
+            })
         }
 
         /// Decides and writes only when polled, so a future dropped while
@@ -227,5 +338,82 @@ mod tests {
         let future = mock.send_batch(&PACKETS);
         assert_send(&future);
         assert_eq!(ready(future).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_zero_capacity_batch_receives_nothing_without_calling_recv() {
+        let mock = Mock::with_inbox(&PACKETS);
+        let mut buf = [0u8; 4];
+        assert_eq!(ready(mock.recv_batch(&mut [], &mut [])).unwrap(), 0);
+        assert_eq!(ready(mock.recv_batch(&mut [], &mut [0; 2])).unwrap(), 0);
+        // `lens` shorter than `bufs` sets the capacity.
+        assert_eq!(ready(mock.recv_batch(&mut [&mut buf], &mut [])).unwrap(), 0);
+        assert_eq!(mock.recv_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.queued(), PACKETS.len());
+    }
+
+    #[test]
+    fn the_default_batch_receives_exactly_one_packet() {
+        let mock = Mock::with_inbox(&PACKETS);
+        let (mut first, mut second) = ([0u8; 4], [0xEEu8; 4]);
+        let mut lens = [usize::MAX; 2];
+        let received = ready(mock.recv_batch(&mut [&mut first, &mut second], &mut lens)).unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(&first[..lens[0]], b"a");
+        assert_eq!((second, lens[1]), ([0xEE; 4], usize::MAX));
+        assert_eq!(mock.queued(), 2, "the rest stay queued");
+    }
+
+    #[test]
+    fn a_failure_on_the_first_packet_is_the_recv_error() {
+        let mut buf = [0u8; 4];
+        let mut lens = [0usize; 2];
+        let mock = Mock::with_inbox(&[]);
+        assert!(matches!(
+            ready(mock.recv_batch(&mut [&mut buf], &mut lens)),
+            Err(Error::Disconnected)
+        ));
+
+        let mock = Mock::with_inbox(&[b"too long", b"ok"]);
+        assert!(matches!(
+            ready(mock.recv_batch(&mut [&mut buf], &mut lens)),
+            Err(Error::BufferTooSmall)
+        ));
+        assert_eq!(
+            ready(mock.recv_batch(&mut [&mut buf], &mut lens)).unwrap(),
+            1
+        );
+        assert_eq!(&buf[..lens[0]], b"ok");
+    }
+
+    #[test]
+    fn a_batch_future_dropped_while_recv_waits_took_nothing() {
+        let mock = Mock::with_inbox(&PACKETS);
+        mock.hold_recv.store(true, Ordering::SeqCst);
+        let mut buf = [0u8; 4];
+        let mut lens = [0usize; 1];
+        // One poll waits in `recv`; returning drops the future there.
+        assert!(poll_once(mock.recv_batch(&mut [&mut buf], &mut lens)).is_pending());
+        assert_eq!(mock.recv_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.queued(), PACKETS.len());
+
+        mock.hold_recv.store(false, Ordering::SeqCst);
+        assert_eq!(
+            ready(mock.recv_batch(&mut [&mut buf], &mut lens)).unwrap(),
+            1
+        );
+        assert_eq!(&buf[..lens[0]], b"a", "the first packet was not lost");
+    }
+
+    #[test]
+    fn the_recv_batch_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let mock = Mock::with_inbox(&PACKETS);
+        let mut buf = [0u8; 4];
+        let mut lens = [0usize; 1];
+        let mut bufs = [&mut buf[..]];
+        let future = mock.recv_batch(&mut bufs, &mut lens);
+        assert_send(&future);
+        assert_eq!(ready(future).unwrap(), 1);
     }
 }
