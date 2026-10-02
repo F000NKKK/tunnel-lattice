@@ -28,11 +28,11 @@ use std::os::fd::{AsFd, OwnedFd};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tunnel_lattice_core::Result;
-use tunnel_lattice_model::DeviceKind;
+use tunnel_lattice_model::{AdminState, DeviceKind};
 
 use crate::offload_queue::OffloadRx;
 use crate::open_contract::HostOs;
-use crate::recv_contract;
+use crate::recv_contract::{self, DeferredTooSmall, Step};
 
 /// A duplicate of a device descriptor, registered with the current Tokio
 /// reactor for readable and error readiness.
@@ -64,15 +64,8 @@ impl ErrorAwareReader {
         AsyncFd::with_interest(File::from(fd), Interest::READABLE | Interest::ERROR).map(Self)
     }
 
-    /// `recv` on an offload-framed queue: serves the next pending segment
-    /// of `rx`, or waits for readable or error readiness and reads one frame
-    /// into `rx`'s staging buffer (see `offload_queue`).
-    ///
-    /// The cooperative budget is spent before anything is served or read,
-    /// so a yield never happens after a segment was taken or a frame was
-    /// read. The staging lock is taken only between awaits, and nothing
-    /// awaits between a successful read and the return, so a dropped
-    /// future leaves every unserved segment pending for the next `recv`.
+    /// `recv` on an offload-framed queue: a batch of one through
+    /// [`Self::recv_offload_batch`], which therefore never drains.
     pub(crate) async fn recv_offload(
         &self,
         os: HostOs,
@@ -80,14 +73,49 @@ impl ErrorAwareReader {
         rx: &OffloadRx,
         out: &mut [u8],
     ) -> Result<usize> {
+        let mut lens = [0];
+        self.recv_offload_batch(os, kind, rx, &mut [out], &mut lens)
+            .await
+            .map(|_| lens[0])
+    }
+
+    /// `recv_batch` on an offload-framed queue: position 0 serves the next
+    /// pending segment of `rx`, or waits for readable or error readiness and
+    /// reads one frame into `rx`'s staging buffer (see `offload_queue`);
+    /// then the staging drains, reading further frames with
+    /// `AsyncFd::try_io`, which never waits (a `WouldBlock` clears the
+    /// readiness it saw, as `try_io` on a guard does).
+    ///
+    /// The cooperative budget is spent before anything is served or read,
+    /// so a yield never happens after a segment was taken or a frame was
+    /// read. The staging lock is taken only between awaits, and nothing
+    /// awaits between a successful read and the return, so a dropped
+    /// future leaves every unserved segment pending for the next call.
+    pub(crate) async fn recv_offload_batch(
+        &self,
+        os: HostOs,
+        kind: DeviceKind,
+        rx: &OffloadRx,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+    ) -> Result<usize> {
+        if recv_contract::batch_capacity(bufs, lens) == 0 {
+            return Ok(0);
+        }
+        let mut read_nowait = |buf: &mut [u8]| {
+            self.0.try_io(Interest::READABLE, |file| {
+                let mut file: &File = file;
+                file.read(buf)
+            })
+        };
         tokio::task::coop::consume_budget().await;
         loop {
-            if let Some(result) = rx.lock().next_pending(out) {
+            if let Some(result) = rx.lock().pending_batch(os, bufs, lens, &mut read_nowait) {
                 return result;
             }
             let ready = self.0.ready(Interest::READABLE | Interest::ERROR).await;
             let mut staging = rx.lock();
-            if let Some(result) = staging.next_pending(out) {
+            if let Some(result) = staging.pending_batch(os, bufs, lens, &mut read_nowait) {
                 return result;
             }
             let result = match ready {
@@ -102,11 +130,89 @@ impl ErrorAwareReader {
                 },
                 Err(err) => Err(err),
             };
-            if let Some(result) = staging.finish_read(os, kind, result, out) {
+            if let Some(result) = staging.read_batch(os, kind, result, bufs, lens, &mut read_nowait)
+            {
                 return result;
             }
         }
     }
+
+    /// `recv_batch` on a plainly framed queue. Position 0 is exactly
+    /// `recv`: [`recv_contract::recv_async`] over this reader's `recv_native`,
+    /// with the cooperative budget spent before each native attempt and
+    /// the readable-or-error wait. The positions after it read
+    /// `[bufs[k], sentinel]` with `try_io` on the readiness guard position
+    /// 0 read with, never waiting again: a `WouldBlock` there clears the
+    /// readiness and ends the batch (see `recv_contract`, "Draining a
+    /// batch"). Nothing awaits after position 0's read, so a dropped future
+    /// has taken no packet. The caller has checked the capacity and taken
+    /// any deferred error.
+    pub(crate) async fn recv_batch_plain<O>(
+        &self,
+        os: HostOs,
+        kind: DeviceKind,
+        oper: &O,
+        bufs: &mut [&mut [u8]],
+        lens: &mut [usize],
+        deferred: &DeferredTooSmall,
+    ) -> Result<usize>
+    where
+        O: Fn() -> io::Result<AdminState> + Sync,
+    {
+        let mut retried = false;
+        'native: loop {
+            // `recv_native`'s budget, spent before every native attempt.
+            tokio::task::coop::consume_budget().await;
+            let (Some(buf), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
+                return Ok(0);
+            };
+            let buf_len = buf.len();
+            loop {
+                let mut guard = match self.0.ready(Interest::READABLE | Interest::ERROR).await {
+                    Ok(guard) => guard,
+                    Err(err) => match recv_contract::recv_step(
+                        os,
+                        kind,
+                        buf_len,
+                        Err(err),
+                        &mut retried,
+                        oper,
+                    ) {
+                        Step::Retry => continue 'native,
+                        Step::Done(result) => return result.map(|_| 0),
+                    },
+                };
+                let result = match guard.try_io(|fd| sentinel_read(fd.get_ref(), buf)) {
+                    Ok(result) => result,
+                    // As in `recv_native`: wait again.
+                    Err(_would_block) => continue,
+                };
+                match recv_contract::recv_step(os, kind, buf_len, result, &mut retried, oper) {
+                    Step::Retry => continue 'native,
+                    Step::Done(result) => *len = result?,
+                }
+                return Ok(recv_contract::drain_plain(
+                    os,
+                    bufs,
+                    lens,
+                    1,
+                    deferred,
+                    |buf| match guard.try_io(|fd| sentinel_read(fd.get_ref(), buf)) {
+                        Ok(result) => result,
+                        Err(_would_block) => Err(io::ErrorKind::WouldBlock.into()),
+                    },
+                ));
+            }
+        }
+    }
+}
+
+/// One sentinel read (`readv` into `[buf, 1-byte sentinel]`) on the
+/// reader's descriptor, which is non-blocking.
+fn sentinel_read(file: &File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut sentinel = [0u8; 1];
+    let mut file = file;
+    file.read_vectored(&mut [IoSliceMut::new(buf), IoSliceMut::new(&mut sentinel)])
 }
 
 /// The sentinel read of `recv_contract` (`readv` into `[buf, 1-byte
@@ -368,6 +474,222 @@ mod tests {
         assert_eq!(served.len(), 3);
         for (k, packet) in served.iter().enumerate() {
             assert_segment(packet, k, 100);
+        }
+    }
+
+    /// A status read for the plain batch tests, which never meet a
+    /// Windows TAP 995.
+    fn no_status() -> io::Result<AdminState> {
+        panic!("the status is read only for a Windows TAP 995")
+    }
+
+    /// Polls `future` once and reports whether it is still pending; the
+    /// future is dropped either way.
+    async fn first_poll_pending<F: Future>(future: F) -> bool {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    /// The plain batch: position 0 waits, the rest drains with `try_io` on
+    /// the same guard, in order, and stops at the empty socket; a datagram
+    /// longer than its buffer after the first ends the batch and is
+    /// reported once, through the deferred flag.
+    #[test]
+    fn a_plain_batch_drains_in_order_and_defers_a_too_long_packet() {
+        let (first, second, deferred_err, last) = with_watchdog("plain batch", || {
+            let (ours, theirs) = datagram_pair();
+            runtime().block_on(async move {
+                let reader =
+                    ErrorAwareReader::from_owned(OwnedFd::from(ours)).expect("register the socket");
+                let deferred = DeferredTooSmall::new();
+                let mut bufs = vec![vec![0u8; 8]; 4];
+                let mut lens = [0; 4];
+                let batch = async |bufs: &mut Vec<Vec<u8>>, lens: &mut [usize]| {
+                    let mut slices: Vec<&mut [u8]> =
+                        bufs.iter_mut().map(Vec::as_mut_slice).collect();
+                    reader
+                        .recv_batch_plain(
+                            HostOs::Linux,
+                            DeviceKind::Tun,
+                            &no_status,
+                            &mut slices,
+                            lens,
+                            &deferred,
+                        )
+                        .await
+                };
+                for packet in [&b"one"[..], b"two", b"three"] {
+                    theirs.send(packet).expect("send a datagram");
+                }
+                let n = batch(&mut bufs, &mut lens).await.expect("a batch");
+                let first: Vec<Vec<u8>> = (0..n).map(|i| bufs[i][..lens[i]].to_vec()).collect();
+                for packet in [&b"four"[..], b"123456789", b"last"] {
+                    theirs.send(packet).expect("send a datagram");
+                }
+                let n = batch(&mut bufs, &mut lens).await.expect("a batch");
+                let second: Vec<Vec<u8>> = (0..n).map(|i| bufs[i][..lens[i]].to_vec()).collect();
+                let deferred_err = deferred.take();
+                let n = batch(&mut bufs, &mut lens).await.expect("a batch");
+                let last: Vec<Vec<u8>> = (0..n).map(|i| bufs[i][..lens[i]].to_vec()).collect();
+                (first, second, deferred_err, last)
+            })
+        });
+        assert_eq!(first, [&b"one"[..], b"two", b"three"]);
+        assert_eq!(second, [&b"four"[..]]);
+        assert!(matches!(
+            deferred_err,
+            Err(tunnel_lattice_core::Error::BufferTooSmall)
+        ));
+        assert_eq!(last, [&b"last"[..]]);
+    }
+
+    /// A plain batch dropped while it waits, or because the cooperative
+    /// budget forced a yield, has taken no packet.
+    #[test]
+    fn a_dropped_plain_batch_loses_no_packet() {
+        let got = with_watchdog("dropped plain batch", || {
+            let (ours, theirs) = datagram_pair();
+            runtime().block_on(async move {
+                tokio::spawn(async move {
+                    let reader = ErrorAwareReader::from_owned(OwnedFd::from(ours))
+                        .expect("register the socket");
+                    let deferred = DeferredTooSmall::new();
+                    let mut a = [0u8; 8];
+                    let mut b = [0u8; 8];
+                    let mut lens = [0; 2];
+                    macro_rules! batch {
+                        () => {
+                            reader.recv_batch_plain(
+                                HostOs::Linux,
+                                DeviceKind::Tun,
+                                &no_status,
+                                &mut [&mut a[..], &mut b[..]],
+                                &mut lens,
+                                &deferred,
+                            )
+                        };
+                    }
+                    assert!(first_poll_pending(batch!()).await, "nothing to read yet");
+                    theirs.send(b"keep").expect("send a datagram");
+                    theirs.send(b"also").expect("send a datagram");
+                    while tokio::task::coop::has_budget_remaining() {
+                        tokio::task::coop::consume_budget().await;
+                    }
+                    assert!(
+                        first_poll_pending(batch!()).await,
+                        "the budget forced a yield"
+                    );
+                    tokio::task::yield_now().await;
+                    let n = batch!().await.expect("a batch");
+                    assert_eq!(n, 2);
+                    (a[..lens[0]].to_vec(), b[..lens[1]].to_vec())
+                })
+                .await
+                .expect("the task does not panic")
+            })
+        });
+        assert_eq!(got, (b"keep".to_vec(), b"also".to_vec()));
+    }
+
+    /// A plain batch pending when the descriptor becomes error-only (the
+    /// Linux device deletion) is woken and returns the kernel's error.
+    #[test]
+    fn error_only_readiness_wakes_a_pending_plain_batch() {
+        let result = with_watchdog("pending batch on an error-only pipe", || {
+            let (reader, writer) = io::pipe().expect("create a pipe");
+            runtime().block_on(async move {
+                let reader_end = ErrorAwareReader::from_owned(OwnedFd::from(writer))
+                    .expect("register the write end");
+                let closer = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    drop(reader);
+                });
+                let mut buf = [0u8; 8];
+                let result = reader_end
+                    .recv_batch_plain(
+                        HostOs::Linux,
+                        DeviceKind::Tun,
+                        &no_status,
+                        &mut [&mut buf[..]],
+                        &mut [0],
+                        &DeferredTooSmall::new(),
+                    )
+                    .await;
+                closer.join().expect("the closer thread does not panic");
+                result
+            })
+        });
+        // EBADF has no typed variant: the platform fallback.
+        assert!(
+            matches!(
+                result,
+                Err(tunnel_lattice_core::Error::Platform(
+                    tunnel_lattice_core::PlatformErrorCode::Linux(libc::EBADF)
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The offload batch: every queued segment across frames in one call;
+    /// a batch dropped while it waits, or by the budget mid-split, loses no
+    /// segment.
+    #[test]
+    fn an_offload_batch_drains_frames_and_survives_cancellation() {
+        use crate::offload_queue::test_frames::{assert_segment, udp4_frame};
+
+        let served = with_watchdog("offload batch", || {
+            let (ours, theirs) = datagram_pair();
+            runtime().block_on(async move {
+                tokio::spawn(async move {
+                    let reader = ErrorAwareReader::from_owned(OwnedFd::from(ours))
+                        .expect("register the socket");
+                    let rx = OffloadRx::new();
+                    let mut bufs = vec![vec![0u8; 1500]; 8];
+                    let mut lens = [0; 8];
+                    let mut served = Vec::new();
+                    macro_rules! batch {
+                        ($count:expr) => {
+                            reader.recv_offload_batch(
+                                HostOs::Linux,
+                                DeviceKind::Tun,
+                                &rx,
+                                &mut bufs[..$count]
+                                    .iter_mut()
+                                    .map(Vec::as_mut_slice)
+                                    .collect::<Vec<_>>(),
+                                &mut lens[..$count],
+                            )
+                        };
+                    }
+                    assert!(first_poll_pending(batch!(8)).await, "nothing to read yet");
+                    theirs.send(&udp4_frame(100, 3, 100)).expect("send a frame");
+                    theirs.send(&udp4_frame(200, 2, 50)).expect("send a frame");
+                    let n = batch!(2).await.expect("a batch");
+                    served.extend((0..n).map(|i| bufs[i][..lens[i]].to_vec()));
+                    while tokio::task::coop::has_budget_remaining() {
+                        tokio::task::coop::consume_budget().await;
+                    }
+                    assert!(
+                        first_poll_pending(batch!(8)).await,
+                        "the budget forced a yield"
+                    );
+                    tokio::task::yield_now().await;
+                    let n = batch!(8).await.expect("a batch");
+                    served.extend((0..n).map(|i| bufs[i][..lens[i]].to_vec()));
+                    served
+                })
+                .await
+                .expect("the task does not panic")
+            })
+        });
+        assert_eq!(served.len(), 5);
+        for (packet, (k, len)) in
+            served
+                .iter()
+                .zip([(0, 100), (1, 100), (2, 100), (0, 200), (1, 50)])
+        {
+            assert_segment(packet, k, len);
         }
     }
 

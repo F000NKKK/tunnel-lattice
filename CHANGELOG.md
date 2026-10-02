@@ -25,6 +25,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `tokio`, `Handle::recv_batch_async`. A downstream type that
   implements both traits and calls `recv_batch` with both in scope has to
   name the trait, as for `send_batch`.
+- **Linux `recv_batch` drain in `tunnel-lattice-backend-tunrs`.** On Linux
+  (TUN and TAP, sync, `async-io`, and `tokio`) `TunRsDevice` overrides
+  `recv_batch`: it waits for the first packet exactly as `recv` does, then
+  drains what the queue already holds with reads that never wait
+  (`preadv2` with `RWF_NOWAIT` in the blocking build, a non-blocking read
+  in the async builds), never toggling `O_NONBLOCK`. The drain stops at
+  the capacity or an empty queue (`EAGAIN`, or `EOPNOTSUPP` from a kernel
+  without per-call non-blocking TUN reads), neither of which is reported.
+  `EINTR` repeats the read, and on an offload-framed queue an `EINVAL` or
+  invalid frame is dropped and the drain goes on; any other error ends the
+  batch and the next call reports it. An offload-framed queue returns the
+  segments of one or more super-packets in one call; a segment too long
+  for its buffer after the first stays pending for the next call. A plain
+  packet too long for its buffer after the first ends the batch, and the
+  next `recv` or `recv_batch` on that handle returns `BufferTooSmall`
+  first, once. A dropped async `recv_batch` has received nothing. Windows
+  and macOS keep one packet per call.
 - **New crate `tunnel-lattice-backend-linux` (in development, 0.1.0).**
   The start of a native Linux backend built directly on `/dev/net/tun`
   and a synchronous rtnetlink socket (`netlink-packet-route` 0.33,

@@ -198,6 +198,49 @@ impl TunRsBackend {
 /// wait, so it never spins. Every other end-of-file, such as the device
 /// being closed or a Wintun session ending, is [`Error::Disconnected`].
 ///
+/// # Receiving a batch
+///
+/// `recv_batch` (sync and async) fills `bufs[i]` and `lens[i]` for a
+/// prefix of the batch and returns how many packets it received. Per OS:
+///
+/// | OS | `recv_batch` |
+/// |---|---|
+/// | Linux (TUN and TAP, every feature set) | waits for the first packet exactly as `recv` does, then drains what the queue already holds without waiting again |
+/// | Windows, macOS | one packet per call: the provided default, a single `recv` |
+///
+/// On Linux, once the first packet is in `bufs[0]`, each further position
+/// is one read that never waits: in the blocking build a `preadv2` with
+/// `RWF_NOWAIT`, in the async builds a non-blocking read on the descriptor
+/// the build already reads from (with `tokio`, a `try_io` on the same
+/// readiness guard). The descriptor's blocking mode is never changed, so a
+/// blocking `recv` on another clone of the handle is not affected. The
+/// drain ends at the first of: the capacity (the shorter of `bufs` and
+/// `lens`), a read that finds the queue empty (`EAGAIN`) or cannot read
+/// without waiting (`EOPNOTSUPP`), or any other error, which is not
+/// reported: the packets already received are returned, and the next call
+/// reads again and reports what the device state is then. A signal
+/// (`EINTR`) repeats the read.
+///
+/// - `Ok(0)` is returned only for an empty batch (no capacity), without
+///   any read. An error means no packet was received; errors are mapped as
+///   for `recv`.
+/// - A plain packet longer than its buffer at a position after the first
+///   has already been taken off the queue, so the batch ends before it and
+///   the next `recv` or `recv_batch` on this handle returns
+///   [`Error::BufferTooSmall`] first, once, without reading. Each
+///   `additional_queue` handle has its own.
+/// - On an offload-framed queue every position takes the next segment of
+///   the current super-packet, then reads the next frame. A segment longer
+///   than its buffer at a position after the first is not dropped: it ends
+///   the batch and stays pending for the next call. A frame the split does
+///   not accept, and a raw `EINVAL`, are dropped and the drain goes on.
+/// - An async `recv_batch` awaits only before its first packet, so one
+///   dropped before it completes has received nothing, and the segments of
+///   a super-packet not yet returned stay pending for the next call.
+///
+/// The contents of `bufs[i]` past `lens[i]`, and of the buffers after the
+/// prefix, are unspecified.
+///
 /// # Segmentation offload
 ///
 /// On Linux, a TUN device opened with `DeviceConfig::offload` asks the
@@ -216,7 +259,8 @@ impl TunRsBackend {
 ///   does not accept (a malformed header or packet, or one larger than the
 ///   staging buffer), and a raw `EINVAL` from the read (the kernel refusing
 ///   to frame a packet), are dropped and the read retried: they never
-///   reach the caller and never spin.
+///   reach the caller and never spin. `recv_batch` returns the segments
+///   of one or more super-packets together (see "Receiving a batch").
 /// - `send` writes the packet behind an all-zero header (no checksum or
 ///   segmentation request), and returns the packet's length.
 /// - `send_batch` (sync and async) sends at most 128 packets per call, in
@@ -331,6 +375,10 @@ pub struct TunRsDevice {
     /// "Segmentation offload"); `None` for a plainly framed queue.
     #[cfg(target_os = "linux")]
     offload: Option<offload_queue::OffloadRx>,
+    /// The deferred too-small-buffer error of this queue's `recv_batch`
+    /// drain (see "Receiving a batch").
+    #[cfg(target_os = "linux")]
+    deferred: recv_contract::DeferredTooSmall,
     #[cfg(feature = "async")]
     handle: tun_rs::AsyncDevice,
     #[cfg(not(feature = "async"))]
@@ -514,6 +562,8 @@ impl DeviceProvider for TunRsBackend {
             id,
             #[cfg(target_os = "linux")]
             offload,
+            #[cfg(target_os = "linux")]
+            deferred: recv_contract::DeferredTooSmall::new(),
             // On failure `handle` drops: a new device is torn down, an
             // attached persistent one is detached.
             #[cfg(all(target_os = "linux", feature = "tokio"))]
@@ -614,6 +664,8 @@ impl TunRsDevice {
         #[cfg(not(feature = "async"))]
         {
             #[cfg(target_os = "linux")]
+            self.deferred.take()?;
+            #[cfg(target_os = "linux")]
             if let Some(rx) = &self.offload {
                 return rx.recv_blocking(open_contract::HOST_OS, self.kind, buf, |staging| {
                     self.handle.recv(staging)
@@ -676,6 +728,8 @@ impl TunRsDevice {
     /// handle.
     #[cfg(feature = "async")]
     async fn async_recv(&self, buf: &mut [u8]) -> Result<usize> {
+        #[cfg(target_os = "linux")]
+        self.deferred.take()?;
         #[cfg(target_os = "macos")]
         if let Some(wait) = &self.tap_wait {
             let source = macos_tap::TapSource {
@@ -716,6 +770,123 @@ impl TunRsDevice {
             buf,
         )
         .await
+    }
+
+    /// Blocking `recv_batch`; see [`Self::blocking_recv`] for how the async
+    /// builds block. Position 0 is exactly `recv`; the positions after it
+    /// drain the queue without waiting (see [`TunRsDevice`], "Receiving a
+    /// batch"). The sync build's drain reads with `preadv2` and
+    /// `RWF_NOWAIT`, so the descriptor's blocking mode is never changed.
+    #[cfg(target_os = "linux")]
+    fn blocking_recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        #[cfg(feature = "tokio")]
+        {
+            tokio::runtime::Handle::current().block_on(self.async_recv_batch(bufs, lens))
+        }
+        #[cfg(all(feature = "async", not(feature = "tokio")))]
+        {
+            futures::executor::block_on(self.async_recv_batch(bufs, lens))
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            use std::os::fd::AsFd;
+
+            if recv_contract::batch_capacity(bufs, lens) == 0 {
+                return Ok(0);
+            }
+            self.deferred.take()?;
+            let os = open_contract::HOST_OS;
+            if let Some(rx) = &self.offload {
+                return rx.recv_batch_blocking(
+                    os,
+                    self.kind,
+                    bufs,
+                    lens,
+                    |staging| self.handle.recv(staging),
+                    |staging| {
+                        recv_contract::read_nowait(
+                            self.handle.as_fd(),
+                            &mut [std::io::IoSliceMut::new(staging)],
+                        )
+                    },
+                );
+            }
+            recv_contract::recv_batch_blocking(
+                os,
+                self.kind,
+                bufs,
+                lens,
+                &self.deferred,
+                &|| self.oper_state(),
+                |buf| sentinel_recv(&self.handle, buf),
+                |buf| recv_contract::sentinel_read_nowait(self.handle.as_fd(), buf),
+            )
+        }
+    }
+
+    /// Async `recv_batch`: position 0 is exactly `async_recv`, and nothing
+    /// awaits after it, so the positions after it drain the queue with
+    /// non-waiting reads (see [`TunRsDevice`], "Receiving a batch").
+    #[cfg(all(target_os = "linux", feature = "async"))]
+    async fn async_recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        if recv_contract::batch_capacity(bufs, lens) == 0 {
+            return Ok(0);
+        }
+        self.deferred.take()?;
+        let os = open_contract::HOST_OS;
+        #[cfg(feature = "tokio")]
+        {
+            if let Some(rx) = &self.offload {
+                return self
+                    .reader
+                    .recv_offload_batch(os, self.kind, rx, bufs, lens)
+                    .await;
+            }
+            self.reader
+                .recv_batch_plain(
+                    os,
+                    self.kind,
+                    &|| self.oper_state(),
+                    bufs,
+                    lens,
+                    &self.deferred,
+                )
+                .await
+        }
+        #[cfg(not(feature = "tokio"))]
+        {
+            if let Some(rx) = &self.offload {
+                return rx
+                    .recv_batch_async_io(os, self.kind, &self.handle, bufs, lens)
+                    .await;
+            }
+            let (Some(first), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
+                return Ok(0);
+            };
+            *len = recv_contract::recv_async(
+                os,
+                self.kind,
+                &self.handle,
+                &|| self.oper_state(),
+                first,
+            )
+            .await?;
+            Ok(recv_contract::drain_plain(
+                os,
+                bufs,
+                lens,
+                1,
+                &self.deferred,
+                |buf| {
+                    use std::io::IoSliceMut;
+                    let mut sentinel = [0u8; 1];
+                    self.handle.try_recv_vectored(&mut [
+                        IoSliceMut::new(buf),
+                        IoSliceMut::new(&mut sentinel),
+                    ])
+                },
+            ))
+        }
     }
 
     /// Async send, retrying transient errors. On an offload-framed queue the
@@ -865,6 +1036,15 @@ impl PacketIo for TunRsDevice {
     fn send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
         self.blocking_send_batch(packets)
     }
+
+    /// Waits for the first packet exactly as `recv` does, then drains
+    /// whatever else the queue already holds without waiting again; see
+    /// [`TunRsDevice`], "Receiving a batch". Every other host receives one
+    /// packet per call, as the provided method does.
+    #[cfg(target_os = "linux")]
+    fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        self.blocking_recv_batch(bufs, lens)
+    }
 }
 
 #[cfg(feature = "async")]
@@ -884,6 +1064,15 @@ impl AsyncPacketIo for TunRsDevice {
     #[cfg(target_os = "linux")]
     async fn send_batch(&self, packets: &[&[u8]]) -> Result<usize> {
         self.async_send_batch(packets).await
+    }
+
+    /// As [`PacketIo::recv_batch`] on this type. Nothing awaits after the
+    /// first packet is taken, so a future dropped before it completes has
+    /// received nothing; the unserved segments of an offload frame stay
+    /// pending for the next call.
+    #[cfg(target_os = "linux")]
+    async fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+        self.async_recv_batch(bufs, lens).await
     }
 }
 
@@ -1116,7 +1305,8 @@ impl MultiQueueProvider for TunRsDevice {
     /// The new queue's framing is checked like an `open`'s (see
     /// [`TunRsDevice`], "Segmentation offload"), so it reports
     /// `SEGMENTATION_OFFLOAD` exactly when it is offload-framed; it gets its
-    /// own receive staging and never shares this handle's.
+    /// own receive staging and never shares this handle's, nor its deferred
+    /// `recv_batch` error.
     fn additional_queue(&self) -> Result<Self> {
         // On failure `handle` drops, which detaches the new queue.
         let handle = self.handle.try_clone().map_err(io_error)?;
@@ -1125,6 +1315,7 @@ impl MultiQueueProvider for TunRsDevice {
             kind: self.kind,
             id: self.id,
             offload,
+            deferred: recv_contract::DeferredTooSmall::new(),
             #[cfg(all(target_os = "linux", feature = "tokio"))]
             reader: tokio_linux::ErrorAwareReader::new(&*handle).map_err(io_error)?,
             handle,
@@ -1915,6 +2106,197 @@ mod io_error_tests {
                 result.err()
             );
         }
+    }
+}
+
+/// Unprivileged tests of the Linux `recv_batch` override through the
+/// public traits, on a device whose handle reads one end of a datagram
+/// socket pair instead of a TUN queue (a socket keeps packet boundaries,
+/// and takes `RWF_NOWAIT` like a TUN descriptor). Run in every build: the
+/// blocking path, and in the async builds also the async one.
+#[cfg(all(test, target_os = "linux"))]
+mod recv_batch_tests {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixDatagram;
+
+    use super::offload_queue::test_frames::{assert_segment, udp4_frame};
+    use super::*;
+
+    /// A device over one end of a datagram pair, and the other end to send
+    /// packets with. Under `tokio` the caller has entered a runtime.
+    fn device(offload: bool) -> (TunRsDevice, UnixDatagram) {
+        let (ours, theirs) = UnixDatagram::pair().expect("create a datagram pair");
+        #[cfg(feature = "async")]
+        ours.set_nonblocking(true).expect("make it non-blocking");
+        let fd = ours.into_raw_fd();
+        // SAFETY: `into_raw_fd` hands over sole ownership of an open
+        // descriptor; the handle closes it when dropped.
+        #[cfg(feature = "async")]
+        let handle = unsafe { tun_rs::AsyncDevice::from_fd(fd) }.expect("wrap the descriptor");
+        // SAFETY: as above.
+        #[cfg(not(feature = "async"))]
+        let handle = unsafe { tun_rs::SyncDevice::from_fd(fd) }.expect("wrap the descriptor");
+        let device = TunRsDevice {
+            kind: DeviceKind::Tun,
+            id: DeviceId::new(1),
+            offload: offload.then(offload_queue::OffloadRx::new),
+            deferred: recv_contract::DeferredTooSmall::new(),
+            #[cfg(feature = "tokio")]
+            reader: tokio_linux::ErrorAwareReader::new(&*handle).expect("register the socket"),
+            handle,
+        };
+        (device, theirs)
+    }
+
+    /// Runs `f` inside the runtime the build needs: a multi-thread Tokio
+    /// runtime, entered, under `tokio`; nothing otherwise.
+    fn with_runtime<T>(f: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "tokio")]
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_io()
+                .build()
+                .expect("build a Tokio runtime");
+            let _entered = runtime.enter();
+            f()
+        }
+        #[cfg(not(feature = "tokio"))]
+        {
+            f()
+        }
+    }
+
+    /// `count` buffers of `len` bytes, and the packets a batch received.
+    struct Bufs(Vec<Vec<u8>>);
+
+    impl Bufs {
+        fn new(count: usize, len: usize) -> Self {
+            Self(vec![vec![0u8; len]; count])
+        }
+
+        fn batch(&mut self, device: &TunRsDevice) -> Result<Vec<Vec<u8>>> {
+            let mut lens = vec![0; self.0.len()];
+            let mut slices: Vec<&mut [u8]> = self.0.iter_mut().map(Vec::as_mut_slice).collect();
+            let n = PacketIo::recv_batch(device, &mut slices, &mut lens)?;
+            Ok((0..n).map(|i| self.0[i][..lens[i]].to_vec()).collect())
+        }
+
+        #[cfg(feature = "async")]
+        fn batch_async(&mut self, device: &TunRsDevice) -> Result<Vec<Vec<u8>>> {
+            let mut lens = vec![0; self.0.len()];
+            let mut slices: Vec<&mut [u8]> = self.0.iter_mut().map(Vec::as_mut_slice).collect();
+            let call = AsyncPacketIo::recv_batch(device, &mut slices, &mut lens);
+            #[cfg(feature = "tokio")]
+            let n = tokio::runtime::Handle::current().block_on(call)?;
+            #[cfg(not(feature = "tokio"))]
+            let n = futures::executor::block_on(call)?;
+            Ok((0..n).map(|i| self.0[i][..lens[i]].to_vec()).collect())
+        }
+    }
+
+    fn send_all(peer: &UnixDatagram, packets: &[&[u8]]) {
+        for packet in packets {
+            peer.send(packet).expect("send a datagram");
+        }
+    }
+
+    #[test]
+    fn a_batch_with_no_capacity_reads_nothing() {
+        with_runtime(|| {
+            let (device, peer) = device(false);
+            send_all(&peer, &[b"one"]);
+            assert_eq!(
+                PacketIo::recv_batch(&device, &mut [], &mut [0; 4]).unwrap(),
+                0
+            );
+            let mut buf = [0u8; 8];
+            assert_eq!(
+                PacketIo::recv_batch(&device, &mut [&mut buf], &mut []).unwrap(),
+                0
+            );
+            assert_eq!(Bufs::new(1, 8).batch(&device).unwrap(), [b"one"]);
+        });
+    }
+
+    #[test]
+    fn a_plain_batch_drains_the_queue_in_order() {
+        with_runtime(|| {
+            let (device, peer) = device(false);
+            send_all(&peer, &[b"one", b"two", b"three", b"four", b""]);
+            let mut bufs = Bufs::new(3, 8);
+            assert_eq!(
+                bufs.batch(&device).unwrap(),
+                [&b"one"[..], b"two", b"three"]
+            );
+            let mut bufs = Bufs::new(8, 8);
+            assert_eq!(bufs.batch(&device).unwrap(), [&b"four"[..], b""]);
+        });
+    }
+
+    /// A packet too long for its buffer after the first ends the batch,
+    /// and its `BufferTooSmall` comes first from the next `recv` or
+    /// `recv_batch`, once.
+    #[test]
+    fn a_too_long_packet_in_a_drain_is_reported_by_the_next_call() {
+        with_runtime(|| {
+            let (device, peer) = device(false);
+            send_all(&peer, &[b"ok", b"123456789", b"after"]);
+            let mut bufs = Bufs::new(4, 8);
+            assert_eq!(bufs.batch(&device).unwrap(), [b"ok"]);
+            let mut buf = [0u8; 8];
+            assert!(matches!(
+                PacketIo::recv(&device, &mut buf),
+                Err(Error::BufferTooSmall)
+            ));
+            assert_eq!(PacketIo::recv(&device, &mut buf).unwrap(), 5);
+
+            send_all(&peer, &[b"ok", b"123456789", b"after"]);
+            assert_eq!(bufs.batch(&device).unwrap(), [b"ok"]);
+            assert!(matches!(bufs.batch(&device), Err(Error::BufferTooSmall)));
+            assert_eq!(bufs.batch(&device).unwrap(), [b"after"]);
+        });
+    }
+
+    #[test]
+    fn an_offload_batch_serves_every_segment() {
+        with_runtime(|| {
+            let (device, peer) = device(true);
+            peer.send(&udp4_frame(300, 3, 300)).expect("send a frame");
+            peer.send(&udp4_frame(200, 2, 50)).expect("send a frame");
+            let packets = Bufs::new(8, 1500).batch(&device).unwrap();
+            assert_eq!(packets.len(), 5);
+            for (packet, (k, len)) in
+                packets
+                    .iter()
+                    .zip([(0, 300), (1, 300), (2, 300), (0, 200), (1, 50)])
+            {
+                assert_segment(packet, k, len);
+            }
+        });
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn the_async_batch_drains_like_the_blocking_one() {
+        with_runtime(|| {
+            let (plain, peer) = device(false);
+            send_all(&peer, &[b"one", b"two", b"123456789", b"three"]);
+            let mut bufs = Bufs::new(4, 8);
+            assert_eq!(bufs.batch_async(&plain).unwrap(), [&b"one"[..], b"two"]);
+            assert!(matches!(
+                bufs.batch_async(&plain),
+                Err(Error::BufferTooSmall)
+            ));
+            assert_eq!(bufs.batch_async(&plain).unwrap(), [b"three"]);
+
+            let (offload, peer) = device(true);
+            peer.send(&udp4_frame(100, 4, 100)).expect("send a frame");
+            let packets = Bufs::new(8, 1500).batch_async(&offload).unwrap();
+            assert_eq!(packets.len(), 4);
+            for (k, packet) in packets.iter().enumerate() {
+                assert_segment(packet, k, 100);
+            }
+        });
     }
 }
 

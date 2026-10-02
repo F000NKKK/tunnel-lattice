@@ -50,7 +50,7 @@ Main surface:
 
 - `TunRsBackend` (`#[non_exhaustive]`; build with `new()`/`default()`):
   `DeviceProvider::open` and a host-level `CapabilityProvider`.
-- `TunRsDevice`: `PacketIo` (`recv`, `send`, `send_batch`),
+- `TunRsDevice`: `PacketIo` (`recv`, `recv_batch`, `send`, `send_batch`),
   `DeviceObserver`, `DeviceMutator` (MTU, TAP MAC, admin state),
   `CapabilityProvider`, and with an async feature `AsyncPacketIo`
   (`Capability::NATIVE_ASYNC`). On Linux only, `PersistentDevice` and
@@ -107,6 +107,17 @@ is a compile error from `tun-rs` itself, so `--all-features` is not valid.
 - `recv` never truncates: an oversize packet is discarded as
   `BufferTooSmall` and the device stays usable. `EINTR` and a transient
   empty macOS TAP read are retried internally.
+- `recv_batch` on Linux waits for the first packet like `recv`, then
+  drains what is already queued without waiting again and without
+  toggling `O_NONBLOCK` (`preadv2` with `RWF_NOWAIT` in the blocking
+  build). An empty queue ends the batch quietly, `EINTR` repeats the
+  read, and an offload `EINVAL` or invalid frame is dropped; any other
+  error after the first packet ends the batch and is left for the next
+  call. A packet after the first that is too long for its buffer makes
+  the next `recv`/`recv_batch` on that handle return `BufferTooSmall`
+  first.
+  A dropped async `recv_batch` has received nothing. Windows and macOS
+  return one packet per call.
 - Deleting a Linux device, or the peer `feth` of a macOS TAP device, ends a
   waiting `recv` with `Disconnected` in every feature set. A device that is
   down or disabled reports `InvalidState`, with two exceptions: a down
@@ -176,7 +187,8 @@ and the [API reference](https://docs.rs/tunnel-lattice-backend-tunrs).
   backend reads the queue's real framing back after every open.
 - `recv` returns one IP packet per call: super-packets (up to 64 KiB) are
   staged in a per-queue buffer and split with lengths and checksums
-  completed. A dropped async `recv` loses no segment.
+  completed. A dropped async `recv` loses no segment. `recv_batch`
+  returns the segments of one or more super-packets in one call.
 - `send_batch` sends at most 128 packets per call and coalesces adjacent
   packets of one TCP flow (or UDP flow, when the kernel supports it) into
   one write without copying payload; a refused super-packet is resent
