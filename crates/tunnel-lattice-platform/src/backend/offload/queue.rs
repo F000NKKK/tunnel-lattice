@@ -143,6 +143,7 @@ impl OffloadRx {
     /// segment (super-packets that were split). A diagnostic for tests that
     /// must tell a real split from packets delivered one by one. Takes the
     /// staging lock, so call it between receives, not during one.
+    #[doc(hidden)]
     #[must_use]
     pub fn split_frames(&self) -> usize {
         self.lock().split_frames

@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.99"
 license = "MPL-2.0"
 repository = "https://github.com/F000NKKK/tunnel-lattice"
 homepage = "https://github.com/F000NKKK/tunnel-lattice"
@@ -27,11 +27,11 @@ tunnel-lattice = { path = "crates/tunnel-lattice", version = "0.6.0" }
 
 # External requirements track the latest release of each dependency (kept
 # identical to net-lattice/dns-lattice where they share one), within the
-# 1.93 MSRV.
+# 1.99 MSRV.
 bitflags = "2.13.2"
 futures = "0.3.34"
 # Dev-only: packet-path benchmarks in tunnel-lattice-async. No default
-# features (no rayon/plotters); 0.8.2 needs Rust 1.86, below our 1.93 floor.
+# features (no rayon/plotters); 0.8.2 needs Rust 1.86, below our 1.99 floor.
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1.53.1", default-features = false }
 

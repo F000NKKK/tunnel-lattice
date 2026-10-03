@@ -7,7 +7,7 @@
 [![crates.io](https://img.shields.io/crates/v/tunnel-lattice-platform.svg?cacheSeconds=86400)](https://crates.io/crates/tunnel-lattice-platform)
 [![docs.rs](https://img.shields.io/docsrs/tunnel-lattice-platform?cacheSeconds=86400)](https://docs.rs/tunnel-lattice-platform)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/tunnel-lattice)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](https://github.com/F000NKKK/tunnel-lattice)
 
 [Overview](#-overview) • [Traits](#-key-features) • [Installation](#-installation) • [Backend Contract](#-backend-contract)
 

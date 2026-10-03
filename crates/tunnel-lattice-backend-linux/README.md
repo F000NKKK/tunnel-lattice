@@ -7,7 +7,7 @@
 [![crates.io](https://img.shields.io/crates/v/tunnel-lattice-backend-linux.svg?cacheSeconds=86400)](https://crates.io/crates/tunnel-lattice-backend-linux)
 [![docs.rs](https://img.shields.io/docsrs/tunnel-lattice-backend-linux?cacheSeconds=86400)](https://docs.rs/tunnel-lattice-backend-linux)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/tunnel-lattice/blob/main/LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/tunnel-lattice)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](https://github.com/F000NKKK/tunnel-lattice)
 
 ![Linux](https://img.shields.io/badge/Linux-in%20development-yellow)
 
@@ -101,7 +101,8 @@ default features off (no tokio, mio, or smol).
 ## 🔐 Privileges
 
 Creating a TUN/TAP device needs `CAP_NET_ADMIN` (attaching to a
-persistent device owned by the calling user or group does not), and
+persistent device owned by the calling user or group, or by no user and
+no group, does not), and
 changing a link (MTU, MAC, administrative state) always does; without it
 both are refused with `Error::PermissionDenied`. Looking a link up over
 rtnetlink, packet I/O on an open queue, and toggling persistence through an

@@ -254,6 +254,16 @@ mod tests {
 
     use super::*;
 
+    /// `TUNSETIFF`/`TUNGETIFF` copy `sizeof(struct ifreq)` through the
+    /// pointer, so the wrapped libc struct must keep the kernel's size
+    /// (a 16-byte name plus a 24-byte union on 64-bit targets).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_ifreq_wrapper_has_the_kernel_size() {
+        assert_eq!(std::mem::size_of::<libc::ifreq>(), 40);
+        assert_eq!(std::mem::size_of::<IfReq>(), 40);
+    }
+
     /// The shared name limit is the kernel's `IFNAMSIZ` minus the NUL.
     #[test]
     fn the_shared_name_limit_is_the_kernel_limit() {
