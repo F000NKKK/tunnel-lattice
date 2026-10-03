@@ -84,15 +84,6 @@ use crate::offload::{
 use crate::open_contract::HostOs;
 use crate::recv_contract::{self, DrainStep, Step};
 
-/// Whether `open` passes a segmentation-offload request on to `tun-rs`:
-/// only for a Linux TUN device. Off Linux and for TAP the request is
-/// ignored (no native call, no error, plain framing), like `multi_queue`
-/// off Linux; the TAP split would have to parse Ethernet, which it does
-/// not.
-pub(crate) const fn offload_request(os: HostOs, kind: DeviceKind, requested: bool) -> bool {
-    requested && matches!(os, HostOs::Linux) && matches!(kind, DeviceKind::Tun)
-}
-
 /// The framing [`decide_framing`] chose for one queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Framing {
@@ -927,21 +918,6 @@ mod tests {
     use crate::offload::MAX_SEGMENTS;
 
     const TUN: DeviceKind = DeviceKind::Tun;
-    const ALL_OSES: [HostOs; 4] = [HostOs::Linux, HostOs::Macos, HostOs::Windows, HostOs::Other];
-
-    #[test]
-    fn offload_is_requested_for_linux_tun_only() {
-        for os in ALL_OSES {
-            for kind in [DeviceKind::Tun, DeviceKind::Tap] {
-                assert!(!offload_request(os, kind, false), "{os:?} {kind:?}");
-                assert_eq!(
-                    offload_request(os, kind, true),
-                    os == HostOs::Linux && kind == DeviceKind::Tun,
-                    "{os:?} {kind:?}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn framing_follows_the_observed_flag_and_header_size() {

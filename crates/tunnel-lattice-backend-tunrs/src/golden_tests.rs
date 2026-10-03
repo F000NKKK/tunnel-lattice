@@ -20,14 +20,18 @@ use tunnel_lattice_model::{
     MacAddress,
 };
 
-use crate::admin_state::{admin_from_flags, admin_from_oper};
-use crate::offload_queue::offload_request;
-use crate::open_contract::{HOST_OS, HostOs, precheck_name};
+use tunnel_lattice_model::backend::{
+    ApplySteps, ApplyTarget, admin_from_if_flags as admin_from_flags,
+    admin_from_oper_status as admin_from_oper, apply_patch as shared_apply_patch,
+    offload_requested as offload_request, precheck_name,
+};
+
+use crate::open_contract::{HOST_OS, HostOs};
 use crate::recv_contract::{
     DrainStep, Step, drain_error_step, is_refused_offload_write, offload_recv_error_step,
     recv_step, send_step,
 };
-use crate::{ApplySteps, ApplyTarget, DeviceProvider, TunRsBackend, apply_patch, io_error};
+use crate::{DeviceProvider, TunRsBackend, io_error};
 
 const ALL_OSES: [HostOs; 4] = [HostOs::Linux, HostOs::Macos, HostOs::Windows, HostOs::Other];
 const KINDS: [DeviceKind; 2] = [DeviceKind::Tun, DeviceKind::Tap];
@@ -504,22 +508,28 @@ impl Recorder {
     }
 }
 
-impl ApplySteps for Recorder {
-    fn mtu(&self) -> Result<u16> {
+impl ApplySteps for &Recorder {
+    fn mtu(&mut self) -> Result<u16> {
         self.record(Call::ReadMtu).map(|()| OLD_MTU)
     }
-    fn set_mtu(&self, mtu: u16) -> Result<()> {
+    fn set_mtu(&mut self, mtu: u16) -> Result<()> {
         self.record(Call::SetMtu(mtu))
     }
-    fn mac(&self) -> Result<MacAddress> {
+    fn mac(&mut self) -> Result<MacAddress> {
         self.record(Call::ReadMac).map(|()| OLD_MAC)
     }
-    fn set_mac(&self, mac: MacAddress) -> Result<()> {
+    fn set_mac(&mut self, mac: MacAddress) -> Result<()> {
         self.record(Call::SetMac(mac))
     }
-    fn set_enabled(&self, enabled: bool) -> Result<()> {
-        self.record(Call::SetEnabled(enabled))
+    fn set_up(&mut self, up: bool) -> Result<()> {
+        self.record(Call::SetEnabled(up))
     }
+}
+
+/// The shared `apply_patch` driven through the recorder, so the tables below
+/// read as they did when `apply_patch` was this crate's own function.
+fn apply_patch(recorder: &Recorder, target: ApplyTarget, patch: &DeviceConfigPatch) -> Result<()> {
+    shared_apply_patch(&mut &*recorder, target, patch)
 }
 
 const TAP: ApplyTarget = ApplyTarget {

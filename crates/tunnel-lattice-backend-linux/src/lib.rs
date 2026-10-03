@@ -33,8 +33,11 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tunnel_lattice_core::{Error, Result};
+use tunnel_lattice_model::backend::{
+    ApplyTarget, HostOs, admin_from_if_flags, apply_patch, precheck_open,
+};
 use tunnel_lattice_model::{
-    AdminState, Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
+    Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
 };
 use tunnel_lattice_platform::{
     Capability, CapabilityProvider, DeviceMutator, DeviceObserver, DeviceProvider,
@@ -151,15 +154,7 @@ impl DeviceProvider for LinuxBackend {
     /// See [`LinuxBackend`], "Opening a device".
     fn open(&self, config: DeviceConfig) -> Result<LinuxDevice> {
         let flags = tun::request_flags(config.kind, config.multi_queue)?;
-        if let Some(name) = config.name.as_deref() {
-            tun::precheck_name(name)?;
-        }
-        if config.mtu.is_some_and(|mtu| mtu > u32::from(u16::MAX)) {
-            return Err(Error::InvalidState);
-        }
-        if config.mac.is_some() && config.kind != DeviceKind::Tap {
-            return Err(Error::InvalidState);
-        }
+        precheck_open(HostOs::Linux, &config)?;
 
         let queue = tun::open_node()?;
         let mut control = RouteSocket::open()?;
@@ -260,22 +255,12 @@ impl DeviceObserver for LinuxDevice {
             link.name,
             self.kind,
             link.mtu,
-            admin_state(link.flags),
+            admin_from_if_flags(link.flags),
         );
         Ok(match (self.kind, link.mac) {
             (DeviceKind::Tap, Some(mac)) => device.with_mac(MacAddress::new(mac)),
             _ => device,
         })
-    }
-}
-
-/// `AdminState::Up` iff `flags` carry both `IFF_UP` and `IFF_RUNNING`.
-fn admin_state(flags: u32) -> AdminState {
-    let up = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
-    if flags & up == up {
-        AdminState::Up
-    } else {
-        AdminState::Down
     }
 }
 
@@ -286,7 +271,7 @@ impl DeviceMutator for LinuxDevice {
     /// index captured at open. The administrative state is changed through
     /// the `IFF_UP` change mask, touching no other flag.
     fn apply(&self, patch: DeviceConfigPatch) -> Result<()> {
-        let target = apply::Target {
+        let target = ApplyTarget {
             id: self.id(),
             kind: self.kind,
             mac_mutation: self.kind == DeviceKind::Tap,
@@ -296,7 +281,7 @@ impl DeviceMutator for LinuxDevice {
             socket: &mut control,
             index: self.index,
         };
-        apply::apply(&mut steps, target, &patch)
+        apply_patch(&mut steps, target, &patch)
     }
 }
 
@@ -369,7 +354,7 @@ impl CapabilityProvider for LinuxDevice {
 
 #[cfg(test)]
 mod tests {
-    use tunnel_lattice_model::DesiredAdminState;
+    use tunnel_lattice_model::{AdminState, DesiredAdminState};
 
     use super::*;
 
@@ -425,13 +410,12 @@ mod tests {
     }
 
     #[test]
-    fn the_admin_state_needs_both_up_and_running() {
-        let up = libc::IFF_UP as u32;
-        let running = libc::IFF_RUNNING as u32;
-        assert_eq!(admin_state(up | running), AdminState::Up);
-        assert_eq!(admin_state(up), AdminState::Down);
-        assert_eq!(admin_state(running), AdminState::Down);
-        assert_eq!(admin_state(0), AdminState::Down);
+    fn the_shared_admin_flags_are_the_kernel_flags() {
+        use tunnel_lattice_model::backend::{IFF_RUNNING, IFF_UP};
+
+        assert_eq!(IFF_UP, libc::IFF_UP as u32);
+        assert_eq!(IFF_RUNNING, libc::IFF_RUNNING as u32);
+        assert_eq!(admin_from_if_flags(IFF_UP | IFF_RUNNING), AdminState::Up);
     }
 
     #[test]
@@ -510,7 +494,7 @@ mod privileged_tests {
     use std::process::Command;
     use std::time::Duration;
 
-    use tunnel_lattice_model::DesiredAdminState;
+    use tunnel_lattice_model::{AdminState, DesiredAdminState};
 
     use super::*;
 

@@ -39,6 +39,9 @@ mod tokio_linux;
 mod windows_tap_probe;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
+use tunnel_lattice_model::backend::{
+    ApplySteps, ApplyTarget, apply_patch, offload_requested, precheck_open,
+};
 use tunnel_lattice_model::{
     Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
 };
@@ -487,16 +490,7 @@ impl DeviceProvider for TunRsBackend {
             _ => return Err(Error::Unsupported),
         };
         // Prechecks: everything below this block may make a native call.
-        if let Some(name) = config.name.as_deref() {
-            open_contract::precheck_name(open_contract::HOST_OS, config.kind, name)?;
-        }
-        let mtu = config
-            .mtu
-            .map(|mtu| u16::try_from(mtu).map_err(|_| Error::InvalidState))
-            .transpose()?;
-        if config.mac.is_some() && config.kind != DeviceKind::Tap {
-            return Err(Error::InvalidState);
-        }
+        let mtu = precheck_open(open_contract::HOST_OS, &config)?.mtu;
 
         let mut builder = tun_rs::DeviceBuilder::new().layer(layer);
         // `tun-rs` defaults `reuse_dev` to `true`, which on macOS/Windows TAP
@@ -518,10 +512,10 @@ impl DeviceProvider for TunRsBackend {
             builder = builder.multi_queue(config.multi_queue);
         }
         // Likewise `DeviceBuilder::offload` is Linux-only; the request is
-        // also ignored for TAP (see `offload_queue::offload_request`).
+        // also ignored for TAP (see `offload_requested`).
         #[cfg(target_os = "linux")]
         {
-            builder = builder.offload(offload_queue::offload_request(
+            builder = builder.offload(offload_requested(
                 open_contract::HOST_OS,
                 config.kind,
                 config.offload,
@@ -1148,123 +1142,33 @@ impl DeviceMutator for TunRsDevice {
             kind: self.kind,
             mac_mutation: mac_mutation_supported(self.kind),
         };
-        apply_patch(&*self.handle, target, &patch)
+        apply_patch(&mut HandleSteps(&self.handle), target, &patch)
     }
 }
 
-/// The native steps [`apply_patch`] drives, split out so the ordering and
-/// compensation logic is testable without a real device.
-trait ApplySteps {
-    fn mtu(&self) -> Result<u16>;
-    fn set_mtu(&self, mtu: u16) -> Result<()>;
-    fn mac(&self) -> Result<MacAddress>;
-    fn set_mac(&self, mac: MacAddress) -> Result<()>;
-    fn set_enabled(&self, enabled: bool) -> Result<()>;
-}
+/// The `tun-rs` handle as the native steps `apply_patch` drives.
+struct HandleSteps<'a>(&'a tun_rs::DeviceImpl);
 
-impl ApplySteps for tun_rs::DeviceImpl {
-    fn mtu(&self) -> Result<u16> {
-        tun_rs::DeviceImpl::mtu(self).map_err(io_error)
+impl ApplySteps for HandleSteps<'_> {
+    fn mtu(&mut self) -> Result<u16> {
+        self.0.mtu().map_err(io_error)
     }
 
-    fn set_mtu(&self, mtu: u16) -> Result<()> {
-        tun_rs::DeviceImpl::set_mtu(self, mtu).map_err(io_error)
+    fn set_mtu(&mut self, mtu: u16) -> Result<()> {
+        self.0.set_mtu(mtu).map_err(io_error)
     }
 
-    fn mac(&self) -> Result<MacAddress> {
-        self.mac_address().map(MacAddress::new).map_err(io_error)
+    fn mac(&mut self) -> Result<MacAddress> {
+        self.0.mac_address().map(MacAddress::new).map_err(io_error)
     }
 
-    fn set_mac(&self, mac: MacAddress) -> Result<()> {
-        self.set_mac_address(mac.octets()).map_err(io_error)
+    fn set_mac(&mut self, mac: MacAddress) -> Result<()> {
+        self.0.set_mac_address(mac.octets()).map_err(io_error)
     }
 
-    fn set_enabled(&self, enabled: bool) -> Result<()> {
-        tun_rs::DeviceImpl::enabled(self, enabled).map_err(io_error)
+    fn set_up(&mut self, up: bool) -> Result<()> {
+        self.0.enabled(up).map_err(io_error)
     }
-}
-
-/// What [`apply_patch`] checks a patch against.
-#[derive(Clone, Copy)]
-struct ApplyTarget {
-    id: DeviceId,
-    kind: DeviceKind,
-    /// Whether the handle reports `Capability::MAC_MUTATION`.
-    mac_mutation: bool,
-}
-
-/// [`DeviceMutator::apply`]'s contract: every precondition before any
-/// native call, then MTU, MAC, and administrative state in that order, and
-/// on a failed step a best-effort revert of the earlier ones in reverse
-/// before returning the original error.
-fn apply_patch(
-    steps: &impl ApplySteps,
-    target: ApplyTarget,
-    patch: &DeviceConfigPatch,
-) -> Result<()> {
-    use tunnel_lattice_model::DesiredAdminState;
-
-    if patch.device_id() != target.id {
-        return Err(Error::InvalidState);
-    }
-    let mtu = patch
-        .mtu()
-        .map(|mtu| u16::try_from(mtu).map_err(|_| Error::InvalidState))
-        .transpose()?;
-    let mac = patch.mac();
-    if mac.is_some() && target.kind != DeviceKind::Tap {
-        return Err(Error::InvalidState);
-    }
-    // `DesiredAdminState` is `#[non_exhaustive]`: a variant this backend
-    // does not know is unsupported, not a malformed patch.
-    let enable = match patch.admin_state() {
-        None => None,
-        Some(DesiredAdminState::Up) => Some(true),
-        Some(DesiredAdminState::Down) => Some(false),
-        Some(_) => return Err(Error::Unsupported),
-    };
-    if mac.is_some() && !target.mac_mutation {
-        return Err(Error::Unsupported);
-    }
-
-    // Administrative state goes last, so no later step can fail after it
-    // and it never needs reverting. A step's previous value is read first,
-    // before any change, and only when a later step could need it reverted.
-    let previous_mtu = match mtu {
-        Some(_) if mac.is_some() || enable.is_some() => Some(steps.mtu()?),
-        _ => None,
-    };
-    let previous_mac = match mac {
-        Some(_) if enable.is_some() => Some(steps.mac()?),
-        _ => None,
-    };
-    // Best effort: the original error is what the caller needs, and
-    // `snapshot()` is authoritative after any `Err`.
-    let revert_mtu = || {
-        if let Some(previous) = previous_mtu {
-            let _ = steps.set_mtu(previous);
-        }
-    };
-
-    if let Some(mtu) = mtu {
-        steps.set_mtu(mtu)?;
-    }
-    if let Some(mac) = mac
-        && let Err(error) = steps.set_mac(mac)
-    {
-        revert_mtu();
-        return Err(error);
-    }
-    if let Some(enable) = enable
-        && let Err(error) = steps.set_enabled(enable)
-    {
-        if let Some(previous) = previous_mac {
-            let _ = steps.set_mac(previous);
-        }
-        revert_mtu();
-        return Err(error);
-    }
-    Ok(())
 }
 
 /// Linux persistence through the kernel's `TUNSETPERSIST` ioctl, which
@@ -1487,330 +1391,6 @@ mod capability_tests {
                 .contains(Capability::TAP_DEVICES),
             windows_tap_probe::tap_driver_installed()
         );
-    }
-}
-
-/// Ordinary tests of [`apply_patch`]'s preconditions, ordering, and
-/// compensation against recorded fake steps (no device).
-#[cfg(test)]
-mod apply_tests {
-    use std::cell::RefCell;
-
-    use tunnel_lattice_model::DesiredAdminState;
-
-    use super::*;
-
-    #[derive(Debug, PartialEq, Eq)]
-    enum Call {
-        ReadMtu,
-        SetMtu(u16),
-        ReadMac,
-        SetMac(MacAddress),
-        SetEnabled(bool),
-    }
-
-    /// Records every native call; each step fails when its flag is set.
-    #[derive(Default)]
-    struct Fake {
-        calls: RefCell<Vec<Call>>,
-        fail_read: bool,
-        fail_set_mtu: bool,
-        fail_set_mac: bool,
-        fail_enable: bool,
-    }
-
-    impl ApplySteps for Fake {
-        fn mtu(&self) -> Result<u16> {
-            self.calls.borrow_mut().push(Call::ReadMtu);
-            if self.fail_read {
-                return Err(Error::Platform(PlatformErrorCode::Unknown));
-            }
-            Ok(1500)
-        }
-
-        fn set_mtu(&self, mtu: u16) -> Result<()> {
-            self.calls.borrow_mut().push(Call::SetMtu(mtu));
-            if self.fail_set_mtu {
-                return Err(Error::PermissionDenied);
-            }
-            Ok(())
-        }
-
-        fn mac(&self) -> Result<MacAddress> {
-            self.calls.borrow_mut().push(Call::ReadMac);
-            Ok(OLD_MAC)
-        }
-
-        fn set_mac(&self, mac: MacAddress) -> Result<()> {
-            self.calls.borrow_mut().push(Call::SetMac(mac));
-            if self.fail_set_mac {
-                return Err(Error::PermissionDenied);
-            }
-            Ok(())
-        }
-
-        fn set_enabled(&self, enabled: bool) -> Result<()> {
-            self.calls.borrow_mut().push(Call::SetEnabled(enabled));
-            if self.fail_enable {
-                return Err(Error::PermissionDenied);
-            }
-            Ok(())
-        }
-    }
-
-    const ID: DeviceId = DeviceId::new(3);
-    const OLD_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 0x01]);
-    const NEW_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 0x02]);
-
-    /// A TUN device: no MAC address at all.
-    const TUN: ApplyTarget = ApplyTarget {
-        id: ID,
-        kind: DeviceKind::Tun,
-        mac_mutation: false,
-    };
-
-    /// A TAP device whose handle reports `MAC_MUTATION`.
-    const TAP: ApplyTarget = ApplyTarget {
-        id: ID,
-        kind: DeviceKind::Tap,
-        mac_mutation: true,
-    };
-
-    fn patch(
-        id: DeviceId,
-        admin: Option<DesiredAdminState>,
-        mtu: Option<u32>,
-    ) -> DeviceConfigPatch {
-        DeviceConfigPatch::new(id, admin, mtu).expect("a valid patch")
-    }
-
-    #[test]
-    fn a_patch_for_another_device_is_rejected_without_a_native_call() {
-        let fake = Fake::default();
-        let patch = patch(DeviceId::new(4), Some(DesiredAdminState::Up), Some(1400));
-        let result = apply_patch(&fake, TUN, &patch);
-        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
-        assert!(fake.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn an_mtu_above_u16_is_rejected_without_a_native_call() {
-        let fake = Fake::default();
-        let patch = patch(ID, Some(DesiredAdminState::Up), Some(70_000));
-        let result = apply_patch(&fake, TUN, &patch);
-        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
-        assert!(fake.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_mac_for_a_tun_device_is_rejected_without_a_native_call() {
-        let fake = Fake::default();
-        let patch = patch(ID, None, Some(1400)).with_mac(NEW_MAC);
-        let result = apply_patch(&fake, TUN, &patch);
-        assert!(matches!(result, Err(Error::InvalidState)), "{result:?}");
-        assert!(fake.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_mac_without_mac_mutation_is_unsupported_without_a_native_call() {
-        let fake = Fake::default();
-        let target = ApplyTarget {
-            mac_mutation: false,
-            ..TAP
-        };
-        let patch = patch(ID, Some(DesiredAdminState::Up), Some(1400)).with_mac(NEW_MAC);
-        let result = apply_patch(&fake, target, &patch);
-        assert!(matches!(result, Err(Error::Unsupported)), "{result:?}");
-        assert!(fake.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_single_step_skips_the_pre_read() {
-        let fake = Fake::default();
-        apply_patch(&fake, TUN, &patch(ID, None, Some(1400))).expect("apply");
-        assert_eq!(*fake.calls.borrow(), [Call::SetMtu(1400)]);
-
-        let fake = Fake::default();
-        apply_patch(&fake, TUN, &patch(ID, Some(DesiredAdminState::Down), None)).expect("apply");
-        assert_eq!(*fake.calls.borrow(), [Call::SetEnabled(false)]);
-
-        let fake = Fake::default();
-        apply_patch(&fake, TAP, &DeviceConfigPatch::new_mac(ID, NEW_MAC)).expect("apply");
-        assert_eq!(*fake.calls.borrow(), [Call::SetMac(NEW_MAC)]);
-    }
-
-    #[test]
-    fn every_step_runs_mtu_then_mac_then_admin_after_the_pre_reads() {
-        let fake = Fake::default();
-        let patch = patch(ID, Some(DesiredAdminState::Up), Some(1400)).with_mac(NEW_MAC);
-        apply_patch(&fake, TAP, &patch).expect("apply");
-        assert_eq!(
-            *fake.calls.borrow(),
-            [
-                Call::ReadMtu,
-                Call::ReadMac,
-                Call::SetMtu(1400),
-                Call::SetMac(NEW_MAC),
-                Call::SetEnabled(true),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_failed_mac_step_restores_the_mtu_and_skips_the_admin_step() {
-        let fake = Fake {
-            fail_set_mac: true,
-            ..Fake::default()
-        };
-        let patch = patch(ID, Some(DesiredAdminState::Up), Some(1400)).with_mac(NEW_MAC);
-        let result = apply_patch(&fake, TAP, &patch);
-        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
-        assert_eq!(
-            *fake.calls.borrow(),
-            [
-                Call::ReadMtu,
-                Call::ReadMac,
-                Call::SetMtu(1400),
-                Call::SetMac(NEW_MAC),
-                Call::SetMtu(1500),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_failed_admin_step_restores_the_mac_then_the_mtu() {
-        let fake = Fake {
-            fail_enable: true,
-            ..Fake::default()
-        };
-        let patch = patch(ID, Some(DesiredAdminState::Down), Some(1400)).with_mac(NEW_MAC);
-        let result = apply_patch(&fake, TAP, &patch);
-        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
-        assert_eq!(
-            *fake.calls.borrow(),
-            [
-                Call::ReadMtu,
-                Call::ReadMac,
-                Call::SetMtu(1400),
-                Call::SetMac(NEW_MAC),
-                Call::SetEnabled(false),
-                Call::SetMac(OLD_MAC),
-                Call::SetMtu(1500),
-            ]
-        );
-    }
-
-    #[test]
-    fn both_steps_run_mtu_first_after_a_pre_read() {
-        let fake = Fake::default();
-        apply_patch(
-            &fake,
-            TUN,
-            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
-        )
-        .expect("apply");
-        assert_eq!(
-            *fake.calls.borrow(),
-            [Call::ReadMtu, Call::SetMtu(1400), Call::SetEnabled(true)]
-        );
-    }
-
-    #[test]
-    fn a_failed_pre_read_changes_nothing() {
-        let fake = Fake {
-            fail_read: true,
-            ..Fake::default()
-        };
-        let result = apply_patch(
-            &fake,
-            TUN,
-            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
-        );
-        assert!(
-            matches!(result, Err(Error::Platform(PlatformErrorCode::Unknown))),
-            "{result:?}"
-        );
-        assert_eq!(*fake.calls.borrow(), [Call::ReadMtu]);
-    }
-
-    #[test]
-    fn a_failed_mtu_step_skips_the_admin_step() {
-        let fake = Fake {
-            fail_set_mtu: true,
-            ..Fake::default()
-        };
-        let result = apply_patch(
-            &fake,
-            TUN,
-            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
-        );
-        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
-        assert_eq!(*fake.calls.borrow(), [Call::ReadMtu, Call::SetMtu(1400)]);
-    }
-
-    #[test]
-    fn a_failed_admin_step_restores_the_mtu_and_returns_its_own_error() {
-        let fake = Fake {
-            fail_enable: true,
-            ..Fake::default()
-        };
-        let result = apply_patch(
-            &fake,
-            TUN,
-            &patch(ID, Some(DesiredAdminState::Down), Some(1400)),
-        );
-        assert!(matches!(result, Err(Error::PermissionDenied)), "{result:?}");
-        assert_eq!(
-            *fake.calls.borrow(),
-            [
-                Call::ReadMtu,
-                Call::SetMtu(1400),
-                Call::SetEnabled(false),
-                Call::SetMtu(1500),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_failed_revert_still_returns_the_original_error() {
-        // `set_mtu` succeeds the first time and fails on the revert.
-        struct FlakyRevert(RefCell<u8>);
-
-        impl ApplySteps for FlakyRevert {
-            fn mtu(&self) -> Result<u16> {
-                Ok(1500)
-            }
-
-            fn set_mtu(&self, _mtu: u16) -> Result<()> {
-                let mut calls = self.0.borrow_mut();
-                *calls += 1;
-                if *calls > 1 {
-                    return Err(Error::Platform(PlatformErrorCode::Unknown));
-                }
-                Ok(())
-            }
-
-            fn mac(&self) -> Result<MacAddress> {
-                Ok(OLD_MAC)
-            }
-
-            fn set_mac(&self, _mac: MacAddress) -> Result<()> {
-                Ok(())
-            }
-
-            fn set_enabled(&self, _enabled: bool) -> Result<()> {
-                Err(Error::NotFound)
-            }
-        }
-
-        let steps = FlakyRevert(RefCell::new(0));
-        let result = apply_patch(
-            &steps,
-            TUN,
-            &patch(ID, Some(DesiredAdminState::Up), Some(1400)),
-        );
-        assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
-        assert_eq!(*steps.0.borrow(), 2, "the revert was attempted");
     }
 }
 

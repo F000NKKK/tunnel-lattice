@@ -25,6 +25,16 @@ types to `model`'s concrete types. This mirrors `net-lattice-platform`'s
 same reason: a backend or the facade decides which concrete types satisfy the
 contract, not the contract itself.
 
+Rules that name model types but are the same for every backend live in
+`tunnel-lattice-model` behind the non-default `backend` feature
+(`tunnel_lattice_model::backend`), so each backend keeps only its native
+calls and trait impls: the per-OS interface-name rules, the checks `open`
+runs before any native call, the segmentation-offload request rule, the
+administrative-state flag and status rules, and the `apply` contract
+(precondition order, step order, compensation). It is a support API for
+backend authors with no stability promise; the `tunnel-lattice` facade never
+enables it and never re-exports it, and it performs no I/O.
+
 ## Why this differs from net-lattice's shape
 
 `net-lattice` inspects and mutates OS objects (routes, interfaces, DNS

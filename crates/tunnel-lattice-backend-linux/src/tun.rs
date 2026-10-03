@@ -22,15 +22,12 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use tunnel_lattice_core::{Error, Result};
 use tunnel_lattice_model::DeviceKind;
+use tunnel_lattice_model::backend::UNIX_MAX_NAME_BYTES;
 
 use crate::errno::{self, Class, Op};
 
 /// The clone device every queue is opened from.
 const TUN_NODE: &CStr = c"/dev/net/tun";
-
-/// The longest interface name the kernel accepts, in bytes, without the
-/// terminating NUL (`IFNAMSIZ - 1`).
-pub(crate) const MAX_NAME_BYTES: usize = libc::IFNAMSIZ - 1;
 
 /// The `TUNSETIFF` flags that describe a queue's framing and queue model.
 /// `IFF_PERSIST` and the `TUNGETIFF`-only bits (`IFF_NOFILTER`,
@@ -42,23 +39,6 @@ const QUEUE_FLAGS: c_int = libc::IFF_TUN
     | libc::IFF_VNET_HDR
     | libc::IFF_NAPI
     | libc::IFF_NAPI_FRAGS;
-
-/// Checks a requested interface name against the rule documented on
-/// `DeviceConfig::name` for Linux, before any native call: non-empty, no
-/// NUL, at most 15 bytes, and no `%` (the kernel would expand `%d` as a
-/// naming template and create another name). Anything else is
-/// `Error::InvalidState`.
-pub(crate) fn precheck_name(name: &str) -> Result<()> {
-    let valid = !name.is_empty()
-        && name.len() <= MAX_NAME_BYTES
-        && !name.contains('\0')
-        && !name.contains('%');
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidState)
-    }
-}
 
 /// The `TUNSETIFF` flags for a new queue of `kind`: always `IFF_NO_PI` (no
 /// packet-information prefix), plus `IFF_MULTI_QUEUE` when requested. Never
@@ -153,7 +133,7 @@ impl IfReq {
         for (slot, byte) in req
             .ifr_name
             .iter_mut()
-            .zip(bytes.iter().take(MAX_NAME_BYTES))
+            .zip(bytes.iter().take(UNIX_MAX_NAME_BYTES))
         {
             *slot = libc::c_char::from_ne_bytes([*byte]);
         }
@@ -274,20 +254,10 @@ mod tests {
 
     use super::*;
 
+    /// The shared name limit is the kernel's `IFNAMSIZ` minus the NUL.
     #[test]
-    fn names_follow_the_documented_linux_rule() {
-        for ok in ["t", "tun0", "tl-test", "a234567890abcde"] {
-            assert!(precheck_name(ok).is_ok(), "{ok}");
-        }
-        for bad in ["", "a234567890abcdef", "tun%d", "tun\0", "%"] {
-            assert!(
-                precheck_name(bad).is_err_and(|e| e.is_invalid_state()),
-                "{bad:?}"
-            );
-        }
-        // The limit is in bytes, not characters.
-        assert!(precheck_name("ééééééé").is_ok());
-        assert!(precheck_name("éééééééé").is_err());
+    fn the_shared_name_limit_is_the_kernel_limit() {
+        assert_eq!(UNIX_MAX_NAME_BYTES, libc::IFNAMSIZ - 1);
     }
 
     #[test]
@@ -345,7 +315,7 @@ mod tests {
         // The longest name keeps its terminating NUL.
         let req = IfReq::new(Some("a234567890abcde"), 0);
         assert_eq!(req.name().unwrap(), "a234567890abcde");
-        assert_eq!(req.0.ifr_name[MAX_NAME_BYTES], 0);
+        assert_eq!(req.0.ifr_name[UNIX_MAX_NAME_BYTES], 0);
         // No name asks the kernel to choose one.
         let req = IfReq::new(None, libc::IFF_TUN);
         assert_eq!(req.name().unwrap(), "");

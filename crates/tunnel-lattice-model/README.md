@@ -67,6 +67,29 @@ contracts; it never inspects or changes the host system.
   observed `Unknown` is never requested back. Both enums are
   `#[non_exhaustive]`, so a `match` on either needs a wildcard arm.
 
+### The `backend` Feature (for Backend Authors)
+
+The non-default `backend` Cargo feature adds `tunnel_lattice_model::backend`,
+a support API for crates that implement Tunnel Lattice backends. It is not
+covered by any stability promise and may change in any minor release;
+applications should not enable it, and the `tunnel-lattice` facade neither
+enables nor re-exports it. It holds the OS-independent rules every backend
+shares, with no I/O and no `unsafe`:
+
+- `HostOs` (and `HostOs::CURRENT`) with the per-OS interface-name rules
+  (`precheck_name`) and their constants;
+- `precheck_open`, the checks `open` runs before any native call (kind,
+  name, MTU, then MAC address), returning an `OpenRequest`;
+- `offload_requested`, `admin_from_if_flags` and `admin_from_oper_status`;
+- `apply_patch`, the `apply` contract (precondition order, MTU then MAC
+  address then administrative state, reverse best-effort compensation),
+  driven through a backend's `ApplySteps`.
+
+```toml
+[dependencies]
+tunnel-lattice-model = { version = "0.6", features = ["backend"] }
+```
+
 ### Out of Scope
 
 - **Packet I/O**: a runtime concern of `tunnel-lattice-platform`'s provider

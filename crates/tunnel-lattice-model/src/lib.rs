@@ -5,7 +5,11 @@
 //! Lattice ecosystem. See ARCHITECTURE.md for the full rationale.
 
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "backend")]
+#[cfg_attr(docsrs, doc(cfg(feature = "backend")))]
+pub mod backend;
 mod device;
 mod mac;
 

@@ -12,5 +12,15 @@ keywords.workspace = true
 description = "Operating-system-independent TUN/TAP domain types for Tunnel Lattice. Models data and contracts; never inspects or mutates the host system."
 readme = "README.md"
 
+[package.metadata.docs.rs]
+# Show the `backend` support module on docs.rs (labelled by its feature).
+features = ["backend"]
+
+[features]
+# Exposes `pub mod backend`: the OS-independent rules that Tunnel Lattice
+# backend crates share. Support API for backend authors, not covered by any
+# stability promise; the facade never enables it.
+backend = []
+
 [dependencies]
 tunnel-lattice-core = { workspace = true }

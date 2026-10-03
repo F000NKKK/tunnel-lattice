@@ -66,6 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segmentation offload or native async yet). A queue that uses virtio-net
   header framing is refused as `Unsupported`. None of it is public yet, and
   the facade does not select it.
+- **`tunnel_lattice_model::backend` support API (new non-default `backend`
+  feature).** `tunnel-lattice-model` gains a documented `backend` module,
+  behind the `backend` Cargo feature, holding the OS-independent rules that
+  backends shared as private copies: `HostOs`/`HostOs::CURRENT`, the per-OS
+  interface-name rules and constants (`precheck_name`), `precheck_open`
+  (kind, name, MTU, then MAC address, returning an `OpenRequest`),
+  `offload_requested`, `admin_from_if_flags`/`admin_from_oper_status`, and
+  the `apply` contract (`ApplySteps`, `ApplyTarget`, `apply_patch`). It is
+  a support API for backend authors, not covered by any stability promise;
+  the `tunnel-lattice` facade neither enables nor re-exports it, so
+  application-visible API is unchanged. Both `tunnel-lattice-backend-tunrs`
+  and the native Linux backend now use it; behaviour is unchanged.
 
 ### Changed
 

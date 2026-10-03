@@ -17,54 +17,16 @@
 //! such a change asynchronously, so a read right after `apply` can still
 //! report the previous state.
 //!
-//! Each read is a pure predicate over the native value plus a thin FFI
-//! wrapper; the predicates and the private constants are unit-tested on
-//! every host.
+//! Each read is a thin FFI wrapper around a shared predicate:
+//! `tunnel_lattice_model::backend::admin_from_if_flags` (macOS) and
+//! `admin_from_oper_status` (Windows), unit-tested there on every host.
 
-use std::ffi::c_int;
-
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tunnel_lattice_model::AdminState;
-
-/// `IFF_UP`, identical on Linux and macOS (asserted against `libc` by the
-/// unit tests on macOS).
-const IFF_UP: c_int = 0x1;
-
-/// `IFF_RUNNING`, identical on Linux and macOS (asserted against `libc` by
-/// the unit tests on macOS).
-const IFF_RUNNING: c_int = 0x40;
-
-/// `IfOperStatusUp` from `ifdef.h` (asserted against `windows-sys` by the
-/// unit tests on Windows).
-const IF_OPER_STATUS_UP: i32 = 1;
-
-/// The macOS predicate: `Up` iff the interface flags carry both `IFF_UP`
-/// and `IFF_RUNNING`.
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "the interface-flags read is macOS-only")
-)]
-pub(crate) fn admin_from_flags(flags: c_int) -> AdminState {
-    if flags & IFF_UP != 0 && flags & IFF_RUNNING != 0 {
-        AdminState::Up
-    } else {
-        AdminState::Down
-    }
-}
-
-/// The Windows predicate: `Up` iff the operational status is
-/// `IfOperStatusUp`; every other status (down, dormant, not present,
-/// lower layer down, testing, unknown) is `Down`.
-#[cfg_attr(
-    all(not(target_os = "windows"), not(test)),
-    expect(dead_code, reason = "the operational-status read is Windows-only")
-)]
-pub(crate) fn admin_from_oper(status: i32) -> AdminState {
-    if status == IF_OPER_STATUS_UP {
-        AdminState::Up
-    } else {
-        AdminState::Down
-    }
-}
+#[cfg(target_os = "macos")]
+use tunnel_lattice_model::backend::admin_from_if_flags;
+#[cfg(target_os = "windows")]
+use tunnel_lattice_model::backend::admin_from_oper_status;
 
 /// `SIOCGIFFLAGS`, `_IOWR('i', 17, struct ifreq)`. `libc` has no Apple
 /// constant for it; the value is pinned by a unit test that rebuilds it
@@ -73,7 +35,7 @@ pub(crate) fn admin_from_oper(status: i32) -> AdminState {
 const SIOCGIFFLAGS: libc::c_ulong = 0xc020_6911;
 
 /// Reads the interface flags of `name` with `SIOCGIFFLAGS` and applies
-/// [`admin_from_flags`]. Unprivileged; uses a throw-away `AF_INET` datagram
+/// [`admin_from_if_flags`](tunnel_lattice_model::backend::admin_from_if_flags). Unprivileged; uses a throw-away `AF_INET` datagram
 /// socket that is closed before returning.
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_admin_state(name: &str) -> std::io::Result<AdminState> {
@@ -116,11 +78,12 @@ pub(crate) fn macos_admin_state(name: &str) -> std::io::Result<AdminState> {
     // pattern is a valid `c_short`.
     let flags = unsafe { request.ifr_ifru.ifru_flags };
     // The flags are an unsigned 16-bit field stored in a `c_short`.
-    Ok(admin_from_flags(c_int::from(flags as u16)))
+    Ok(admin_from_if_flags(u32::from(flags as u16)))
 }
 
 /// Reads the operational status of the interface with `luid` with
-/// `GetIfEntry2` and applies [`admin_from_oper`]. Unprivileged. A failure
+/// `GetIfEntry2` and applies
+/// [`admin_from_oper_status`](tunnel_lattice_model::backend::admin_from_oper_status). Unprivileged. A failure
 /// is the raw Win32 code `GetIfEntry2` returned.
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_admin_state(
@@ -141,41 +104,21 @@ pub(crate) fn windows_admin_state(
         // A `WIN32_ERROR` is a `DWORD`; `std` stores it in an `i32`.
         return Err(std::io::Error::from_raw_os_error(result as i32));
     }
-    Ok(admin_from_oper(row.OperStatus))
+    Ok(admin_from_oper_status(row.OperStatus))
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use super::*;
-
-    #[test]
-    fn interface_flags_are_up_only_with_up_and_running() {
-        assert_eq!(admin_from_flags(IFF_UP | IFF_RUNNING), AdminState::Up);
-        // Other flags (broadcast, multicast, point-to-point) do not matter.
-        assert_eq!(
-            admin_from_flags(IFF_UP | IFF_RUNNING | 0x2 | 0x8000),
-            AdminState::Up
-        );
-        assert_eq!(admin_from_flags(IFF_UP), AdminState::Down);
-        assert_eq!(admin_from_flags(IFF_RUNNING), AdminState::Down);
-        assert_eq!(admin_from_flags(0), AdminState::Down);
-    }
-
-    #[test]
-    fn operational_status_is_up_only_when_up() {
-        // `ifdef.h`: Up 1, Down 2, Testing 3, Unknown 4, Dormant 5,
-        // NotPresent 6, LowerLayerDown 7.
-        assert_eq!(admin_from_oper(1), AdminState::Up);
-        for status in [2, 3, 4, 5, 6, 7, 0, -1] {
-            assert_eq!(admin_from_oper(status), AdminState::Down, "{status}");
-        }
-    }
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn interface_flag_constants_match_libc() {
-        assert_eq!(IFF_UP, libc::IFF_UP);
-        assert_eq!(IFF_RUNNING, libc::IFF_RUNNING);
+        use tunnel_lattice_model::backend::{IFF_RUNNING, IFF_UP};
+
+        assert_eq!(IFF_UP as i32, libc::IFF_UP);
+        assert_eq!(IFF_RUNNING as i32, libc::IFF_RUNNING);
     }
 
     /// `SIOCGIFFLAGS` is `_IOWR('i', 17, struct ifreq)`: the in/out
@@ -196,19 +139,20 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn operational_status_constants_match_windows_sys() {
+        use tunnel_lattice_model::backend::IF_OPER_STATUS_UP;
         use windows_sys::Win32::NetworkManagement::Ndis::{
             IfOperStatusDormant, IfOperStatusDown, IfOperStatusLowerLayerDown,
             IfOperStatusNotPresent, IfOperStatusUp,
         };
         assert_eq!(IF_OPER_STATUS_UP, IfOperStatusUp);
-        assert_eq!(admin_from_oper(IfOperStatusUp), AdminState::Up);
+        assert_eq!(admin_from_oper_status(IfOperStatusUp), AdminState::Up);
         for status in [
             IfOperStatusDown,
             IfOperStatusDormant,
             IfOperStatusNotPresent,
             IfOperStatusLowerLayerDown,
         ] {
-            assert_eq!(admin_from_oper(status), AdminState::Down, "{status}");
+            assert_eq!(admin_from_oper_status(status), AdminState::Down, "{status}");
         }
     }
 }

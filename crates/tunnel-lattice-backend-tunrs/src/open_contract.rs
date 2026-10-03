@@ -1,10 +1,11 @@
-//! The `DeviceProvider::open` contract: name prechecks that run before any
-//! native call, and the open-only error classifier that runs before the
-//! generic [`io_error`] mapping.
+//! The `DeviceProvider::open` contract: the open-only error classifier that
+//! runs before the generic [`io_error`] mapping. The name and parameter
+//! prechecks that run before any native call are shared with the other
+//! backends in `tunnel_lattice_model::backend`.
 //!
-//! Both are written against an explicit [`HostOs`] parameter instead of
-//! `#[cfg]` blocks, so every per-OS rule is exercised by the ordinary unit
-//! tests on every host. Only the two genuinely native pieces — the
+//! The classifier is written against an explicit [`HostOs`] parameter
+//! instead of `#[cfg]` blocks, so every per-OS rule is exercised by the
+//! ordinary unit tests on every host. Only the two genuinely native pieces — the
 //! `libloading::Error` downcast (Windows) and the `if_nametoindex` lookup
 //! (Linux/macOS) — are target-gated.
 //!
@@ -21,53 +22,12 @@ use std::io;
 
 use tunnel_lattice_core::Error;
 use tunnel_lattice_model::DeviceKind;
+pub(crate) use tunnel_lattice_model::backend::HostOs;
 
 use crate::io_error;
 
-/// The operating system whose `open` rules apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HostOs {
-    Linux,
-    Macos,
-    Windows,
-    /// Any other target: no name rules beyond the portable ones, and no
-    /// open-only classification.
-    Other,
-}
-
 /// The target this crate was compiled for.
-pub(crate) const HOST_OS: HostOs = if cfg!(target_os = "linux") {
-    HostOs::Linux
-} else if cfg!(target_os = "macos") {
-    HostOs::Macos
-} else if cfg!(target_os = "windows") {
-    HostOs::Windows
-} else {
-    HostOs::Other
-};
-
-/// Longest Linux/macOS interface name in bytes: `IFNAMSIZ` (16) minus the
-/// terminating NUL (`tun-rs` `linux/device.rs`, `macos/tuntap.rs`,
-/// `macos/tap/mod.rs`).
-const UNIX_MAX_NAME_BYTES: usize = 15;
-
-/// Longest Windows adapter name in UTF-16 code units: `tun-rs`'s
-/// `MAX_POOL` (256) minus the terminating NUL that its `encode_utf16`
-/// appends (`windows/tun/mod.rs`, `windows/ffi.rs`).
-const WINDOWS_MAX_NAME_UTF16_UNITS: usize = 255;
-
-/// Required prefix of a macOS TAP (`feth`) name (`macos/tap/mod.rs`).
-const MACOS_TAP_PREFIX: &str = "feth";
-
-/// Highest `feth` unit the XNU cloner creates: `FETH_MAXUNIT`, which is
-/// `IF_MAXUNIT` (`0x7fff`) in `bsd/net/if_fake.c` / `if_private.h`. Larger
-/// units fail natively with `ENXIO`, and `u32::MAX` is XNU's wildcard unit
-/// (`if_clone_create` then picks the lowest free unit and renames the
-/// device).
-const MACOS_FETH_MAX_UNIT: u32 = 0x7fff;
-
-/// Required prefix of a macOS TUN (`utun`) name (`macos/tuntap.rs`).
-const MACOS_TUN_PREFIX: &str = "utun";
+pub(crate) const HOST_OS: HostOs = HostOs::CURRENT;
 
 /// `tun-rs` 2.8.11 `windows/tap/iface.rs`: the message of the code-less
 /// `ErrorKind::NotFound` returned when no `tap0901` driver is installed.
@@ -89,81 +49,6 @@ const ENOENT: i32 = 2;
 const EBUSY: i32 = 16;
 const ENODEV: i32 = 19;
 const EINVAL: i32 = 22;
-
-/// Validates a requested device name before any native call.
-///
-/// Returns [`Error::InvalidState`] when `name` cannot be honored exactly
-/// on `os`, instead of letting `tun-rs` fail with a code-less error (or, for
-/// some formats, silently open a differently named device):
-///
-/// | OS | Rule |
-/// |---|---|
-/// | all | non-empty, no NUL character |
-/// | Linux | at most 15 bytes, no `%` (the kernel expands `%d` as a naming template) |
-/// | macOS `Tap` | `feth` followed by a canonical decimal number from 0 to 32767 (no sign, no leading zero) |
-/// | macOS `Tun` | `utun` followed by a canonical decimal number below `u32::MAX` (no sign, no leading zero), at most 15 bytes |
-/// | Windows `Tun`/`Tap` | at most 255 UTF-16 code units |
-pub(crate) fn precheck_name(os: HostOs, kind: DeviceKind, name: &str) -> Result<(), Error> {
-    if name.is_empty() || name.contains('\0') {
-        return Err(Error::InvalidState);
-    }
-    let valid = match os {
-        HostOs::Linux => name.len() <= UNIX_MAX_NAME_BYTES && !name.contains('%'),
-        HostOs::Macos => {
-            name.len() <= UNIX_MAX_NAME_BYTES
-                && match kind {
-                    DeviceKind::Tap => is_canonical_feth_name(name),
-                    DeviceKind::Tun => is_canonical_utun_name(name),
-                    // `open` rejects unknown kinds before prechecking.
-                    _ => true,
-                }
-        }
-        HostOs::Windows => name.encode_utf16().count() <= WINDOWS_MAX_NAME_UTF16_UNITS,
-        HostOs::Other => true,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidState)
-    }
-}
-
-/// `utun<N>` where `N` is exactly what `tun-rs` will create: `tun-rs`
-/// parses `N` with `str::parse::<u32>` (which also accepts `+7` and `007`,
-/// both of which would open `utun7` under a different name) and then adds
-/// one, so `u32::MAX` itself would overflow.
-fn is_canonical_utun_name(name: &str) -> bool {
-    name.strip_prefix(MACOS_TUN_PREFIX)
-        .and_then(canonical_unit)
-        .is_some_and(|n| n < u32::MAX)
-}
-
-/// `feth<N>` with an explicit, canonical unit number. `tun-rs` itself only
-/// checks the `feth` prefix and hands the name to `SIOCIFCREATE`, but bare
-/// `feth` is its own auto-naming template (the kernel picks the unit, so the
-/// device would open as some `fethN`), and a non-numeric or non-canonical
-/// unit is not a name the `feth` cloner creates as given. The unit is also
-/// bounded by [`MACOS_FETH_MAX_UNIT`]: `feth4294967295` would be XNU's
-/// wildcard (again a kernel-picked unit) and `feth32768` and above fail
-/// natively.
-fn is_canonical_feth_name(name: &str) -> bool {
-    name.strip_prefix(MACOS_TAP_PREFIX)
-        .and_then(canonical_unit)
-        .is_some_and(|n| n <= MACOS_FETH_MAX_UNIT)
-}
-
-/// Parses a non-empty run of ASCII digits with no sign and no leading zero
-/// (except `0` itself) as a `u32`.
-fn canonical_unit(unit: &str) -> Option<u32> {
-    let canonical = !unit.is_empty()
-        && unit.bytes().all(|b| b.is_ascii_digit())
-        && (unit == "0" || !unit.starts_with('0'));
-    if canonical {
-        unit.parse::<u32>().ok()
-    } else {
-        None
-    }
-}
 
 /// Maps an error from `tun-rs`'s device build step (inside
 /// `DeviceProvider::open`) onto [`Error`].
@@ -282,164 +167,20 @@ pub(crate) fn host_name_exists(_name: &str) -> bool {
     false
 }
 
-/// Ordinary (non-privileged, deterministic) tests of every precheck and
-/// classifier row, on every host.
+/// Ordinary (non-privileged, deterministic) tests of every classifier row,
+/// on every host.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL_OSES: [HostOs; 4] = [HostOs::Linux, HostOs::Macos, HostOs::Windows, HostOs::Other];
     const KINDS: [DeviceKind; 2] = [DeviceKind::Tun, DeviceKind::Tap];
 
-    fn rejected(os: HostOs, kind: DeviceKind, name: &str) -> bool {
-        matches!(precheck_name(os, kind, name), Err(Error::InvalidState))
-    }
-
-    fn accepted(os: HostOs, kind: DeviceKind, name: &str) -> bool {
-        precheck_name(os, kind, name).is_ok()
-    }
-
-    // ---- prechecks -------------------------------------------------------
+    // The name and parameter prechecks are tested next to their shared
+    // implementation in `tunnel_lattice_model::backend`.
 
     #[test]
-    fn empty_and_nul_names_are_rejected_everywhere() {
-        for os in ALL_OSES {
-            for kind in KINDS {
-                assert!(rejected(os, kind, ""), "{os:?}/{kind:?} empty");
-                assert!(rejected(os, kind, "feth\0x"), "{os:?}/{kind:?} NUL");
-                assert!(rejected(os, kind, "utun1\0"), "{os:?}/{kind:?} NUL");
-            }
-        }
-    }
-
-    #[test]
-    fn linux_names_are_limited_to_15_bytes_for_both_kinds() {
-        for kind in KINDS {
-            assert!(accepted(HostOs::Linux, kind, "tun0"));
-            assert!(accepted(HostOs::Linux, kind, &"a".repeat(15)));
-            assert!(rejected(HostOs::Linux, kind, &"a".repeat(16)));
-            // Bytes, not characters: 8 two-byte characters are 16 bytes.
-            assert!(accepted(HostOs::Linux, kind, &"ä".repeat(7)));
-            assert!(rejected(HostOs::Linux, kind, &"ä".repeat(8)));
-        }
-    }
-
-    /// Linux expands a `%d` in the requested name as a naming template
-    /// (`tl%d` opens as `tl0`), and rejects any other `%` use natively, so
-    /// every `%` is rejected up front.
-    #[test]
-    fn linux_names_containing_a_percent_sign_are_rejected() {
-        for kind in KINDS {
-            for bad in ["tl%d", "%d", "tun%", "a%sb", "%%"] {
-                assert!(rejected(HostOs::Linux, kind, bad), "{kind:?}/{bad}");
-            }
-        }
-        // The `%` rule is Linux-only; Windows adapter names may contain it.
-        assert!(accepted(HostOs::Windows, DeviceKind::Tun, "tl%d"));
-        assert!(accepted(HostOs::Other, DeviceKind::Tun, "tl%d"));
-    }
-
-    #[test]
-    fn macos_tap_names_must_be_canonical_feth_units() {
-        let tap = DeviceKind::Tap;
-        for ok in ["feth0", "feth7", "feth42", "feth32767"] {
-            assert!(accepted(HostOs::Macos, tap, ok), "{ok} should be accepted");
-        }
-        for bad in [
-            // `tun-rs`'s own auto-naming template: the kernel picks the unit.
-            "feth",
-            "fethX",
-            "feth1a",
-            "feth+5",
-            "feth-1",
-            "feth07",
-            "feth00",
-            "feth 1",
-            // Past XNU's `IF_MAXUNIT` (0x7fff): fails natively with ENXIO.
-            "feth32768",
-            "feth65535",
-            // XNU's wildcard unit (`u32::MAX`): the kernel would pick the
-            // unit and rename the device.
-            "feth4294967295",
-            // Past `u32` (and within 15 bytes, so only the range rule
-            // rejects it).
-            "feth4294967296",
-            "feth99999999999",
-            // 16 bytes.
-            "feth111111111111",
-            "tap0",
-            "fet",
-            "utun3",
-        ] {
-            assert!(
-                rejected(HostOs::Macos, tap, bad),
-                "{bad} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn macos_tun_names_must_be_canonical_utun_units() {
-        let tun = DeviceKind::Tun;
-        for ok in ["utun0", "utun7", "utun123", "utun4294967294"] {
-            assert!(accepted(HostOs::Macos, tun, ok), "{ok} should be accepted");
-        }
-        for bad in [
-            "utun",
-            "utunx",
-            "utun+5",
-            "utun-1",
-            "utun07",
-            "utun00",
-            "utun 1",
-            "tun0",
-            "feth0",
-            // `tun-rs` computes `N + 1`; `u32::MAX` would overflow.
-            "utun4294967295",
-            // Parses past `u32` (and is 15 bytes, so only the range rule
-            // rejects it).
-            "utun99999999999",
-            // 16 bytes.
-            "utun999999999999",
-        ] {
-            assert!(
-                rejected(HostOs::Macos, tun, bad),
-                "{bad} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn windows_names_are_limited_to_255_utf16_units_for_both_kinds() {
-        for kind in KINDS {
-            // Longer than any Unix limit, still fine on Windows.
-            assert!(accepted(HostOs::Windows, kind, &"a".repeat(100)));
-            assert!(accepted(HostOs::Windows, kind, "Tunnel Lattice (test)"));
-            assert!(accepted(HostOs::Windows, kind, &"a".repeat(255)));
-            assert!(rejected(HostOs::Windows, kind, &"a".repeat(256)));
-            // A non-BMP character is two UTF-16 units.
-            assert!(accepted(HostOs::Windows, kind, &"\u{1F600}".repeat(127)));
-            assert!(rejected(HostOs::Windows, kind, &"\u{1F600}".repeat(128)));
-        }
-    }
-
-    #[test]
-    fn other_targets_only_apply_the_portable_rules() {
-        for kind in KINDS {
-            assert!(accepted(HostOs::Other, kind, &"a".repeat(300)));
-        }
-    }
-
-    #[test]
-    fn host_os_matches_the_compilation_target() {
-        #[cfg(target_os = "linux")]
-        assert_eq!(HOST_OS, HostOs::Linux);
-        #[cfg(target_os = "macos")]
-        assert_eq!(HOST_OS, HostOs::Macos);
-        #[cfg(target_os = "windows")]
-        assert_eq!(HOST_OS, HostOs::Windows);
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        assert_eq!(HOST_OS, HostOs::Other);
+    fn host_os_is_the_compilation_target() {
+        assert_eq!(HOST_OS, HostOs::CURRENT);
     }
 
     // ---- classifier ------------------------------------------------------

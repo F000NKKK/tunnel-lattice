@@ -16,7 +16,11 @@ use tunnel_lattice_model::{
     MacAddress,
 };
 
-use crate::apply::{self, Steps, Target};
+use tunnel_lattice_model::backend::{
+    ApplySteps as Steps, ApplyTarget as Target, HostOs, UNIX_MAX_NAME_BYTES, admin_from_if_flags,
+    apply_patch, precheck_name,
+};
+
 use crate::errno::{self, Op};
 use crate::tun;
 
@@ -212,9 +216,9 @@ fn linux_name_rows() -> Vec<(String, bool)> {
 
 #[test]
 fn the_linux_name_rule_is_pinned() {
-    assert_eq!(tun::MAX_NAME_BYTES, 15);
+    assert_eq!(UNIX_MAX_NAME_BYTES, 15);
     for (name, accepted) in linux_name_rows() {
-        let result = tun::precheck_name(&name);
+        let result = precheck_name(HostOs::Linux, DeviceKind::Tun, &name);
         if accepted {
             assert!(result.is_ok(), "{name:?}");
         } else {
@@ -238,7 +242,7 @@ const BAD_NAMES: [&str; 3] = ["", "a\0b", "tl%d"];
 /// check would otherwise have to run first; an unknown (`non_exhaustive`)
 /// kind, the only `Unsupported` outcome, cannot be built outside the model.
 fn precheck_rejects(kind: DeviceKind, name: Option<&str>, mtu: Option<u32>, mac: bool) -> bool {
-    name.is_some_and(|name| tun::precheck_name(name).is_err())
+    name.is_some_and(|name| precheck_name(HostOs::Linux, kind, name).is_err())
         || mtu.is_some_and(|mtu| mtu > u32::from(u16::MAX))
         || (mac && kind != DeviceKind::Tap)
 }
@@ -301,11 +305,11 @@ fn administrative_state_follows_up_and_running_for_every_16_bit_flag_word() {
         } else {
             AdminState::Down
         };
-        assert_eq!(crate::admin_state(flags), expected, "{flags:#x}");
+        assert_eq!(admin_from_if_flags(flags), expected, "{flags:#x}");
     }
     // Bits above the 16-bit interface flags change nothing.
-    assert_eq!(crate::admin_state(0x8000_0041), AdminState::Up);
-    assert_eq!(crate::admin_state(0xffff_ffbe), AdminState::Down);
+    assert_eq!(admin_from_if_flags(0x8000_0041), AdminState::Up);
+    assert_eq!(admin_from_if_flags(0xffff_ffbe), AdminState::Down);
 }
 
 #[test]
@@ -405,11 +409,12 @@ impl Recorder {
 }
 
 impl Steps for Recorder {
-    fn mtu(&mut self) -> Result<u32> {
-        self.record(Call::ReadMtu).map(|()| OLD_MTU)
+    fn mtu(&mut self) -> Result<u16> {
+        self.record(Call::ReadMtu)
+            .map(|()| u16::try_from(OLD_MTU).unwrap())
     }
-    fn set_mtu(&mut self, mtu: u32) -> Result<()> {
-        self.record(Call::SetMtu(mtu))
+    fn set_mtu(&mut self, mtu: u16) -> Result<()> {
+        self.record(Call::SetMtu(u32::from(mtu)))
     }
     fn mac(&mut self) -> Result<MacAddress> {
         self.record(Call::ReadMac).map(|()| OLD_MAC)
@@ -523,7 +528,7 @@ fn apply_traces_and_compensation_are_pinned_for_every_patch_and_failure() {
                                 fail_at,
                                 fail_restores,
                             };
-                            let result = apply::apply(&mut recorder, target, &patch(mtu, mac, up));
+                            let result = apply_patch(&mut recorder, target, &patch(mtu, mac, up));
                             let (calls, label) = expected_trace(mtu, mac, up, fail_at);
                             let context = format!(
                                 "{:?} mtu {mtu:?} mac {mac} up {up:?} fail {fail_at:?} \
@@ -562,7 +567,7 @@ fn apply_literal_traces_of_the_full_patch_are_pinned() {
         fail_at: None,
         fail_restores: false,
     };
-    assert!(apply::apply(&mut ok, TAP, &full).is_ok());
+    assert!(apply_patch(&mut ok, TAP, &full).is_ok());
     assert_eq!(ok.calls, forward);
 
     let mut mac_fails = Recorder {
@@ -571,10 +576,7 @@ fn apply_literal_traces_of_the_full_patch_are_pinned() {
         fail_restores: false,
     };
     assert_eq!(
-        format!(
-            "{:?}",
-            apply::apply(&mut mac_fails, TAP, &full).unwrap_err()
-        ),
+        format!("{:?}", apply_patch(&mut mac_fails, TAP, &full).unwrap_err()),
         "Platform(Linux(1003))"
     );
     assert_eq!(
@@ -596,7 +598,7 @@ fn apply_literal_traces_of_the_full_patch_are_pinned() {
     assert_eq!(
         format!(
             "{:?}",
-            apply::apply(&mut admin_fails, TAP, &full).unwrap_err()
+            apply_patch(&mut admin_fails, TAP, &full).unwrap_err()
         ),
         "Platform(Linux(1004))"
     );
@@ -667,7 +669,7 @@ fn apply_preconditions_are_pinned() {
             fail_at: None,
             fail_restores: false,
         };
-        let got = match apply::apply(&mut recorder, target, &patch) {
+        let got = match apply_patch(&mut recorder, target, &patch) {
             Ok(()) => "Ok".to_owned(),
             Err(error) => format!("{error:?}"),
         };
