@@ -1,26 +1,5 @@
-//! Virtio-net header framing and segmentation offload for Linux TUN.
-//!
-//! A Linux TUN queue opened with `IFF_VNET_HDR` puts a 10-byte
-//! `struct virtio_net_hdr` in front of every packet, in both directions.
-//! With the kernel's TSO/USO offloads enabled, one read can return a
-//! *super-packet* of up to 64 KiB whose header asks the reader to split it
-//! into `gso_size`-byte segments, and one write can hand the kernel such a
-//! super-packet for it to split.
-//!
-//! This module is the pure, I/O-free half of that framing:
-//!
-//! - [`VirtioNetHdr`] decodes and encodes the header. It is native-endian,
-//!   the legacy framing a TUN device uses unless someone set
-//!   `TUNSETVNETLE`/`TUNSETVNETBE` on it.
-//! - [`SplitCursor`] validates one received frame, then writes it out one
-//!   IP packet at a time into a caller buffer. It synthesizes each
-//!   segment's IP and TCP/UDP headers with full checksums, or completes the
-//!   partial checksum of a non-GSO packet.
-//! - [`plan_run`] finds the run of adjacent same-flow packets at the head of
-//!   a send batch that the kernel will split back into exactly those
-//!   packets, and builds the header bytes to write in front of their
-//!   payloads.
-//! - [`checksum`], [`sum_words`] and [`fold`] compute the Internet checksum.
+//! The pure codec: the virtio-net header, the receive split and the send
+//! coalescing (see the parent module for the overview).
 //!
 //! Nothing here can panic on any input: offsets use checked arithmetic,
 //! every slice access goes through `get`, and malformed input becomes a
@@ -32,16 +11,16 @@ use core::ops::Range;
 
 /// Size of `struct virtio_net_hdr` without the `num_buffers` field, the
 /// default (and the only supported) TUN vnet header size.
-pub(crate) const VNET_HDR_LEN: usize = 10;
+pub const VNET_HDR_LEN: usize = 10;
 
 /// The largest IP packet (or GSO super-packet) a TUN device exchanges with
 /// the kernel: tun sets no `tso_max_size`, so the legacy 64 KiB GSO limit
 /// applies.
-pub(crate) const MAX_PACKET_LEN: usize = 65_536;
+pub const MAX_PACKET_LEN: usize = 65_536;
 
 /// Size of a receive staging buffer: the header, the largest super-packet
 /// and one sentinel byte that only an oversized read can fill.
-pub(crate) const STAGING_LEN: usize = VNET_HDR_LEN + MAX_PACKET_LEN + 1;
+pub const STAGING_LEN: usize = VNET_HDR_LEN + MAX_PACKET_LEN + 1;
 
 /// The most packets one coalesced write may carry. This is the kernel's
 /// `UDP_MAX_SEGMENTS`, which it enforces on a UDP super-packet written to a
@@ -51,29 +30,27 @@ pub(crate) const STAGING_LEN: usize = VNET_HDR_LEN + MAX_PACKET_LEN + 1;
 /// super-packet of any segment count costs nothing extra, and dropping one
 /// that splits into more segments (TCP with a small MSS) would lose data.
 /// A received frame is bounded only by its length checks.
-pub(crate) const MAX_SEGMENTS: usize = 128;
+pub const MAX_SEGMENTS: usize = 128;
 
 /// The header of a plain (non-GSO, no checksum offload) packet.
-pub(crate) const VNET_HDR_NONE: [u8; VNET_HDR_LEN] = [0; VNET_HDR_LEN];
+pub const VNET_HDR_NONE: [u8; VNET_HDR_LEN] = [0; VNET_HDR_LEN];
 
 /// `VIRTIO_NET_HDR_GSO_NONE`: not a super-packet.
-pub(crate) const GSO_NONE: u8 = 0;
+pub const GSO_NONE: u8 = 0;
 /// `VIRTIO_NET_HDR_GSO_TCPV4`: an IPv4 TCP super-packet.
-pub(crate) const GSO_TCPV4: u8 = 1;
+pub const GSO_TCPV4: u8 = 1;
 /// `VIRTIO_NET_HDR_GSO_TCPV6`: an IPv6 TCP super-packet.
-pub(crate) const GSO_TCPV6: u8 = 4;
+pub const GSO_TCPV6: u8 = 4;
 /// `VIRTIO_NET_HDR_GSO_UDP_L4`: an IPv4 or IPv6 UDP super-packet (USO).
-pub(crate) const GSO_UDP_L4: u8 = 5;
+pub const GSO_UDP_L4: u8 = 5;
 /// `VIRTIO_NET_HDR_GSO_ECN`: a modifier bit on a TCP `gso_type`.
-pub(crate) const GSO_ECN: u8 = 0x80;
+pub const GSO_ECN: u8 = 0x80;
 /// `VIRTIO_NET_HDR_F_NEEDS_CSUM`: the checksum from `csum_start` to the end
 /// is partial and must be completed at `csum_start + csum_offset`.
-pub(crate) const F_NEEDS_CSUM: u8 = 1;
+pub const F_NEEDS_CSUM: u8 = 1;
 /// `VIRTIO_NET_HDR_F_DATA_VALID`: the checksum was already verified.
-/// Accepted by the split without a check of its own, so only the tests
-/// name it.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const F_DATA_VALID: u8 = 2;
+/// Accepted by the split without a check of its own.
+pub const F_DATA_VALID: u8 = 2;
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -103,7 +80,7 @@ const RUN_HEADER_CAP: usize = VNET_HDR_LEN + MAX_RUN_HDR_LEN;
 /// the caller (drop the frame, read again); the variants exist so the tests
 /// can tell the rejection paths apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DropReason {
+pub enum DropReason {
     /// The frame is shorter than the vnet header.
     ShortHeader,
     /// The packet after the header is longer than [`MAX_PACKET_LEN`] (the
@@ -151,26 +128,26 @@ pub(crate) enum DropReason {
 
 /// The decoded `struct virtio_net_hdr` (native-endian legacy framing).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct VirtioNetHdr {
+pub struct VirtioNetHdr {
     /// `VIRTIO_NET_HDR_F_*` bits.
-    pub(crate) flags: u8,
+    pub flags: u8,
     /// `VIRTIO_NET_HDR_GSO_*` value, possibly with [`GSO_ECN`].
-    pub(crate) gso_type: u8,
+    pub gso_type: u8,
     /// Advisory header length. The kernel fills it with the skb's linear
     /// length on receive, which can exceed the headers, so the split derives
     /// the real header length itself and ignores this field.
-    pub(crate) hdr_len: u16,
+    pub hdr_len: u16,
     /// Payload bytes per segment.
-    pub(crate) gso_size: u16,
+    pub gso_size: u16,
     /// Offset of the L4 header, where checksumming starts.
-    pub(crate) csum_start: u16,
+    pub csum_start: u16,
     /// Offset of the checksum field from `csum_start`.
-    pub(crate) csum_offset: u16,
+    pub csum_offset: u16,
 }
 
 impl VirtioNetHdr {
     /// Decodes the header from the first [`VNET_HDR_LEN`] bytes of `frame`.
-    pub(crate) fn decode(frame: &[u8]) -> Result<Self, DropReason> {
+    pub fn decode(frame: &[u8]) -> Result<Self, DropReason> {
         let Some(&[flags, gso_type, h0, h1, s0, s1, c0, c1, o0, o1]) = frame.get(..VNET_HDR_LEN)
         else {
             return Err(DropReason::ShortHeader);
@@ -186,7 +163,7 @@ impl VirtioNetHdr {
     }
 
     /// Encodes the header into its native-endian wire form.
-    pub(crate) fn encode(&self) -> [u8; VNET_HDR_LEN] {
+    pub fn encode(&self) -> [u8; VNET_HDR_LEN] {
         let [h0, h1] = self.hdr_len.to_ne_bytes();
         let [s0, s1] = self.gso_size.to_ne_bytes();
         let [c0, c1] = self.csum_start.to_ne_bytes();
@@ -201,7 +178,7 @@ impl VirtioNetHdr {
 /// Summing 32-bit words and folding later is equivalent to summing 16-bit
 /// words, because 2^16 is congruent to 1 modulo 2^16 - 1. The accumulator
 /// cannot wrap for any slice shorter than 2^34 bytes.
-pub(crate) fn sum_words(data: &[u8], initial: u64) -> u64 {
+pub fn sum_words(data: &[u8], initial: u64) -> u64 {
     let mut acc = initial;
     let (quads, remainder) = data.as_chunks::<4>();
     for quad in quads {
@@ -218,7 +195,7 @@ pub(crate) fn sum_words(data: &[u8], initial: u64) -> u64 {
 
 /// Folds an accumulator from [`sum_words`] into a 16-bit one's-complement
 /// sum (not complemented).
-pub(crate) fn fold(mut acc: u64) -> u16 {
+pub fn fold(mut acc: u64) -> u16 {
     while acc > 0xffff {
         acc = (acc & 0xffff) + (acc >> 16);
     }
@@ -228,7 +205,7 @@ pub(crate) fn fold(mut acc: u64) -> u16 {
 /// The Internet checksum of `data` on top of the accumulator `initial`:
 /// the complement of the folded sum. Over data that already carries a
 /// correct checksum (and its pseudo-header in `initial`) it is zero.
-pub(crate) fn checksum(data: &[u8], initial: u64) -> u16 {
+pub fn checksum(data: &[u8], initial: u64) -> u16 {
     !fold(sum_words(data, initial))
 }
 
@@ -405,7 +382,7 @@ enum Plan {
 
 /// What [`SplitCursor::write_next`] produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Segment {
+pub enum Segment {
     /// The next IP packet, this many bytes long, is at the start of the
     /// output buffer.
     Packet(usize),
@@ -428,7 +405,7 @@ pub(crate) enum Segment {
 /// each packet is assembled straight into the caller's buffer (headers
 /// copied and patched, payload copied once, checksums computed in place).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SplitCursor {
+pub struct SplitCursor {
     plan: Plan,
     frame_len: usize,
     count: usize,
@@ -438,7 +415,7 @@ pub(crate) struct SplitCursor {
 impl SplitCursor {
     /// A cursor with nothing pending, for staging state before the first
     /// read.
-    pub(crate) const IDLE: Self = Self {
+    pub const IDLE: Self = Self {
         plan: Plan::Whole { csum: None },
         frame_len: 0,
         count: 0,
@@ -452,7 +429,7 @@ impl SplitCursor {
     /// inspected beyond the checksum range when [`F_NEEDS_CSUM`] is set. A
     /// TCPv4, TCPv6 or UDP (v4 or v6) super-packet is fully validated
     /// first, so [`write_next`](Self::write_next) cannot fail on it.
-    pub(crate) fn new(frame: &[u8]) -> Result<Self, DropReason> {
+    pub fn new(frame: &[u8]) -> Result<Self, DropReason> {
         let hdr = VirtioNetHdr::decode(frame)?;
         let pkt = frame.get(VNET_HDR_LEN..).ok_or(DropReason::ShortHeader)?;
         if pkt.len() > MAX_PACKET_LEN {
@@ -489,18 +466,17 @@ impl SplitCursor {
     }
 
     /// How many packets the frame carries in total.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn segments(&self) -> usize {
+    pub fn segments(&self) -> usize {
         self.count
     }
 
     /// How many packets have not been produced (or dropped) yet.
-    pub(crate) fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.count.saturating_sub(self.next)
     }
 
     /// Whether every packet has been produced (or dropped).
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.remaining() == 0
     }
 
@@ -509,7 +485,7 @@ impl SplitCursor {
     /// consumes it. `None` when every packet has been produced, or when the
     /// cursor's plan cannot size it (the next `write_next` then ends the
     /// cursor with [`DropReason::FrameMismatch`]).
-    pub(crate) fn next_len(&self) -> Option<usize> {
+    pub fn next_len(&self) -> Option<usize> {
         if self.is_finished() {
             return None;
         }
@@ -522,11 +498,7 @@ impl SplitCursor {
     /// different length ends the cursor with
     /// [`DropReason::FrameMismatch`]. A too-short `out` drops only the
     /// current packet ([`Segment::BufferTooSmall`]).
-    pub(crate) fn write_next(
-        &mut self,
-        frame: &[u8],
-        out: &mut [u8],
-    ) -> Result<Segment, DropReason> {
+    pub fn write_next(&mut self, frame: &[u8], out: &mut [u8]) -> Result<Segment, DropReason> {
         if self.is_finished() {
             return Ok(Segment::Done);
         }
@@ -864,7 +836,7 @@ fn continues(first: &[u8], prev: &[u8], prev_flow: &Flow, pkt: &[u8], flow: &Flo
 /// TCP sequence numbers are contiguous, IPv4 ids consecutive, and every
 /// other header field is identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Run {
+pub struct Run {
     count: usize,
     hdr_len: usize,
     total_len: usize,
@@ -875,7 +847,7 @@ pub(crate) struct Run {
 impl Run {
     /// How many packets from the head of the batch the run covers (2 to
     /// [`MAX_SEGMENTS`]).
-    pub(crate) fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.count
     }
 
@@ -883,19 +855,19 @@ impl Run {
     /// the first packet's IP and L4 headers, patched for the whole run
     /// (lengths, IPv4 header checksum, the partial L4 checksum, and PSH
     /// from the last packet).
-    pub(crate) fn header(&self) -> &[u8] {
+    pub fn header(&self) -> &[u8] {
         self.header.get(..self.header_len).unwrap_or(&[])
     }
 
     /// The payload of one of the run's packets: everything after its IP
     /// and L4 headers. Every packet of the run has the same header length.
-    pub(crate) fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
+    pub fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
         packet.get(self.hdr_len..).unwrap_or(&[])
     }
 
     /// The length of the IP super-packet the run is written as (without
     /// the vnet header).
-    pub(crate) fn total_len(&self) -> usize {
+    pub fn total_len(&self) -> usize {
         self.total_len
     }
 }
@@ -911,7 +883,7 @@ impl Run {
 /// first, or would exceed [`MAX_SEGMENTS`] packets or 64 KiB (and any IP or
 /// UDP length field); it stops after a TCP packet with PSH and after any
 /// packet shorter than the first.
-pub(crate) fn plan_run(packets: &[&[u8]], udp_gso: bool) -> Option<Run> {
+pub fn plan_run(packets: &[&[u8]], udp_gso: bool) -> Option<Run> {
     let first: &[u8] = packets.first()?;
     let flow = coalescible(first)?;
     if flow.l4 == L4::Udp && !udp_gso {

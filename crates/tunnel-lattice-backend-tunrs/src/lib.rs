@@ -19,17 +19,14 @@
 #![warn(missing_docs)]
 
 mod admin_state;
-#[cfg(any(all(target_os = "macos", feature = "async"), all(test, unix)))]
-mod macos_tap;
-// Pure and I/O-free, so it compiles and is unit-tested on every OS; only
-// the Linux TUN receive and send paths call it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-mod offload;
-// The queue-level half of offload: compiled and unit-tested on every OS,
-// called only by the Linux TUN paths.
 #[cfg(test)]
 mod golden_tests;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(all(target_os = "macos", feature = "async"), all(test, unix)))]
+mod macos_tap;
+// Segmentation offload exists only on Linux TUN; its codec and engine come
+// from `tunnel-lattice-platform`'s `offload` feature, which this crate
+// enables only for Linux targets. This module is the Linux binding of them.
+#[cfg(target_os = "linux")]
 mod offload_queue;
 mod open_contract;
 mod recv_contract;
@@ -47,6 +44,8 @@ use tunnel_lattice_model::{
 };
 #[cfg(feature = "async")]
 use tunnel_lattice_platform::AsyncPacketIo;
+#[cfg(target_os = "linux")]
+use tunnel_lattice_platform::backend::offload::{VNET_HDR_LEN, VNET_HDR_NONE};
 use tunnel_lattice_platform::{
     Capability, CapabilityProvider, DeviceMutator, DeviceObserver, DeviceProvider, PacketIo,
 };
@@ -963,7 +962,7 @@ impl TunRsDevice {
 #[cfg(target_os = "linux")]
 fn framed(buf: &[u8]) -> [std::io::IoSlice<'_>; 2] {
     [
-        std::io::IoSlice::new(&offload::VNET_HDR_NONE),
+        std::io::IoSlice::new(&VNET_HDR_NONE),
         std::io::IoSlice::new(buf),
     ]
 }
@@ -972,7 +971,7 @@ fn framed(buf: &[u8]) -> [std::io::IoSlice<'_>; 2] {
 /// caller sent.
 #[cfg(target_os = "linux")]
 fn framed_len(written: std::io::Result<usize>) -> std::io::Result<usize> {
-    written.map(|n| n.saturating_sub(offload::VNET_HDR_LEN))
+    written.map(|n| n.saturating_sub(VNET_HDR_LEN))
 }
 
 /// One blocking native read. On unix it reads into `[buf, 1-byte

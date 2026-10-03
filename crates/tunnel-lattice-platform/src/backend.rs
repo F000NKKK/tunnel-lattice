@@ -23,6 +23,10 @@
 //! - [`errno`] holds the raw error codes the backends compare against, as
 //!   plain integers (so this crate needs no `libc`), and the Linux table that
 //!   maps an `errno` and the operation that produced it to an outcome.
+//! - `offload`, behind the additional `offload` feature, is the Linux
+//!   segmentation-offload codec (the virtio-net header, the receive split,
+//!   the send coalescing) and the queue-level engine around it. Its reads,
+//!   writes and error tables are supplied by the backend.
 //!
 //! # Draining a batch
 //!
@@ -42,6 +46,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tunnel_lattice_core::{Error, Result};
 
 pub mod errno;
+#[cfg(feature = "offload")]
+#[cfg_attr(docsrs, doc(cfg(feature = "offload")))]
+pub mod offload;
 
 /// What a `recv`/`send` loop does with one native attempt's result.
 #[derive(Debug)]

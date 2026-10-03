@@ -95,6 +95,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so application-visible API is unchanged. Both
   `tunnel-lattice-backend-tunrs` and the native Linux backend now use it;
   behaviour is unchanged.
+- **`tunnel_lattice_platform::backend::offload` (new non-default `offload`
+  feature, implies `backend`).** The Linux segmentation-offload codec and
+  engine move out of `tunnel-lattice-backend-tunrs` into the platform
+  crate as safe, portable Rust that compiles and is tested on every host:
+  the virtio-net header codec (receive split, send coalescing, checksum
+  completion), `Framing`/`decide_framing`, the receive staging
+  (`OffloadRx`, `Staging`), the send-batch engine (`send_batch_blocking`,
+  and with the `async` feature `AsyncGatherWrite` and `send_batch_async`).
+  The engine is generic over the error type: the backend supplies the
+  reads, writes and the `OffloadRules` error classification, and keeps the
+  `unsafe` (`preadv2`, the ioctls). `tunnel-lattice-backend-tunrs` enables
+  the feature on Linux targets only, so other targets compile none of it.
+  It is a support API for backend authors, not covered by any stability
+  promise; the facade neither enables nor re-exports it, and offload
+  behaviour is byte-for-byte unchanged. CI also runs the platform crate's
+  offload tests under Miri (non-blocking).
 
 ### Changed
 

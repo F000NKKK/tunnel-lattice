@@ -30,7 +30,7 @@ use tokio::io::unix::AsyncFd;
 use tunnel_lattice_core::Result;
 use tunnel_lattice_model::{AdminState, DeviceKind};
 
-use crate::offload_queue::OffloadRx;
+use crate::offload_queue::{OffloadRx, TunRsRules};
 use crate::open_contract::HostOs;
 use crate::recv_contract::{self, DeferredTooSmall, Step};
 
@@ -108,14 +108,18 @@ impl ErrorAwareReader {
                 file.read(buf)
             })
         };
+        let rules = TunRsRules::new(os, kind);
         tokio::task::coop::consume_budget().await;
         loop {
-            if let Some(result) = rx.lock().pending_batch(os, bufs, lens, &mut read_nowait) {
+            if let Some(result) = rx
+                .lock()
+                .pending_batch(bufs, lens, &mut read_nowait, &rules)
+            {
                 return result;
             }
             let ready = self.0.ready(Interest::READABLE | Interest::ERROR).await;
             let mut staging = rx.lock();
-            if let Some(result) = staging.pending_batch(os, bufs, lens, &mut read_nowait) {
+            if let Some(result) = staging.pending_batch(bufs, lens, &mut read_nowait, &rules) {
                 return result;
             }
             let result = match ready {
@@ -130,8 +134,7 @@ impl ErrorAwareReader {
                 },
                 Err(err) => Err(err),
             };
-            if let Some(result) = staging.read_batch(os, kind, result, bufs, lens, &mut read_nowait)
-            {
+            if let Some(result) = staging.read_batch(result, bufs, lens, &mut read_nowait, &rules) {
                 return result;
             }
         }

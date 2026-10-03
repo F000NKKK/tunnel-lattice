@@ -46,6 +46,13 @@ futures = { workspace = true, optional = true }
 # `Interest::ERROR` (1.32) and `task::coop::consume_budget` (1.44)).
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
 
+# Segmentation offload exists only on Linux TUN: the virtio-net codec and
+# the receive/send engine come from the platform crate's `offload` feature,
+# which is enabled for Linux targets only, so the other targets compile none
+# of it.
+[target.'cfg(target_os = "linux")'.dependencies]
+tunnel-lattice-platform = { workspace = true, features = ["backend", "offload"] }
+
 # `if_nametoindex`, used by `open` to tell an existing-name conflict apart
 # from other `EINVAL`/`EBUSY` failures, and on Linux the `TUNSETPERSIST`
 # ioctl `unpersist` issues itself (tun-rs can only set the flag). Already

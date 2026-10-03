@@ -1,7 +1,15 @@
-//! Segmentation offload at the queue level: which open requests reach
-//! `tun-rs`, the open-time check of what framing a Linux TUN queue really
-//! has, and the per-queue receive staging that turns one kernel read into
-//! one IP packet per `recv`.
+//! Segmentation offload at the queue level for the `tun-rs` backend: the
+//! open-time check of what framing a Linux TUN queue really has, and the
+//! adapters that bind the shared engine to this backend's reads, writes and
+//! error rules. Linux only.
+//!
+//! The codec (the virtio-net header, the receive split, the send coalescing)
+//! and the engine (the per-queue receive staging, the batch receive drain,
+//! the batch send) live in `tunnel_lattice_platform::backend::offload`, shared
+//! by every backend. What stays here is what only this backend can know:
+//! the `ioctl`s that observe the queue, the native reads and writes, and
+//! [`TunRsRules`], which maps a failed `tun-rs` read or write through
+//! `recv_contract`.
 //!
 //! # Framing follows the device, not the request
 //!
@@ -10,7 +18,7 @@
 //! already has queues. So after every Linux TUN open (and every added
 //! queue), [`verify_queue`] reads the device's flags (`TUNGETIFF`) and, if
 //! the flag is set, its header size (`TUNGETVNETHDRSZ`), and
-//! [`decide_framing`] picks the framing:
+//! `decide_framing` picks the framing:
 //!
 //! | Observed | Framing |
 //! |---|---|
@@ -18,103 +26,66 @@
 //! | `IFF_VNET_HDR` set, any other header size | `open` fails with `Unsupported` |
 //! | `IFF_VNET_HDR` clear | plain; if `tun-rs` set an offload mask for this queue, it is cleared with `TUNSETOFFLOAD(0)`, since a device without the header must not produce super-packets |
 //!
-//! # Receiving on an offload-framed queue
+//! # Receiving and sending on an offload-framed queue
 //!
-//! [`OffloadRx`] owns a staging buffer of [`STAGING_LEN`] bytes (header,
-//! the largest super-packet, one sentinel byte) and a [`SplitCursor`],
-//! behind a mutex. A `recv` first serves the next pending segment of the
-//! last frame read, if any; otherwise it reads one frame into the staging
-//! buffer, validates it, and serves its first segment. A segment that does
-//! not fit the caller's buffer is dropped alone, as
-//! [`Error::BufferTooSmall`]. A frame that fails validation (or filled the
-//! sentinel), and a raw `EINVAL` read, are dropped and the read retried
-//! (see `recv_contract`).
+//! A `recv` serves the next pending segment of the last frame read, or
+//! reads one frame into the staging buffer and serves its first segment; a
+//! frame that fails validation, and a raw `EINVAL` read, are dropped and the
+//! read retried (see `recv_contract`). A `recv_batch` fills position 0 the
+//! same way, then drains with a *non-waiting* read; every failed drain read
+//! other than a raw `EINTR` or `EINVAL` ends the batch (see `recv_contract`,
+//! "Draining a batch"). The drain takes its read as a closure, so the
+//! blocking build (`preadv2` with `RWF_NOWAIT`), `async-io` (`try_recv`) and
+//! Tokio (`try_io`) share it, and so do the scripted-read unit tests.
 //!
-//! The async receive loops never hold the mutex across an `.await`, and
-//! never await between a successful read and the return: a dropped `recv`
-//! future therefore never loses a frame it read, because its remaining
-//! segments stay in the staging buffer for the next `recv`.
-//!
-//! # Receiving a batch on an offload-framed queue
-//!
-//! A `recv_batch` fills position 0 exactly as a `recv` does (`recv` is a
-//! batch of one), then [`Staging::drain`]s, still under the same lock and
-//! with no `.await`: the pending segments of the current frame go into
-//! `bufs[1..]` in order, and once none is pending, the next frame is read
-//! into the staging buffer with a *non-waiting* read and split on. A
-//! segment is sized before it is copied ([`SplitCursor::next_len`]): one
-//! that does not fit `bufs[k]`, `k >= 1`, stays pending and ends the batch,
-//! so the next call serves it (or, at position 0, drops it as
-//! [`Error::BufferTooSmall`], as `recv` does). A frame the split does not
-//! accept and a raw `EINVAL` read are dropped and the drain goes on; every
-//! other failed read ends the batch (see `recv_contract`, "Draining a
-//! batch"). The drain takes its read as a closure, so the blocking build
-//! (`preadv2` with `RWF_NOWAIT`), `async-io` (`try_recv`) and Tokio
-//! (`try_io`) share it, and so do the scripted-read unit tests.
-//!
-//! # Sending a batch on an offload-framed queue
-//!
-//! [`send_batch_blocking`] and `send_batch_async` send at most
-//! [`MAX_SEGMENTS`] packets per call, walking them in order. At each
-//! position, [`plan_run`] looks for a run of adjacent packets of one flow
-//! that the kernel will split back into exactly those packets (UDP only
-//! when the queue has USO); a run goes out as one gather write of the run
-//! header and each packet's payload, with no payload copied, and anything
-//! else as one packet behind an all-zero header. Results follow the
-//! `send_batch` prefix contract: `Ok(n)` means the first `n` packets were
-//! written whole, in order, and nothing after them; an error on the first
-//! write is returned as is; an error after `k > 0` packets gives `Ok(k)`.
-//!
-//! A raw `EINVAL` on a run's write means the kernel refused the header and
+//! A `send_batch` coalesces runs of one flow into single gather writes. A
+//! raw `EINVAL` on a run's write means the kernel refused the header and
 //! wrote nothing (a kernel without USO, for example), so the run's packets
-//! are written again one by one. A write that reports fewer bytes than it
-//! was given is an error like any other failed write: the kernel's TUN
-//! write takes the whole frame or nothing, so this never happens on a real
-//! queue, but if it did, no packet of that write is counted as sent.
+//! are written again one by one.
 
 use std::io::{self, IoSlice};
-use std::sync::{Mutex, MutexGuard};
+#[cfg(feature = "async")]
+use std::sync::MutexGuard;
 
-use tunnel_lattice_core::{Error, Result};
+use tunnel_lattice_core::Result;
 use tunnel_lattice_model::DeviceKind;
+#[cfg(feature = "async")]
+use tunnel_lattice_platform::backend::offload::Staging;
+use tunnel_lattice_platform::backend::offload::{self as engine, OffloadRules};
 
-use crate::offload::{
-    MAX_SEGMENTS, Run, STAGING_LEN, Segment, SplitCursor, VNET_HDR_LEN, VNET_HDR_NONE, plan_run,
-};
 use crate::open_contract::HostOs;
 use crate::recv_contract::{self, DrainStep, Step};
 
-/// The framing [`decide_framing`] chose for one queue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Framing {
-    /// Every packet on the queue carries a 10-byte virtio-net header.
-    pub(crate) offload: bool,
-    /// The device has no header framing but carries an offload mask that
-    /// `tun-rs` set for this queue: clear it with `TUNSETOFFLOAD(0)`.
-    pub(crate) clear_mask: bool,
+/// This backend's answers to the shared engine's questions about a failed
+/// read or write: the `recv_contract` rules for `os` and `kind`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TunRsRules {
+    os: HostOs,
+    kind: DeviceKind,
 }
 
-/// Chooses a queue's framing from what the device reports: whether
-/// `IFF_VNET_HDR` is set, its header size (`None` when it was not read
-/// because the flag is clear), and whether `tun-rs` set an offload mask for
-/// this queue (its `tcp_gso()`). See the module table.
-pub(crate) fn decide_framing(
-    vnet_hdr: bool,
-    hdr_size: Option<i32>,
-    mask_set: bool,
-) -> Result<Framing> {
-    if !vnet_hdr {
-        return Ok(Framing {
-            offload: false,
-            clear_mask: mask_set,
-        });
+impl TunRsRules {
+    /// The rules of a `kind` handle on `os`.
+    pub(crate) fn new(os: HostOs, kind: DeviceKind) -> Self {
+        Self { os, kind }
     }
-    match hdr_size.map(usize::try_from) {
-        Some(Ok(VNET_HDR_LEN)) => Ok(Framing {
-            offload: true,
-            clear_mask: false,
-        }),
-        _ => Err(Error::Unsupported),
+}
+
+impl OffloadRules<io::Error> for TunRsRules {
+    fn read_error(&self, err: io::Error) -> Step {
+        recv_contract::offload_recv_error_step(self.os, self.kind, err)
+    }
+
+    fn drain_error(&self, err: &io::Error) -> DrainStep {
+        recv_contract::drain_error_step(self.os, true, err)
+    }
+
+    fn write_error(&self, err: io::Error) -> Step {
+        recv_contract::send_step(self.os, self.kind, Err(err))
+    }
+
+    fn run_refused(&self, err: &io::Error) -> bool {
+        recv_contract::is_refused_offload_write(self.os, err)
     }
 }
 
@@ -134,7 +105,7 @@ pub(crate) fn verify_queue(fd: std::os::fd::RawFd, mask_set: bool) -> Result<Opt
     } else {
         None
     };
-    let framing = decide_framing(vnet_hdr, hdr_size, mask_set)?;
+    let framing = engine::decide_framing(vnet_hdr, hdr_size, mask_set)?;
     if framing.clear_mask {
         clear_offload_mask(fd).map_err(io_error)?;
     }
@@ -197,61 +168,33 @@ fn clear_offload_mask(fd: std::os::fd::RawFd) -> io::Result<()> {
     }
 }
 
-/// The receive staging of one offload-framed queue: allocated only for
-/// such a queue, owned by its handle, never shared with another queue.
-pub(crate) struct OffloadRx(Mutex<Staging>);
-
-/// The last frame read and how far it has been served.
-pub(crate) struct Staging {
-    /// Header, packet and sentinel byte of the last read.
-    buf: Box<[u8]>,
-    /// How many bytes of `buf` the last read filled.
-    frame_len: usize,
-    /// The segments of that frame still to serve; idle when none are.
-    cursor: SplitCursor,
-    /// Test builds only: how many frames read so far carried more than one
-    /// segment, so a test can tell a real split from packets the kernel
-    /// delivered one by one.
-    #[cfg(test)]
-    split_frames: usize,
-}
+/// The receive staging of one offload-framed queue: the shared engine's
+/// staging, with this backend's blocking and async receive loops around it.
+/// Allocated only for such a queue, owned by its handle, never shared with
+/// another queue.
+pub(crate) struct OffloadRx(engine::OffloadRx);
 
 impl OffloadRx {
     /// A fresh staging buffer with nothing pending.
     pub(crate) fn new() -> Self {
-        Self(Mutex::new(Staging {
-            buf: vec![0u8; STAGING_LEN].into_boxed_slice(),
-            frame_len: 0,
-            cursor: SplitCursor::IDLE,
-            #[cfg(test)]
-            split_frames: 0,
-        }))
+        Self(engine::OffloadRx::new())
     }
 
-    /// Test builds only: how many frames this queue has read that carried
-    /// more than one segment (super-packets that were split). Takes the
-    /// staging lock, so call it between `recv`s, not during one.
+    /// Locks the staging (see `engine::OffloadRx::lock`).
+    #[cfg(feature = "async")]
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Staging> {
+        self.0.lock()
+    }
+
+    /// How many frames this queue has split (a test diagnostic).
     #[cfg(test)]
     pub(crate) fn split_frames(&self) -> usize {
-        self.lock().split_frames
+        self.0.split_frames()
     }
 
-    /// Locks the staging. The split code cannot panic, so the mutex is
-    /// never poisoned by it; if it ever is, the pending segments are
-    /// discarded and the staging is used again.
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Staging> {
-        self.0.lock().unwrap_or_else(|poisoned| {
-            let mut staging = poisoned.into_inner();
-            staging.cursor = SplitCursor::IDLE;
-            self.0.clear_poison();
-            staging
-        })
-    }
-
-    /// Blocking `recv`: a batch of one through [`Self::recv_batch_blocking`],
-    /// which therefore never drains.
+    /// Blocking `recv`: a batch of one, which therefore never drains.
     #[cfg_attr(
-        all(target_os = "linux", feature = "async", not(test)),
+        all(feature = "async", not(test)),
         expect(dead_code, reason = "async builds receive through an async loop")
     )]
     pub(crate) fn recv_blocking(
@@ -261,40 +204,30 @@ impl OffloadRx {
         out: &mut [u8],
         read: impl FnMut(&mut [u8]) -> io::Result<usize>,
     ) -> Result<usize> {
-        let mut lens = [0];
-        self.recv_batch_blocking(os, kind, &mut [out], &mut lens, read, never_drained)
-            .map(|_| lens[0])
+        self.0.recv_blocking(out, read, &TunRsRules::new(os, kind))
     }
 
     /// Blocking `recv_batch` (see the module docs): position 0 serves a
     /// pending segment, or reads frames with `read` (one blocking native
     /// read into the given buffer) until one yields a packet or an error;
-    /// then [`Staging::drain`] fills the rest with `read_nowait`, which must
-    /// never wait. Holds the lock across `read`, which is what a blocking
-    /// caller does anyway.
+    /// then the staging drains with `read_nowait`, which must never wait.
+    /// Holds the lock across `read`, which is what a blocking caller does
+    /// anyway.
+    #[cfg_attr(
+        all(feature = "async", not(test)),
+        expect(dead_code, reason = "async builds receive through an async loop")
+    )]
     pub(crate) fn recv_batch_blocking(
         &self,
         os: HostOs,
         kind: DeviceKind,
         bufs: &mut [&mut [u8]],
         lens: &mut [usize],
-        mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
-        mut read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
+        read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
     ) -> Result<usize> {
-        if recv_contract::batch_capacity(bufs, lens) == 0 {
-            return Ok(0);
-        }
-        let mut staging = self.lock();
-        loop {
-            if let Some(result) = staging.pending_batch(os, bufs, lens, &mut read_nowait) {
-                return result;
-            }
-            let result = read(staging.read_buf());
-            if let Some(result) = staging.read_batch(os, kind, result, bufs, lens, &mut read_nowait)
-            {
-                return result;
-            }
-        }
+        self.0
+            .recv_batch_blocking(bufs, lens, read, read_nowait, &TunRsRules::new(os, kind))
     }
 
     /// The `async-io` `recv`: a batch of one through
@@ -317,7 +250,7 @@ impl OffloadRx {
     /// staging buffer first, and waits for readiness on the `tun-rs` handle
     /// only after that read found the queue empty (`WouldBlock`), as
     /// `async-io`'s own `read_with` and the plain receive path do. Once
-    /// position 0 holds a packet, [`Staging::drain`] fills the rest with
+    /// position 0 holds a packet, the staging drains the rest with
     /// `try_recv`, which never waits.
     ///
     /// The read must come first: a fresh `async-io` readiness wait never
@@ -336,6 +269,7 @@ impl OffloadRx {
         if recv_contract::batch_capacity(bufs, lens) == 0 {
             return Ok(0);
         }
+        let rules = TunRsRules::new(os, kind);
         let mut read_nowait = |buf: &mut [u8]| handle.try_recv(buf);
         // The outcome of the last readiness wait; an error is handled
         // like a failed read.
@@ -347,7 +281,7 @@ impl OffloadRx {
             // future can be dropped.
             {
                 let mut staging = self.lock();
-                if let Some(result) = staging.pending_batch(os, bufs, lens, &mut read_nowait) {
+                if let Some(result) = staging.pending_batch(bufs, lens, &mut read_nowait, &rules) {
                     return result;
                 }
                 let result = match std::mem::replace(&mut ready, Ok(())) {
@@ -358,7 +292,7 @@ impl OffloadRx {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     result => {
                         if let Some(result) =
-                            staging.read_batch(os, kind, result, bufs, lens, &mut read_nowait)
+                            staging.read_batch(result, bufs, lens, &mut read_nowait, &rules)
                         {
                             return result;
                         }
@@ -373,331 +307,10 @@ impl OffloadRx {
     }
 }
 
-/// The drain read of a batch of one, which [`Staging::drain`] never calls.
-fn never_drained(_: &mut [u8]) -> io::Result<usize> {
-    Err(io::ErrorKind::WouldBlock.into())
-}
-
-impl Staging {
-    /// Position 0 of a batch from a pending segment, then the drain:
-    /// `Some(result)` for the call, or `None` when nothing is pending (or
-    /// the batch has no capacity, which callers check first).
-    pub(crate) fn pending_batch(
-        &mut self,
-        os: HostOs,
-        bufs: &mut [&mut [u8]],
-        lens: &mut [usize],
-        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
-    ) -> Option<Result<usize>> {
-        let first = self.next_pending(bufs.first_mut()?)?;
-        Some(self.complete_batch(os, first, bufs, lens, read_nowait))
-    }
-
-    /// Position 0 of a batch from one native read's `result` (see
-    /// [`Self::finish_read`]), then the drain: `Some(result)` for the call,
-    /// or `None` to read again.
-    pub(crate) fn read_batch(
-        &mut self,
-        os: HostOs,
-        kind: DeviceKind,
-        result: io::Result<usize>,
-        bufs: &mut [&mut [u8]],
-        lens: &mut [usize],
-        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
-    ) -> Option<Result<usize>> {
-        let first = self.finish_read(os, kind, result, bufs.first_mut()?)?;
-        Some(self.complete_batch(os, first, bufs, lens, read_nowait))
-    }
-
-    /// Records position 0's packet, or returns its error with nothing
-    /// received, then drains.
-    fn complete_batch(
-        &mut self,
-        os: HostOs,
-        first: Result<usize>,
-        bufs: &mut [&mut [u8]],
-        lens: &mut [usize],
-        read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
-    ) -> Result<usize> {
-        let len = first?;
-        let Some(slot) = lens.first_mut() else {
-            return Ok(0);
-        };
-        *slot = len;
-        Ok(self.drain(os, bufs, lens, 1, read_nowait))
-    }
-
-    /// Positions `n..` of a batch, never waiting: serves pending segments
-    /// into `bufs[n..]`, and when none is pending reads the next frame with
-    /// `read_nowait` and splits on, until the capacity is reached or the
-    /// batch ends (see the module docs). Returns the new count.
-    ///
-    /// A segment longer than its buffer stays pending and ends the batch.
-    /// A frame the split does not accept is dropped, and a failed read
-    /// follows `recv_contract::drain_error_step`. A zero-length read is a
-    /// zero-length packet, as `recv` passes it through.
-    pub(crate) fn drain(
-        &mut self,
-        os: HostOs,
-        bufs: &mut [&mut [u8]],
-        lens: &mut [usize],
-        mut n: usize,
-        mut read_nowait: impl FnMut(&mut [u8]) -> io::Result<usize>,
-    ) -> usize {
-        let capacity = recv_contract::batch_capacity(bufs, lens);
-        while n < capacity {
-            let (Some(out), Some(len)) = (bufs.get_mut(n), lens.get_mut(n)) else {
-                break;
-            };
-            if !self.cursor.is_finished() {
-                if self.cursor.next_len().is_some_and(|next| next > out.len()) {
-                    break;
-                }
-                match self.next_pending(out) {
-                    Some(Ok(got)) => {
-                        *len = got;
-                        n += 1;
-                    }
-                    // Unreachable after the size check: a too-small buffer
-                    // is the only error, and it would have dropped the
-                    // segment. End the batch rather than go on.
-                    Some(Err(_)) => break,
-                    // The cursor ended: read the next frame.
-                    None => {}
-                }
-                continue;
-            }
-            match read_nowait(self.read_buf()) {
-                Ok(0) => {
-                    *len = 0;
-                    n += 1;
-                }
-                Ok(got) => self.load(got),
-                Err(err) => match recv_contract::drain_error_step(os, true, &err) {
-                    DrainStep::Repeat => {}
-                    DrainStep::End => break,
-                },
-            }
-        }
-        n
-    }
-
-    /// Takes a frame of `len` bytes that a read put in the staging buffer:
-    /// validates it and points the cursor at its first segment, or, when
-    /// the split does not accept it, drops it (the cursor stays idle).
-    fn load(&mut self, len: usize) {
-        self.frame_len = len.min(self.buf.len());
-        let frame = self.buf.get(..self.frame_len).unwrap_or_default();
-        self.cursor = SplitCursor::new(frame).unwrap_or(SplitCursor::IDLE);
-        #[cfg(test)]
-        if self.cursor.segments() > 1 {
-            self.split_frames += 1;
-        }
-    }
-
-    /// Writes the next pending segment into `out`: `Some(Ok(len))`, or
-    /// `Some(Err(BufferTooSmall))` when `out` is too short (that segment is
-    /// dropped, and the next call serves the one after it). `None` when no
-    /// segment is pending.
-    pub(crate) fn next_pending(&mut self, out: &mut [u8]) -> Option<Result<usize>> {
-        if self.cursor.is_finished() {
-            return None;
-        }
-        let frame = self.buf.get(..self.frame_len).unwrap_or_default();
-        match self.cursor.write_next(frame, out) {
-            Ok(Segment::Packet(len)) => Some(Ok(len)),
-            Ok(Segment::BufferTooSmall { .. }) => Some(Err(Error::BufferTooSmall)),
-            // `Done` cannot happen on an unfinished cursor, and a frame
-            // mismatch cannot happen on the frame the cursor validated;
-            // either way nothing is pending any more.
-            Ok(Segment::Done) | Err(_) => {
-                self.cursor = SplitCursor::IDLE;
-                None
-            }
-        }
-    }
-
-    /// The buffer one native read fills: the whole staging buffer,
-    /// sentinel included. Nothing is pending when this is called, so the
-    /// read may overwrite the previous frame.
-    pub(crate) fn read_buf(&mut self) -> &mut [u8] {
-        &mut self.buf
-    }
-
-    /// Takes one native read's `result`: on success, validates the frame
-    /// and serves its first segment into `out`; on failure, applies the
-    /// offload `recv` rules. `None` means "read again": the frame was
-    /// dropped, or the error is retried.
-    ///
-    /// A zero-length read carries no frame and is passed through as
-    /// `Ok(0)`, as on a plain queue, rather than retried.
-    pub(crate) fn finish_read(
-        &mut self,
-        os: HostOs,
-        kind: DeviceKind,
-        result: io::Result<usize>,
-        out: &mut [u8],
-    ) -> Option<Result<usize>> {
-        match result {
-            Ok(0) => {
-                self.cursor = SplitCursor::IDLE;
-                Some(Ok(0))
-            }
-            Ok(len) => {
-                self.load(len);
-                self.next_pending(out)
-            }
-            Err(err) => match recv_contract::offload_recv_error_step(os, kind, err) {
-                Step::Retry => None,
-                Step::Done(result) => Some(result),
-            },
-        }
-    }
-}
-
-/// The most I/O slices one batch write uses: a run's header, then one
-/// payload per packet of the run.
-const BATCH_IOV: usize = MAX_SEGMENTS + 1;
-
-/// The error a batch write that reported fewer bytes than it was given
-/// becomes, before the `send` error rules map it (see the module docs).
-const SHORT_WRITE: &str = "short write to an offload-framed queue";
-
-/// One native write of a send batch.
-#[derive(Clone, Copy, Debug)]
-enum BatchWrite {
-    /// The next `run.count()` packets as one super-packet.
-    Run(Run),
-    /// The next packet alone, behind [`VNET_HDR_NONE`].
-    Single,
-}
-
-impl BatchWrite {
-    /// How many packets the write carries.
-    fn count(&self) -> usize {
-        match self {
-            Self::Run(run) => run.count(),
-            Self::Single => 1,
-        }
-    }
-
-    /// The length of the frame the write carries for the head of `rest`,
-    /// header included: what a complete write reports.
-    fn frame_len(&self, rest: &[&[u8]]) -> usize {
-        let packet_len = match self {
-            Self::Run(run) => run.total_len(),
-            Self::Single => rest.first().map_or(0, |packet| packet.len()),
-        };
-        VNET_HDR_LEN.saturating_add(packet_len)
-    }
-
-    /// Fills `iov` with what to write for the head of `rest` and returns
-    /// how many slices it used: the run header and each packet's payload,
-    /// or the all-zero header and the packet.
-    fn iovecs<'s>(&'s self, rest: &[&'s [u8]], iov: &mut [IoSlice<'s>; BATCH_IOV]) -> usize {
-        let mut used = 0;
-        let mut push = |slice: &'s [u8]| {
-            if let Some(entry) = iov.get_mut(used) {
-                *entry = IoSlice::new(slice);
-                used += 1;
-            }
-        };
-        match self {
-            Self::Run(run) => {
-                push(run.header());
-                for &packet in rest.iter().take(run.count()) {
-                    push(run.payload(packet));
-                }
-            }
-            Self::Single => {
-                push(&VNET_HDR_NONE);
-                push(rest.first().copied().unwrap_or_default());
-            }
-        }
-        used
-    }
-}
-
-/// The progress of one `send_batch` call on an offload-framed queue.
-struct BatchSend<'a, 'p> {
-    /// The packets this call may send: at most [`MAX_SEGMENTS`].
-    packets: &'a [&'p [u8]],
-    /// Whether the queue has USO, so UDP runs may be coalesced.
-    udp_gso: bool,
-    /// How many packets from the head were written whole.
-    sent: usize,
-    /// How many of the next packets go out one by one, because the kernel
-    /// refused their coalesced write.
-    singles: usize,
-}
-
-impl<'a, 'p> BatchSend<'a, 'p> {
-    fn new(packets: &'a [&'p [u8]], udp_gso: bool) -> Self {
-        Self {
-            packets: packets.get(..MAX_SEGMENTS).unwrap_or(packets),
-            udp_gso,
-            sent: 0,
-            singles: 0,
-        }
-    }
-
-    /// The packets not written yet.
-    fn rest(&self) -> &'a [&'p [u8]] {
-        self.packets.get(self.sent..).unwrap_or_default()
-    }
-
-    /// The next write, or `None` once every packet of the call is written.
-    fn next_write(&self) -> Option<BatchWrite> {
-        let rest = self.rest();
-        if rest.is_empty() {
-            return None;
-        }
-        if self.singles > 0 {
-            return Some(BatchWrite::Single);
-        }
-        Some(plan_run(rest, self.udp_gso).map_or(BatchWrite::Single, BatchWrite::Run))
-    }
-
-    /// Takes the `result` of `write`, which was given `expected` bytes.
-    /// `None` means "go on with the next write" (the same one again after
-    /// a transient error); `Some` is the call's result.
-    fn finish(
-        &mut self,
-        os: HostOs,
-        kind: DeviceKind,
-        write: &BatchWrite,
-        expected: usize,
-        result: io::Result<usize>,
-    ) -> Option<Result<usize>> {
-        let failure = match result {
-            Ok(written) if written == expected => {
-                self.sent = self.sent.saturating_add(write.count());
-                self.singles = self.singles.saturating_sub(write.count());
-                return None;
-            }
-            Ok(_) => io::Error::new(io::ErrorKind::WriteZero, SHORT_WRITE),
-            Err(err) => {
-                if let BatchWrite::Run(run) = write
-                    && recv_contract::is_refused_offload_write(os, &err)
-                {
-                    self.singles = run.count();
-                    return None;
-                }
-                err
-            }
-        };
-        match recv_contract::send_step(os, kind, Err(failure)) {
-            Step::Retry => None,
-            Step::Done(Err(err)) if self.sent == 0 => Some(Err(err)),
-            Step::Done(_) => Some(Ok(self.sent)),
-        }
-    }
-}
-
 /// Blocking `send_batch` on an offload-framed queue (see the module docs):
 /// `writev` is one blocking gather write to the queue.
 #[cfg_attr(
-    all(target_os = "linux", feature = "async", not(test)),
+    all(feature = "async", not(test)),
     expect(dead_code, reason = "async builds block on `send_batch_async`")
 )]
 pub(crate) fn send_batch_blocking(
@@ -705,19 +318,9 @@ pub(crate) fn send_batch_blocking(
     kind: DeviceKind,
     packets: &[&[u8]],
     udp_gso: bool,
-    mut writev: impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
+    writev: impl FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
 ) -> Result<usize> {
-    let mut batch = BatchSend::new(packets, udp_gso);
-    while let Some(write) = batch.next_write() {
-        let mut iov = [IoSlice::new(&[]); BATCH_IOV];
-        let used = write.iovecs(batch.rest(), &mut iov);
-        let expected = write.frame_len(batch.rest());
-        let result = writev(iov.get(..used).unwrap_or_default());
-        if let Some(result) = batch.finish(os, kind, &write, expected, result) {
-            return result;
-        }
-    }
-    Ok(batch.sent)
+    engine::send_batch_blocking(packets, udp_gso, writev, &TunRsRules::new(os, kind))
 }
 
 /// One async gather write to a queue, as [`send_batch_async`] uses it.
@@ -732,13 +335,30 @@ pub(crate) trait AsyncGatherWrite {
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
-#[cfg(all(target_os = "linux", feature = "async"))]
+#[cfg(feature = "async")]
 impl AsyncGatherWrite for tun_rs::AsyncDevice {
     fn write_gather(
         &self,
         bufs: &[IoSlice<'_>],
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
         self.send_vectored(bufs)
+    }
+}
+
+/// Binds this backend's [`AsyncGatherWrite`] to the shared engine's trait
+/// of the same name, whose `Error` is `io::Error` here.
+#[cfg(any(feature = "async", test))]
+struct Gather<'w, W: ?Sized>(&'w W);
+
+#[cfg(any(feature = "async", test))]
+impl<W: AsyncGatherWrite + ?Sized> engine::AsyncGatherWrite for Gather<'_, W> {
+    type Error = io::Error;
+
+    fn write_gather(
+        &self,
+        bufs: &[IoSlice<'_>],
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+        self.0.write_gather(bufs)
     }
 }
 
@@ -759,26 +379,16 @@ pub(crate) async fn send_batch_async<W>(
 where
     W: AsyncGatherWrite + Sync + ?Sized,
 {
-    let mut batch = BatchSend::new(packets, udp_gso);
-    while let Some(write) = batch.next_write() {
-        let mut iov = [IoSlice::new(&[]); BATCH_IOV];
-        let used = write.iovecs(batch.rest(), &mut iov);
-        let expected = write.frame_len(batch.rest());
-        let result = queue
-            .write_gather(iov.get(..used).unwrap_or_default())
-            .await;
-        if let Some(result) = batch.finish(os, kind, &write, expected, result) {
-            return result;
-        }
-    }
-    Ok(batch.sent)
+    engine::send_batch_async(packets, udp_gso, &Gather(queue), &TunRsRules::new(os, kind)).await
 }
 
 /// Hand-built offload frames shared by the receive tests here and in the
 /// async receive paths.
 #[cfg(test)]
 pub(crate) mod test_frames {
-    use crate::offload::{F_NEEDS_CSUM, GSO_UDP_L4, VNET_HDR_LEN, VirtioNetHdr};
+    use tunnel_lattice_platform::backend::offload::{
+        F_NEEDS_CSUM, GSO_UDP_L4, VNET_HDR_LEN, VirtioNetHdr,
+    };
 
     /// The payload of segment `k` of a [`udp4_frame`], `len` bytes long.
     pub(crate) fn segment_payload(k: usize, len: usize) -> Vec<u8> {
@@ -828,7 +438,7 @@ pub(crate) mod test_frames {
     /// Fills in the IPv4 total length and header checksum and the L4
     /// checksum of an IPv4 packet with a 20-byte header.
     fn finish_ipv4(mut packet: Vec<u8>, csum_offset: usize) -> Vec<u8> {
-        use crate::offload::{checksum, sum_words};
+        use tunnel_lattice_platform::backend::offload::{checksum, sum_words};
 
         let total = u16::try_from(packet.len()).expect("a short packet");
         packet[2..4].copy_from_slice(&total.to_be_bytes());
@@ -897,7 +507,7 @@ pub(crate) mod test_frames {
     /// Splits one written frame back into its IP packets, as the kernel
     /// would on the receiving side.
     pub(crate) fn split(frame: &[u8]) -> Vec<Vec<u8>> {
-        use crate::offload::{Segment, SplitCursor};
+        use tunnel_lattice_platform::backend::offload::{Segment, SplitCursor};
 
         let mut cursor = SplitCursor::new(frame).expect("a valid frame");
         let mut packets = Vec::new();
@@ -914,44 +524,12 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::test_frames::{assert_segment, udp4_frame};
+    use tunnel_lattice_core::Error;
+    use tunnel_lattice_platform::backend::offload::{MAX_SEGMENTS, STAGING_LEN, VNET_HDR_NONE};
+
     use super::*;
-    use crate::offload::MAX_SEGMENTS;
 
     const TUN: DeviceKind = DeviceKind::Tun;
-
-    #[test]
-    fn framing_follows_the_observed_flag_and_header_size() {
-        let framing = |offload, clear_mask| Framing {
-            offload,
-            clear_mask,
-        };
-        for mask in [false, true] {
-            assert_eq!(
-                decide_framing(true, Some(10), mask).ok(),
-                Some(framing(true, false)),
-                "{mask}"
-            );
-        }
-        for size in [None, Some(0), Some(-1), Some(12), Some(20)] {
-            for mask in [false, true] {
-                assert!(
-                    matches!(decide_framing(true, size, mask), Err(Error::Unsupported)),
-                    "{size:?} {mask}"
-                );
-            }
-        }
-        for size in [None, Some(10)] {
-            assert_eq!(
-                decide_framing(false, size, false).ok(),
-                Some(framing(false, false))
-            );
-            assert_eq!(
-                decide_framing(false, size, true).ok(),
-                Some(framing(false, true)),
-                "a mask on a device without framing is repaired"
-            );
-        }
-    }
 
     /// Scripted native reads: each copies a frame (or fails).
     struct Reads(VecDeque<io::Result<Vec<u8>>>);
@@ -984,45 +562,6 @@ mod tests {
             assert_segment(&out[..len], k, if k == 4 { 300 } else { 1000 });
         }
         assert!(reads.0.is_empty(), "one read for the whole super-packet");
-    }
-
-    /// The test-only split counter counts frames of more than one segment
-    /// once each, when they are read: not a plain frame, not a GSO frame
-    /// that carries a single segment, and not a frame dropped as malformed.
-    #[test]
-    fn the_split_counter_counts_multi_segment_frames_only() {
-        let rx = OffloadRx::new();
-        let plain = [
-            crate::offload::VNET_HDR_NONE.as_slice(),
-            &[
-                0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
-            ],
-        ]
-        .concat();
-        let mut malformed = udp4_frame(100, 4, 100);
-        malformed[1] = 0x33;
-        let mut reads = Reads::new([
-            Ok(plain),
-            Ok(udp4_frame(100, 1, 60)),
-            Ok(malformed),
-            Ok(udp4_frame(100, 3, 100)),
-            Ok(udp4_frame(200, 2, 10)),
-        ]);
-        let mut out = vec![0u8; 400];
-        assert_eq!(rx.split_frames(), 0);
-        recv(&rx, &mut reads, &mut out).expect("the plain packet");
-        assert_eq!(rx.split_frames(), 0, "a plain frame is not split");
-        recv(&rx, &mut reads, &mut out).expect("the single segment");
-        assert_eq!(rx.split_frames(), 0, "one segment is not a split");
-        // The malformed frame is dropped; the next frame is split.
-        recv(&rx, &mut reads, &mut out).expect("segment 0");
-        assert_eq!(rx.split_frames(), 1, "counted when read");
-        for _ in 1..3 {
-            recv(&rx, &mut reads, &mut out).expect("a pending segment");
-        }
-        assert_eq!(rx.split_frames(), 1, "pending segments read nothing");
-        recv(&rx, &mut reads, &mut out).expect("segment 0");
-        assert_eq!(rx.split_frames(), 2);
     }
 
     /// A segment that does not fit is dropped alone; the next `recv` with
@@ -1074,7 +613,7 @@ mod tests {
         let packet = [
             0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
         ];
-        let frame = [crate::offload::VNET_HDR_NONE.as_slice(), &packet].concat();
+        let frame = [VNET_HDR_NONE.as_slice(), &packet].concat();
         let mut reads = Reads::new([Ok(frame)]);
         let mut out = vec![0u8; 64];
         let len = recv(&rx, &mut reads, &mut out).unwrap();
@@ -1116,26 +655,6 @@ mod tests {
             assert_segment(&out[..len], k, if k + 1 == count { 40 } else { 100 });
         }
         assert!(reads.0.is_empty());
-    }
-
-    /// A poisoned staging mutex is recovered with nothing pending.
-    #[test]
-    fn a_poisoned_staging_is_reset() {
-        let rx = std::sync::Arc::new(OffloadRx::new());
-        let mut reads = Reads::new([Ok(udp4_frame(100, 3, 100))]);
-        let mut out = vec![0u8; 200];
-        recv(&rx, &mut reads, &mut out).unwrap();
-        let poisoner = std::sync::Arc::clone(&rx);
-        let _ = std::thread::spawn(move || {
-            let _staging = poisoner.lock();
-            panic!("poison the staging");
-        })
-        .join();
-        assert!(rx.0.is_poisoned());
-        let mut reads = Reads::new([Ok(udp4_frame(100, 2, 100))]);
-        let len = recv(&rx, &mut reads, &mut out).unwrap();
-        assert_segment(&out[..len], 0, 100);
-        assert!(!rx.0.is_poisoned());
     }
 
     /// `count` receive buffers of `len` bytes each.
@@ -1236,7 +755,7 @@ mod tests {
     #[test]
     fn the_drain_spans_frames_until_the_queue_is_empty() {
         let plain = [
-            crate::offload::VNET_HDR_NONE.as_slice(),
+            VNET_HDR_NONE.as_slice(),
             &[
                 0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
             ],
@@ -1380,7 +899,8 @@ mod batch_tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
 
-    use tunnel_lattice_core::PlatformErrorCode;
+    use tunnel_lattice_core::{Error, PlatformErrorCode};
+    use tunnel_lattice_platform::backend::offload::{MAX_SEGMENTS, VNET_HDR_LEN, VNET_HDR_NONE};
 
     use super::test_frames::{
         TCP_ACK, segment_payload, split, tcp4_flow, tcp4_packet, udp4_packet,

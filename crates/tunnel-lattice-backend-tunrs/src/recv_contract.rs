@@ -115,7 +115,9 @@ use tunnel_lattice_platform::backend as shared;
 use tunnel_lattice_platform::backend::errno::linux::{Class, IoOp, packet_rule};
 use tunnel_lattice_platform::backend::errno::{darwin, windows};
 
-pub(crate) use shared::{DeferredTooSmall, DrainStep, Step, batch_capacity};
+#[cfg(target_os = "linux")]
+pub(crate) use shared::batch_capacity;
+pub(crate) use shared::{DeferredTooSmall, DrainStep, Step};
 
 use crate::io_error;
 use crate::open_contract::HostOs;
@@ -222,6 +224,7 @@ pub(crate) fn recv_step(
 /// other error goes through the ordinary `recv` rules ([`recv_step`]); a
 /// read into the staging buffer can never be too small for a packet, so
 /// [`Error::BufferTooSmall`] does not come from here.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn offload_recv_error_step(os: HostOs, kind: DeviceKind, err: io::Error) -> Step {
     if os == HostOs::Linux
         && matches!(
@@ -247,6 +250,7 @@ pub(crate) fn offload_recv_error_step(os: HostOs, kind: DeviceKind, err: io::Err
 /// and its packets can be written again one by one. Only a
 /// run's write is matched: for a single packet, `EINVAL` keeps its generic
 /// meaning through [`send_step`].
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn is_refused_offload_write(os: HostOs, err: &io::Error) -> bool {
     os == HostOs::Linux
         && matches!(

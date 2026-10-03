@@ -127,6 +127,22 @@ packet-path rules every backend shares, as safe Rust with no I/O, no
 tunnel-lattice-platform = { version = "0.6", features = ["backend"] }
 ```
 
+The non-default `offload` feature (it implies `backend`) adds
+`backend::offload`, the Linux TUN segmentation-offload support: the
+virtio-net header codec (splitting a received super-packet into packets,
+coalescing a run of same-flow packets into one, completing checksums), the
+framing decision, the receive staging (`OffloadRx`) and the batch-send
+engine (`send_batch_blocking`, plus `send_batch_async` and
+`AsyncGatherWrite` with the `async` feature). It is safe Rust that compiles
+and is tested on every host; the backend supplies the native reads and
+writes and classifies their errors through the `OffloadRules` trait, and
+keeps its own `unsafe` calls. Same support-API status as `backend`.
+
+```toml
+[dependencies]
+tunnel-lattice-platform = { version = "0.6", features = ["offload"] }
+```
+
 ## 📐 Backend Contract
 
 A backend's `PacketIo::recv` and `AsyncPacketIo::recv` must return `Ok(n)`

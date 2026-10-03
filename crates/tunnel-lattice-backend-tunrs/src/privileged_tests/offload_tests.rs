@@ -647,9 +647,12 @@ fn a_batch_over_the_limit_is_sent_in_short_batches() {
     let device = open(DeviceConfig::new(DeviceKind::Tun).with_offload(true));
     let subnet = [10, 211, subnet_octet()];
     let host = host_udp_socket(&device, subnet);
-    let count = crate::offload::MAX_SEGMENTS + 12;
+    let count = tunnel_lattice_platform::backend::offload::MAX_SEGMENTS + 12;
     assert_udp_batch_arrives(&device, &host, subnet, (count, 64, 1), |counts| {
-        assert_eq!(counts, [crate::offload::MAX_SEGMENTS, 12]);
+        assert_eq!(
+            counts,
+            [tunnel_lattice_platform::backend::offload::MAX_SEGMENTS, 12]
+        );
     });
 }
 

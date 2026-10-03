@@ -13,8 +13,9 @@ description = "Generic provider traits and Capability contract between the model
 readme = "README.md"
 
 [package.metadata.docs.rs]
-# Show the `backend` support module on docs.rs (labelled by its feature).
-features = ["backend"]
+# Show the `backend` support module, and its `offload` part with the async
+# send, on docs.rs (labelled by their features).
+features = ["backend", "offload", "async"]
 
 [features]
 # No optional dependency needed: AsyncPacketIo uses `impl Future` directly,
@@ -26,6 +27,11 @@ async = []
 # Tunnel Lattice backend crates share. Support API for backend authors, not
 # covered by any stability promise; the facade never enables it.
 backend = []
+# Adds `backend::offload`: the Linux segmentation-offload codec (virtio-net
+# header, receive split, send coalescing) and the queue-level engine around
+# it. Safe, portable code that compiles on every host; the backend supplies
+# the reads, writes and error tables. Same support-API status as `backend`.
+offload = ["backend"]
 
 [dependencies]
 tunnel-lattice-core = { workspace = true }

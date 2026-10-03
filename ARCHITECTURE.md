@@ -46,6 +46,14 @@ that produced it to an outcome. It is safe Rust with no `libc` dependency
 carries the same no-stability-promise status, and is likewise never enabled or
 re-exported by the facade.
 
+The Linux segmentation-offload codec and queue-level engine (see
+"Segmentation offload" below) live in the same crate behind a further
+non-default `offload` feature (`tunnel_lattice_platform::backend::offload`,
+which implies `backend`): safe Rust that compiles and is tested on every
+host, generic over the read error type, with the native reads, writes and
+error classification passed in by the backend, which keeps the `unsafe`
+calls. `tunnel-lattice-backend-tunrs` enables it for Linux targets only.
+
 ## Why this differs from net-lattice's shape
 
 `net-lattice` inspects and mutates OS objects (routes, interfaces, DNS
@@ -389,10 +397,12 @@ the host-level `Tunnel::capabilities()`. Offload is fixed at open;
 The kernel side is a 10-byte virtio-net header in front of every packet
 on the queue (`IFF_VNET_HDR`) plus a device-wide offload mask
 (`TUNSETOFFLOAD`) that lets it deliver one TCP or UDP super-packet of up
-to 64 KiB in place of many packets, and accept one on write. The backend
-parses and builds that header itself, in a private module that does no
-I/O, uses checked arithmetic only, and compiles and is unit-tested on
-every OS; it uses only `tun-rs`'s public builder option and vectored
+to 64 KiB in place of many packets, and accept one on write. Tunnel Lattice
+parses and builds that header itself, in a module that does no I/O, uses
+checked arithmetic only, and compiles and is unit-tested on every OS (it
+is `tunnel-lattice-platform`'s `backend::offload`, behind the `offload`
+feature; the backend adds only the native reads and writes); it uses only
+`tun-rs`'s public builder option and vectored
 reads and writes, none of its hidden offload helpers. Packet framing as a
 caller sees it does not change:
 
