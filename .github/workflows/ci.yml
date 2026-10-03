@@ -117,6 +117,9 @@ jobs:
     name: miri (tunnel-lattice-async pool, platform offload, non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
+    # The offload codec tests build 64 KiB frames, which Miri interprets
+    # slowly; cap the job so a slow run cannot hold the workflow open.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
