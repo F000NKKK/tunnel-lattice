@@ -39,9 +39,9 @@ mod tokio_linux;
 mod windows_tap_probe;
 
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
-use tunnel_lattice_model::backend::{
-    ApplySteps, ApplyTarget, apply_patch, offload_requested, precheck_open,
-};
+#[cfg(target_os = "linux")]
+use tunnel_lattice_model::backend::offload_requested;
+use tunnel_lattice_model::backend::{ApplySteps, ApplyTarget, apply_patch, precheck_open};
 use tunnel_lattice_model::{
     Device, DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind, MacAddress,
 };
