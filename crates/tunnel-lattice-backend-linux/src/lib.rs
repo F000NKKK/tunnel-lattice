@@ -23,6 +23,8 @@
 mod apply;
 mod control;
 mod errno;
+#[cfg(test)]
+mod golden_tests;
 mod io;
 mod tun;
 

@@ -27,6 +27,8 @@ mod macos_tap;
 mod offload;
 // The queue-level half of offload: compiled and unit-tested on every OS,
 // called only by the Linux TUN paths.
+#[cfg(test)]
+mod golden_tests;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod offload_queue;
 mod open_contract;
