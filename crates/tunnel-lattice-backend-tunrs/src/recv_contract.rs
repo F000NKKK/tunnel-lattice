@@ -108,10 +108,14 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tunnel_lattice_core::{Error, Result};
 use tunnel_lattice_model::{AdminState, DeviceKind};
+use tunnel_lattice_platform::backend as shared;
+use tunnel_lattice_platform::backend::errno::linux::{Class, IoOp, packet_rule};
+use tunnel_lattice_platform::backend::errno::{darwin, windows};
+
+pub(crate) use shared::{DeferredTooSmall, DrainStep, Step, batch_capacity};
 
 use crate::io_error;
 use crate::open_contract::HostOs;
@@ -129,55 +133,25 @@ pub(crate) const MACOS_TAP_EMPTY_READ_MESSAGE: &str = "recv buffer is empty";
 /// Recoverable with `apply(Up)`: mapped to [`Error::InvalidState`].
 pub(crate) const WINDOWS_TUN_DISABLED_MESSAGE: &str = "The interface has been disabled";
 
-/// `EINTR`, identical on Linux and macOS (asserted against `libc` by the
-/// unit tests on those targets). Written out so the rules compile, and are
-/// tested, on every host.
-const EINTR: i32 = 4;
-
-/// `ENXIO`, identical on Linux and macOS (asserted against `libc` by the
-/// unit tests on those targets).
-const ENXIO: i32 = 6;
-
-/// Linux `EBADFD` (asserted against `libc` by the unit tests on Linux).
-/// macOS has no `EBADFD`; its code 77 is `ENOLCK`, so this rule is
-/// Linux-only.
-const EBADFD: i32 = 77;
-
-/// Linux `EFAULT` (asserted against `libc` by the unit tests on Linux).
-/// Mapped on Linux `recv` only; see [`recv_error`].
-const EFAULT: i32 = 14;
-
-/// Linux `EIO` (asserted against `libc` by the unit tests on Linux).
-/// Mapped on Linux `send` only; see [`send_error`].
-const EIO: i32 = 5;
-
-/// Linux `EINVAL` (asserted against `libc` by the unit tests on Linux).
-/// Retried on a read from an offload-framed queue only; see
-/// [`offload_recv_error_step`].
-const EINVAL: i32 = 22;
-
-/// Windows `ERROR_OPERATION_ABORTED` (asserted against `windows-sys` by the
-/// unit tests on Windows). Mapped for a TAP handle only; see
-/// [`lifecycle_error`].
-const ERROR_OPERATION_ABORTED: i32 = 995;
-
-/// What a `recv`/`send` loop does with one native attempt's result.
-#[derive(Debug)]
-pub(crate) enum Step {
-    /// A transient condition: make the native call again.
-    Retry,
-    /// The call is finished with this result.
-    Done(Result<usize>),
+/// The shared Linux raw-code rule for a packet-path failure (see
+/// [`packet_rule`]), or `None` for a code the shared table does not handle
+/// (which this backend maps by its own rules) and for an error with no raw
+/// code. The rules compare the raw code only, never `kind()`.
+fn linux_rule(err: &io::Error, op: IoOp) -> Option<Class> {
+    err.raw_os_error().and_then(|code| packet_rule(code, op))
 }
 
 /// Returns `true` for a transient native error that `recv`/`send` retry
 /// instead of reporting (see the module table).
 pub(crate) fn is_transient(os: HostOs, err: &io::Error) -> bool {
-    // Matched on the raw code alone: on Linux and macOS code 4 is always
-    // `EINTR` (which std decodes as `Interrupted`), whereas `kind()` is
-    // decoded with the *running* host's table, so a kind check would make
-    // the Linux/macOS rule fail when the tests run on Windows.
-    let eintr = matches!(os, HostOs::Linux | HostOs::Macos) && err.raw_os_error() == Some(EINTR);
+    // Matched on the raw code alone: `kind()` is decoded with the *running*
+    // host's table, so a kind check would make the Linux/macOS rule fail
+    // when the tests run on Windows.
+    let eintr = match os {
+        HostOs::Linux => matches!(linux_rule(err, IoOp::Recv), Some(Class::Retry)),
+        HostOs::Macos => err.raw_os_error() == Some(darwin::EINTR),
+        HostOs::Windows | HostOs::Other => false,
+    };
     let feth_empty_read = os == HostOs::Macos
         && err.kind() == io::ErrorKind::UnexpectedEof
         && err.raw_os_error().is_none()
@@ -205,7 +179,7 @@ pub(crate) fn tap_abort_retries(
     retried: bool,
     oper: impl FnOnce() -> io::Result<AdminState>,
 ) -> bool {
-    !retried && matches!(oper(), Ok(AdminState::Up))
+    shared::tap_abort_retries(retried, || matches!(oper(), Ok(AdminState::Up)))
 }
 
 /// Maps one native `recv` attempt on a `kind` handle that read into a
@@ -220,21 +194,20 @@ pub(crate) fn recv_step(
     retried: &mut bool,
     oper: impl FnOnce() -> io::Result<AdminState>,
 ) -> Step {
-    if let Err(err) = &result
-        && os == HostOs::Windows
-        && kind == DeviceKind::Tap
-        && err.raw_os_error() == Some(ERROR_OPERATION_ABORTED)
-        && tap_abort_retries(*retried, oper)
-    {
-        *retried = true;
-        return Step::Retry;
-    }
-    match result {
-        Ok(n) if n > buf_len => Step::Done(Err(Error::BufferTooSmall)),
-        Ok(n) => Step::Done(Ok(n)),
-        Err(err) if is_transient(os, &err) => Step::Retry,
-        Err(err) => Step::Done(Err(recv_error(os, kind, err))),
-    }
+    shared::recv_step(buf_len, result, |err| {
+        if os == HostOs::Windows
+            && kind == DeviceKind::Tap
+            && err.raw_os_error() == Some(windows::ERROR_OPERATION_ABORTED)
+            && tap_abort_retries(*retried, oper)
+        {
+            *retried = true;
+            Step::Retry
+        } else if is_transient(os, &err) {
+            Step::Retry
+        } else {
+            Step::Done(Err(recv_error(os, kind, err)))
+        }
+    })
 }
 
 /// Maps one failed native read on an offload-framed Linux TUN queue (a
@@ -250,7 +223,12 @@ pub(crate) fn recv_step(
 /// read into the staging buffer can never be too small for a packet, so
 /// [`Error::BufferTooSmall`] does not come from here.
 pub(crate) fn offload_recv_error_step(os: HostOs, kind: DeviceKind, err: io::Error) -> Step {
-    if os == HostOs::Linux && err.raw_os_error() == Some(EINVAL) {
+    if os == HostOs::Linux
+        && matches!(
+            linux_rule(&err, IoOp::OffloadRecv),
+            Some(Class::DropAndReread)
+        )
+    {
         return Step::Retry;
     }
     recv_step(os, kind, usize::MAX, Err(err), &mut false, || {
@@ -270,16 +248,22 @@ pub(crate) fn offload_recv_error_step(os: HostOs, kind: DeviceKind, err: io::Err
 /// run's write is matched: for a single packet, `EINVAL` keeps its generic
 /// meaning through [`send_step`].
 pub(crate) fn is_refused_offload_write(os: HostOs, err: &io::Error) -> bool {
-    os == HostOs::Linux && err.raw_os_error() == Some(EINVAL)
+    os == HostOs::Linux
+        && matches!(
+            linux_rule(err, IoOp::OffloadSend),
+            Some(Class::ResendPerPacket)
+        )
 }
 
 /// Maps one native `send` attempt on a `kind` handle.
 pub(crate) fn send_step(os: HostOs, kind: DeviceKind, result: io::Result<usize>) -> Step {
-    match result {
-        Ok(n) => Step::Done(Ok(n)),
-        Err(err) if is_transient(os, &err) => Step::Retry,
-        Err(err) => Step::Done(Err(send_error(os, kind, err))),
-    }
+    shared::send_step(result, |err| {
+        if is_transient(os, &err) {
+            Step::Retry
+        } else {
+            Step::Done(Err(send_error(os, kind, err)))
+        }
+    })
 }
 
 /// Maps a non-transient `recv` error: the too-small-buffer signals first,
@@ -308,8 +292,12 @@ fn recv_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
     // decodes the code with the running host's table. Not applied to
     // `send` (an `EFAULT` there is only a copy fault; teardown is
     // `EBADFD`) nor to macOS (a BPF `EFAULT` is a `copyout` fault).
-    if os == HostOs::Linux && err.raw_os_error() == Some(EFAULT) {
-        return Error::Disconnected;
+    // The shared Linux packet rule answers `EFAULT`, and also `ENXIO` and
+    // `EBADFD` (`Disconnected` on both directions).
+    if os == HostOs::Linux
+        && let Some(Class::Fail(error)) = linux_rule(&err, IoOp::Recv)
+    {
+        return error;
     }
     lifecycle_error(os, kind, &err).unwrap_or_else(|| io_error(err))
 }
@@ -337,8 +325,12 @@ fn send_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
     // ever enabled, or a kernel adds another `EIO` to that path. Matched on the raw code only; never on
     // `recv` (the read path has no `EIO`: a down device makes `recv` wait)
     // nor on macOS (where `EIO` has unrelated meanings).
-    if os == HostOs::Linux && err.raw_os_error() == Some(EIO) {
-        return Error::InvalidState;
+    // The shared Linux packet rule answers `EIO`, and also `ENXIO` and
+    // `EBADFD` (`Disconnected` on both directions).
+    if os == HostOs::Linux
+        && let Some(Class::Fail(error)) = linux_rule(&err, IoOp::Send)
+    {
+        return error;
     }
     lifecycle_error(os, kind, &err).unwrap_or_else(|| io_error(err))
 }
@@ -347,7 +339,9 @@ fn send_error(os: HostOs, kind: DeviceKind, err: io::Error) -> Error {
 /// handle (see the module table), or `None` for an error [`io_error`]
 /// maps.
 fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Error> {
-    let unix = matches!(os, HostOs::Linux | HostOs::Macos);
+    // Linux `ENXIO` and `EBADFD` are answered by the shared packet rule in
+    // `recv_error`/`send_error` before this; macOS `ENXIO` is the feth TAP's
+    // destroyed BPF descriptor.
     // tap-windows fails every read and write *issued* while the adapter's
     // media is disconnected with `ERROR_OPERATION_ABORTED`; a read already
     // pending when the media is disconnected is not completed and keeps
@@ -371,9 +365,8 @@ fn lifecycle_error(os: HostOs, kind: DeviceKind, err: &io::Error) -> Option<Erro
     // the driver refused.
     let tap_media_down = os == HostOs::Windows && kind == DeviceKind::Tap;
     match err.raw_os_error() {
-        Some(ENXIO) if unix => Some(Error::Disconnected),
-        Some(EBADFD) if os == HostOs::Linux => Some(Error::Disconnected),
-        Some(ERROR_OPERATION_ABORTED) if tap_media_down => Some(Error::InvalidState),
+        Some(darwin::ENXIO) if os == HostOs::Macos => Some(Error::Disconnected),
+        Some(windows::ERROR_OPERATION_ABORTED) if tap_media_down => Some(Error::InvalidState),
         Some(_) => None,
         None => (os == HostOs::Windows
             && err.kind() == io::ErrorKind::Other
@@ -460,16 +453,6 @@ where
     }
 }
 
-/// What a `recv_batch` drain does after one failed non-waiting read at a
-/// position `k >= 1` (see the module's "Draining a batch").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DrainStep {
-    /// Read again: the failure consumed nothing the caller should see.
-    Repeat,
-    /// End the batch with the packets received so far.
-    End,
-}
-
 /// Classifies a failed drain read on a queue that is offload-framed or
 /// not (`offload`). Only a raw `EINTR` (Linux, macOS), and a raw `EINVAL`
 /// on an offload-framed Linux queue (a packet the kernel could not frame
@@ -481,9 +464,17 @@ pub(crate) enum DrainStep {
 /// returned first, and the next call's own native read reports the device
 /// state behind it.
 pub(crate) fn drain_error_step(os: HostOs, offload: bool, err: &io::Error) -> DrainStep {
-    let code = err.raw_os_error();
-    let eintr = matches!(os, HostOs::Linux | HostOs::Macos) && code == Some(EINTR);
-    let dropped_frame = offload && os == HostOs::Linux && code == Some(EINVAL);
+    let eintr = match os {
+        HostOs::Linux => matches!(linux_rule(err, IoOp::Recv), Some(Class::Retry)),
+        HostOs::Macos => err.raw_os_error() == Some(darwin::EINTR),
+        HostOs::Windows | HostOs::Other => false,
+    };
+    let dropped_frame = offload
+        && os == HostOs::Linux
+        && matches!(
+            linux_rule(err, IoOp::OffloadRecv),
+            Some(Class::DropAndReread)
+        );
     if eintr || dropped_frame {
         DrainStep::Repeat
     } else {
@@ -491,94 +482,24 @@ pub(crate) fn drain_error_step(os: HostOs, offload: bool, err: &io::Error) -> Dr
     }
 }
 
-/// How many packets one `recv_batch` call may receive: the shorter of its
-/// two slices.
-pub(crate) fn batch_capacity(bufs: &[&mut [u8]], lens: &[usize]) -> usize {
-    bufs.len().min(lens.len())
-}
-
-/// The deferred [`Error::BufferTooSmall`] of one queue: set by a
-/// `recv_batch` drain that consumed a plain packet too long for its
-/// buffer after it had already received others, and returned once, first,
-/// by the next `recv` or `recv_batch` on the same queue, before any native
-/// call.
-///
-/// The flag is per queue (one per device handle, never shared with an
-/// `additional_queue`), so every handle clone that reads this queue sees
-/// it. The fast path is one relaxed load; the swap happens only when it is
-/// set. It is set immediately before the batch returns, with no `.await`
-/// after it, so a dropped future can neither lose nor duplicate it.
-#[derive(Debug, Default)]
-pub(crate) struct DeferredTooSmall(AtomicBool);
-
+/// Positions `n..` of a `recv_batch` on a plainly framed queue (see
+/// [`shared::drain_plain`]), with failures classified by
+/// [`drain_error_step`] for a plain queue.
 #[cfg_attr(
-    all(not(target_os = "linux"), not(test)),
-    expect(dead_code, reason = "only the Linux recv_batch override drains")
+    all(not(all(target_os = "linux", feature = "async")), not(test)),
+    expect(dead_code, reason = "only the async Linux builds drain through it")
 )]
-impl DeferredTooSmall {
-    /// No error pending.
-    pub(crate) const fn new() -> Self {
-        Self(AtomicBool::new(false))
-    }
-
-    /// Records one pending [`Error::BufferTooSmall`]. Several drains that
-    /// each set it before any receive collapse into one, which cannot
-    /// happen in practice: a drain that sets it returns, and the next call
-    /// clears it before reading.
-    pub(crate) fn set(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    /// Returns the pending [`Error::BufferTooSmall`] once and clears it, or
-    /// `Ok(())` when none is pending.
-    pub(crate) fn take(&self) -> Result<()> {
-        if self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::Relaxed) {
-            Err(Error::BufferTooSmall)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Positions `n..` of a `recv_batch` on a plainly framed queue, after the
-/// first `n` (normally one) were received and recorded in `lens`: reads
-/// with `read`, which must never wait, into `bufs[k]` until the capacity
-/// is reached or a read ends the batch. Returns the new count.
-///
-/// `read` is the sentinel read of the module docs (`[bufs[k], 1-byte
-/// sentinel]`), so a result past `bufs[k].len()` is a packet that did not
-/// fit: it is already consumed, so the batch ends there and `deferred` is
-/// set (see [`DeferredTooSmall`]). Failures follow [`drain_error_step`].
-/// A zero-length read is a zero-length packet, as `recv` passes it through.
 pub(crate) fn drain_plain(
     os: HostOs,
     bufs: &mut [&mut [u8]],
     lens: &mut [usize],
-    mut n: usize,
+    n: usize,
     deferred: &DeferredTooSmall,
-    mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    read: impl FnMut(&mut [u8]) -> io::Result<usize>,
 ) -> usize {
-    let capacity = batch_capacity(bufs, lens);
-    while n < capacity {
-        let (Some(buf), Some(len)) = (bufs.get_mut(n), lens.get_mut(n)) else {
-            break;
-        };
-        match read(buf) {
-            Ok(got) if got > buf.len() => {
-                deferred.set();
-                break;
-            }
-            Ok(got) => {
-                *len = got;
-                n += 1;
-            }
-            Err(err) => match drain_error_step(os, false, &err) {
-                DrainStep::Repeat => {}
-                DrainStep::End => break,
-            },
-        }
-    }
-    n
+    shared::drain_plain(bufs, lens, n, deferred, read, |err| {
+        drain_error_step(os, false, err)
+    })
 }
 
 /// Blocking `recv_batch` on a plainly framed queue: position 0 is exactly
@@ -606,11 +527,14 @@ pub(crate) fn recv_batch_blocking<O>(
 where
     O: Fn() -> io::Result<AdminState>,
 {
-    let (Some(buf), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
-        return Ok(0);
-    };
-    *len = recv_blocking(os, kind, buf, oper, read)?;
-    Ok(drain_plain(os, bufs, lens, 1, deferred, read_nowait))
+    shared::recv_batch_blocking(
+        bufs,
+        lens,
+        deferred,
+        |buf| recv_blocking(os, kind, buf, oper, read),
+        read_nowait,
+        |err| drain_error_step(os, false, err),
+    )
 }
 
 /// One read on `fd` that never waits, whatever the descriptor's
@@ -698,6 +622,10 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use tunnel_lattice_core::PlatformErrorCode;
+    use tunnel_lattice_platform::backend::errno::linux::{
+        EAGAIN, EBADFD, EFAULT, EINTR, EINVAL, EIO, ENXIO, EOPNOTSUPP,
+    };
+    use tunnel_lattice_platform::backend::errno::windows::ERROR_OPERATION_ABORTED;
 
     use super::*;
 
@@ -812,35 +740,13 @@ mod tests {
         assert_eq!(close().to_string(), "close");
     }
 
+    /// The Linux codes are pinned against `libc` by the platform crate's own
+    /// tests; the Darwin ones are pinned here, where `libc` is the macOS one.
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn eintr_and_enxio_match_libc() {
+    #[cfg(target_os = "macos")]
+    fn darwin_codes_match_libc() {
         assert_eq!(EINTR, libc::EINTR);
         assert_eq!(ENXIO, libc::ENXIO);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn ebadfd_matches_libc_on_linux() {
-        assert_eq!(EBADFD, libc::EBADFD);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn efault_matches_libc_on_linux() {
-        assert_eq!(EFAULT, libc::EFAULT);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn eio_matches_libc_on_linux() {
-        assert_eq!(EIO, libc::EIO);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn einval_matches_libc_on_linux() {
-        assert_eq!(EINVAL, libc::EINVAL);
     }
 
     fn offload_step(os: HostOs, err: io::Error) -> Option<Result<usize>> {
@@ -1689,18 +1595,6 @@ mod tests {
         assert_eq!(script.calls(), 2);
     }
 
-    /// Linux `EAGAIN` and `EOPNOTSUPP`, the two codes that end a drain
-    /// because the queue has nothing to give without waiting.
-    const EAGAIN: i32 = 11;
-    const EOPNOTSUPP: i32 = 95;
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn eagain_and_eopnotsupp_match_libc_on_linux() {
-        assert_eq!(EAGAIN, libc::EAGAIN);
-        assert_eq!(EOPNOTSUPP, libc::EOPNOTSUPP);
-    }
-
     #[test]
     fn drain_repeats_only_eintr_and_an_offload_einval_on_linux() {
         let raw = io::Error::from_raw_os_error;
@@ -1744,25 +1638,6 @@ mod tests {
             drain_error_step(HostOs::Macos, true, &raw(EINVAL)),
             DrainStep::End
         );
-    }
-
-    #[test]
-    fn batch_capacity_is_the_shorter_slice() {
-        let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
-        let bufs: [&mut [u8]; 2] = [&mut a, &mut b];
-        assert_eq!(batch_capacity(&bufs, &[0; 1]), 1);
-        assert_eq!(batch_capacity(&bufs, &[0; 3]), 2);
-        assert_eq!(batch_capacity(&[], &[0; 3]), 0);
-    }
-
-    #[test]
-    fn deferred_too_small_is_returned_once() {
-        let deferred = DeferredTooSmall::new();
-        assert!(deferred.take().is_ok());
-        deferred.set();
-        deferred.set();
-        assert!(matches!(deferred.take(), Err(Error::BufferTooSmall)));
-        assert!(deferred.take().is_ok());
     }
 
     /// Four 8-byte buffers for the drain tests.

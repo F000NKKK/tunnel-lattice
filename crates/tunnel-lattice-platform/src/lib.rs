@@ -17,15 +17,19 @@
 //! [`PersistentDevice`] for marking a device to survive process exit and
 //! clearing that again (`Capability::PERSISTENT_DEVICES`), and [`MultiQueueProvider`] for
 //! duplicating a hardware-scheduled queue (`Capability::MULTI_QUEUE`). The
-//! `async` feature additionally provides [`AsyncPacketIo`] for a native
+//! `async` feature additionally provides `AsyncPacketIo` for a native
 //! async transfer path — see that trait's docs for when a backend should
 //! implement it instead of relying on `tunnel-lattice-async`'s thread-based
 //! adapter over [`PacketIo`].
 
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "async")]
 mod async_packet_io;
+#[cfg(feature = "backend")]
+#[cfg_attr(docsrs, doc(cfg(feature = "backend")))]
+pub mod backend;
 mod capability;
 mod device_mutator;
 mod device_observer;

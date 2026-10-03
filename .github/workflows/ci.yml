@@ -83,6 +83,16 @@ jobs:
       - name: cargo doc --no-deps --workspace
         run: cargo doc --no-deps --workspace ${{ matrix.features.flags }}
 
+      # The one place `--all-features` is valid: these two crates have no
+      # mutually exclusive features (`backend`, and the platform crate's
+      # `async`, are additive), and every per-OS rule in their `backend`
+      # modules takes the OS as a parameter, so each host tests all of
+      # them. Never extend this to the workspace (tun-rs rejects two async
+      # runtimes). Runs once per OS.
+      - name: cargo test -p tunnel-lattice-model -p tunnel-lattice-platform --all-features
+        if: matrix.features.name == 'default'
+        run: cargo test -p tunnel-lattice-model -p tunnel-lattice-platform --all-features
+
       # Benches run on mocks and are not timed in CI (shared runners are too
       # noisy); this only proves they still build in release mode, once per
       # OS. `tunnel-lattice-async` has no features of its own, so the other

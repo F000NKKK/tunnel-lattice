@@ -12,12 +12,26 @@ keywords.workspace = true
 description = "Generic provider traits and Capability contract between the model and platform backends. Depends only on tunnel-lattice-core — never on tunnel-lattice-model."
 readme = "README.md"
 
+[package.metadata.docs.rs]
+# Show the `backend` support module on docs.rs (labelled by its feature).
+features = ["backend"]
+
 [features]
 # No optional dependency needed: AsyncPacketIo uses `impl Future` directly,
 # so this crate stays runtime-agnostic even with the feature on (see
 # tunnel-lattice-async's README for where an actual Tokio dependency lives).
 async = []
+# Exposes `pub mod backend`: the OS-independent packet-path rules (the
+# recv/send step, the `recv_batch` drain, the raw error-code tables) that
+# Tunnel Lattice backend crates share. Support API for backend authors, not
+# covered by any stability promise; the facade never enables it.
+backend = []
 
 [dependencies]
 tunnel-lattice-core = { workspace = true }
 bitflags = { workspace = true }
+
+# Test-only: pins the `errno` constants of `backend::errno::linux` against
+# the C library's values. The crate itself never depends on `libc`.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2.189"

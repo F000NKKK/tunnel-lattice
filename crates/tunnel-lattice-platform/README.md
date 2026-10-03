@@ -97,6 +97,36 @@ tunnel-lattice-platform = "0.6"
 tunnel-lattice-platform = { version = "0.6", features = ["async"] }
 ```
 
+### The `backend` Feature (for Backend Authors)
+
+The non-default `backend` Cargo feature adds
+`tunnel_lattice_platform::backend`, a support API for crates that implement
+Tunnel Lattice backends. It is not covered by any stability promise and may
+change in any minor release; applications should not enable it, and the
+`tunnel-lattice` facade neither enables nor re-exports it. It holds the
+packet-path rules every backend shares, as safe Rust with no I/O, no
+`unsafe` and no `libc` dependency:
+
+- `Step`, `recv_step`, `send_step` and `tap_abort_retries`: what a `recv` or
+  `send` loop does after one native attempt (retry, or finish with a
+  result). What is transient or fatal is the caller's rule, passed in as a
+  closure;
+- the `recv_batch` drain: `DrainStep`, `batch_capacity`, `DeferredTooSmall`,
+  `drain_plain` and `recv_batch_blocking`, generic over the error type of
+  the read (`std::io::Error` for one backend, a raw `errno` for another)
+  with the classifier passed as a closure;
+- `backend::errno`: the raw error codes as plain integers, and for Linux the
+  table (`linux::classify`) that maps an `errno` and the operation that
+  produced it (`linux::Op`) to an outcome (`linux::Class`), plus the subset
+  of it (`linux::packet_rule`) that a `std::io::Error`-based backend can
+  apply to the raw code of a packet-path failure. The crate's own tests
+  check every Linux constant against `libc`.
+
+```toml
+[dependencies]
+tunnel-lattice-platform = { version = "0.6", features = ["backend"] }
+```
+
 ## 📐 Backend Contract
 
 A backend's `PacketIo::recv` and `AsyncPacketIo::recv` must return `Ok(n)`

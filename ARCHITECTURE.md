@@ -35,6 +35,17 @@ administrative-state flag and status rules, and the `apply` contract
 backend authors with no stability promise; the `tunnel-lattice` facade never
 enables it and never re-exports it, and it performs no I/O.
 
+The rules that name no model type live the same way in
+`tunnel-lattice-platform` behind its own non-default `backend` feature
+(`tunnel_lattice_platform::backend`): the step a `recv`/`send` loop takes
+after one native attempt, the `recv_batch` drain (generic over the error type
+of the read, with the classifier passed in as a closure), and the raw error
+codes, including the Linux `errno` table that maps a code and the operation
+that produced it to an outcome. It is safe Rust with no `libc` dependency
+(the Linux constants are checked against `libc` in the crate's own tests),
+carries the same no-stability-promise status, and is likewise never enabled or
+re-exported by the facade.
+
 ## Why this differs from net-lattice's shape
 
 `net-lattice` inspects and mutates OS objects (routes, interfaces, DNS

@@ -38,7 +38,7 @@ tokio = ["async", "tun-rs/async_tokio", "dep:tokio"]
 [dependencies]
 tunnel-lattice-core = { workspace = true }
 tunnel-lattice-model = { workspace = true, features = ["backend"] }
-tunnel-lattice-platform = { workspace = true }
+tunnel-lattice-platform = { workspace = true, features = ["backend"] }
 tun-rs = { workspace = true }
 futures = { workspace = true, optional = true }
 # The latest tokio release, matching the workspace's own requirement (tun-rs

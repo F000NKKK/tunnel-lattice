@@ -78,6 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `tunnel-lattice` facade neither enables nor re-exports it, so
   application-visible API is unchanged. Both `tunnel-lattice-backend-tunrs`
   and the native Linux backend now use it; behaviour is unchanged.
+- **`tunnel_lattice_platform::backend` support API (new non-default
+  `backend` feature).** `tunnel-lattice-platform` gains a documented
+  `backend` module, behind the `backend` Cargo feature, holding the
+  packet-path rules that backends shared as private copies: `Step` with
+  `recv_step`, `send_step` and `tap_abort_retries`; the `recv_batch` drain
+  (`DrainStep`, `batch_capacity`, `DeferredTooSmall`, `drain_plain`,
+  `recv_batch_blocking`), generic over the error type of the read with the
+  classifier passed as a closure; and `backend::errno` with the raw error
+  codes as plain integers and the Linux `errno` table (`linux::Op`,
+  `linux::Class`, `linux::classify`, and `linux::packet_rule`, the subset
+  the `tun-rs`-backed backend applies). Safe Rust, no new runtime
+  dependency (`libc` is a Linux dev-dependency that checks the constants).
+  It is a support API for backend authors, not covered by any stability
+  promise; the `tunnel-lattice` facade neither enables nor re-exports it,
+  so application-visible API is unchanged. Both
+  `tunnel-lattice-backend-tunrs` and the native Linux backend now use it;
+  behaviour is unchanged.
 
 ### Changed
 
