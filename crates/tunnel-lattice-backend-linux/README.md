@@ -32,6 +32,12 @@ and to be selectable alongside it.
 > [`tunnel-lattice`](https://crates.io/crates/tunnel-lattice) facade, whose
 > default backend is `tunnel-lattice-backend-tunrs`.
 
+The OS-independent rules (name and open checks, the `apply` step order and
+revert, the Linux `errno` table) are shared with the
+other backends through the non-default `backend` support modules of
+`tunnel-lattice-model` and `tunnel-lattice-platform`; this crate keeps only
+the native calls and trait implementations.
+
 What is implemented so far (all internal):
 
 - **Error mapping** from the raw `errno` and the operation that produced

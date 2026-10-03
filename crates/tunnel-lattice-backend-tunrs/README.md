@@ -46,6 +46,13 @@ What it adds on top of `tun-rs`:
 - **Linux TUN segmentation offload** with its own header parsing,
   segmentation, and coalescing, plus `send_batch` on every OS.
 
+The rules every backend shares (name and open checks, the `apply` step
+order, the `recv_batch` drain, the Linux `errno` table, and the offload codec
+and engine) are not private to this crate: they come from the non-default
+`backend` (and, on Linux targets, `offload`) support modules of
+`tunnel-lattice-model` and `tunnel-lattice-platform`. This crate keeps only
+the `tun-rs` calls, its error classifiers, and the trait implementations.
+
 Main surface:
 
 - `TunRsBackend` (`#[non_exhaustive]`; build with `new()`/`default()`):

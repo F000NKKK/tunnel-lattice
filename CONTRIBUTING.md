@@ -35,6 +35,12 @@ Tunnel Lattice follows standard Rust ecosystem conventions:
 - Every affected crate must retain a standalone crate-local README, and
   English/Russian project documentation must remain synchronized.
 - Privileged network tests must be isolated, opt-in, and restore changed state.
+- `tunnel-lattice-model` and `tunnel-lattice-platform` hold the rules every
+  backend shares behind their non-default `backend` (and, for platform,
+  `offload`) features. Test them with
+  `cargo test -p tunnel-lattice-model -p tunnel-lattice-platform --all-features`
+  (valid for these two crates only; never use `--all-features` on the
+  workspace). Backends keep only native calls and trait implementations.
 - Changes to the packet receive path should report before/after numbers
   from `cargo bench -p tunnel-lattice-async` and keep
   `crates/tunnel-lattice-async/tests/alloc_count.rs` passing.

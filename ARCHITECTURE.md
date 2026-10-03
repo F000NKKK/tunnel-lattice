@@ -599,8 +599,8 @@ offload queue each position takes the next staged segment (see
 "Segmentation offload" above), and a segment too long for its buffer
 after the first stays pending instead. Nothing awaits after the first
 packet, so a dropped async `recv_batch` has received nothing. The drain
-itself is written against read closures, with no I/O of its own, so a
-native backend can reuse it. `PacketStream` and `PacketPool` still
+itself is written against read closures, with no I/O of its own, and lives
+in `tunnel-lattice-platform`'s `backend` module, so every backend shares it. `PacketStream` and `PacketPool` still
 receive through the one-packet `recv`.
 A downstream type that implements both `PacketIo` and `AsyncPacketIo` and
 calls `send_batch` with both traits in scope must name the trait, as it
