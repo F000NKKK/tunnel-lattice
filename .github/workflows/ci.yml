@@ -49,7 +49,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: ${{ matrix.features.name }}
 
@@ -161,7 +161,7 @@ jobs:
 
       # rust-cache's workspace mapping is `<workspace> -> <target dir>`,
       # relative to the workspace, so it saves the directory set above.
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: bench-forwarder
           workspaces: bench/forwarder -> ../../target/forwarder
@@ -226,7 +226,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: privileged-${{ matrix.features.name }}
 
@@ -490,7 +490,7 @@ jobs:
 
       # Its own key: this job builds only the backend's unit tests, not the
       # `privileged` job's backend and facade test binaries.
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: persistence-${{ matrix.features.name }}
 
