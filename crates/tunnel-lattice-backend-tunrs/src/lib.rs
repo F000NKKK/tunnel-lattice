@@ -535,6 +535,19 @@ impl DeviceProvider for TunRsBackend {
         #[cfg(not(feature = "async"))]
         let built = builder.build_sync();
         let handle = built.map_err(|err| {
+            // The Windows real-device test needs the original tun-rs error:
+            // the public error mapping deliberately discards its diagnostic.
+            #[cfg(all(test, target_os = "windows"))]
+            if config.kind == DeviceKind::Tap
+                && config.name.is_some()
+                && err.kind() == io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "named TAP build failed: kind={:?}, raw_os_error={:?}, error={err:?}",
+                    err.kind(),
+                    err.raw_os_error()
+                );
+            }
             open_contract::classify_open_error(
                 open_contract::HOST_OS,
                 config.kind,
