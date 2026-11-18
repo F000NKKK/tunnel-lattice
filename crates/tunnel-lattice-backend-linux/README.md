@@ -43,7 +43,9 @@ What is implemented so far (all internal):
 - **Error mapping** from the raw `errno` and the operation that produced
   it, never from `std::io::ErrorKind`. A missing `/dev/net/tun` node or
   `tun` module is reported as `DriverUnavailable`; the backend never
-  creates the device node itself.
+  creates the device node itself. When diagnosing a `TUNSETIFF` name
+  conflict, a failed link lookup retains its own error instead of being
+  treated as an absent interface.
 - **A synchronous rtnetlink control plane** for link lookups and changes
   (MTU, MAC, administrative state): one blocking socket, an acknowledged
   request per change, sequence numbers checked, and kernel errors decoded

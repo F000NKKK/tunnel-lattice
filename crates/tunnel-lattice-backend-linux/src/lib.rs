@@ -67,7 +67,7 @@ use errno::{Class, Op};
 ///    has a queue) is `Error::AlreadyExists`; `EINVAL` is
 ///    `Error::AlreadyExists` when an interface of that name exists (the
 ///    other kind, or a multi-queue mismatch) and `Platform(Linux(EINVAL))`
-///    otherwise.
+///    when it does not exist. A failed name lookup returns its own error.
 /// 4. The queue's name and flags are read back with `TUNGETIFF`. A device
 ///    that uses virtio-net header framing (possible when joining a
 ///    multi-queue device another process set up) is `Error::Unsupported`.
@@ -204,7 +204,7 @@ fn attach(
             Class::Fail(error) => return Err(error),
             Class::CheckNameConflict => {
                 let exists = match name {
-                    Some(name) => control.get_link(LinkQuery::Name(name)).is_ok(),
+                    Some(name) => link_exists(control.get_link(LinkQuery::Name(name)))?,
                     None => false,
                 };
                 return Err(errno::set_iff_einval(exists));
@@ -213,6 +213,16 @@ fn attach(
         }
     }
     tun::queue_ioctl(|| tun::get_iff(queue.as_fd()))
+}
+
+// A failed lookup is not evidence that a name is available: preserve errors
+// such as permission failures rather than hiding them behind TUNSETIFF's EINVAL.
+fn link_exists<T>(lookup: Result<T>) -> Result<bool> {
+    match lookup {
+        Ok(_) => Ok(true),
+        Err(Error::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 impl LinuxDevice {
@@ -359,6 +369,24 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn name_conflict_lookup_only_treats_not_found_as_absence() {
+        assert!(matches!(link_exists(Ok(())), Ok(true)));
+        assert!(matches!(link_exists::<()>(Err(Error::NotFound)), Ok(false)));
+        assert!(matches!(
+            link_exists::<()>(Err(Error::PermissionDenied)),
+            Err(Error::PermissionDenied)
+        ));
+        assert!(matches!(
+            link_exists::<()>(Err(Error::Platform(
+                tunnel_lattice_core::PlatformErrorCode::Linux(5)
+            ))),
+            Err(Error::Platform(
+                tunnel_lattice_core::PlatformErrorCode::Linux(5)
+            ))
+        ));
+    }
 
     #[test]
     fn the_backend_and_its_devices_are_send_and_sync() {

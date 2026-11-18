@@ -160,6 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI now runs the native Linux backend's ignored real-device tests with
+  privileges, separately from the tun-rs and facade tests.
+- The in-development native Linux backend now preserves link lookup errors
+  when diagnosing a `TUNSETIFF` name conflict instead of treating every
+  lookup failure as an absent interface.
+
 - **A queue attached to a multi-queue offload device is framed
   correctly.** On Linux the kernel's header flag is device-wide and is not
   applied to a queue attached to a multi-queue device that already has

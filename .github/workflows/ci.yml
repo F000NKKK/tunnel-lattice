@@ -344,6 +344,14 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice --lib ${{ matrix.features.facade_flags }} -- --ignored --nocapture
 
+      # The native Linux backend has its own real-device tests. Run them
+      # once, serially: packet tests configure routes in the host namespace.
+      # Bound the run because a regression could otherwise leave recv blocked.
+      - name: Native Linux backend real-device tests
+        if: matrix.os == 'ubuntu-latest' && matrix.features.name == 'default'
+        timeout-minutes: 10
+        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-linux --lib -- --ignored --test-threads=1 --nocapture
+
       # Every Linux TUN/TAP device the privileged tests create goes away
       # when its last handle drops (at the latest when the test process
       # exits), except the ones the persistence tests make persistent on
