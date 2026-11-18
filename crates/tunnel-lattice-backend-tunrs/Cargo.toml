@@ -44,7 +44,7 @@ futures = { workspace = true, optional = true }
 # The latest tokio release, matching the workspace's own requirement (tun-rs
 # 2.8.11 needs 1.49; the Linux error-aware receive path needs
 # `Interest::ERROR` (1.32) and `task::coop::consume_budget` (1.44)).
-tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "rt-multi-thread", "net"], optional = true }
 
 # Segmentation offload exists only on Linux TUN: the virtio-net codec and
 # the receive/send engine come from the platform crate's `offload` feature,

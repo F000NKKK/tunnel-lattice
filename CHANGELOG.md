@@ -160,6 +160,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Linux Tokio backend registers its owned descriptor using Tokio's
+  I/O-safe registration API; the minimum Tokio version is now 1.53.3.
+
 - CI now runs the native Linux backend's ignored real-device tests with
   privileges, separately from the tun-rs and facade tests.
 - The in-development native Linux backend now preserves link lookup errors

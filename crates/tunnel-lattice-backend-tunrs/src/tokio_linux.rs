@@ -61,7 +61,13 @@ impl ErrorAwareReader {
 
     /// Registers an already-owned non-blocking descriptor.
     fn from_owned(fd: OwnedFd) -> io::Result<Self> {
-        AsyncFd::with_interest(File::from(fd), Interest::READABLE | Interest::ERROR).map(Self)
+        // SAFETY: File owns this open descriptor for the entire AsyncFd
+        // lifetime and always returns the same descriptor number.
+        unsafe {
+            AsyncFd::register_with_interest(File::from(fd), Interest::READABLE | Interest::ERROR)
+        }
+        .map(Self)
+        .map_err(Into::into)
     }
 
     /// `recv` on an offload-framed queue: a batch of one through
@@ -708,10 +714,11 @@ mod tests {
         let (woken_tx, woken) = mpsc::channel::<()>();
         runtime.spawn(async move {
             let file = File::from(OwnedFd::from(writer));
-            let fd = match AsyncFd::with_interest(file, Interest::READABLE) {
+            // SAFETY: the File owns a stable descriptor until AsyncFd drops.
+            let fd = match unsafe { AsyncFd::register_with_interest(file, Interest::READABLE) } {
                 Ok(fd) => fd,
                 Err(err) => {
-                    let _ = registered_tx.send(Err(err));
+                    let _ = registered_tx.send(Err(err.into()));
                     return;
                 }
             };
