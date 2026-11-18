@@ -29,9 +29,8 @@ The cross-platform TUN/TAP backend of
 2.8.11). It implements `tunnel-lattice-platform`'s provider traits and turns
 every `tun-rs`/OS error into a typed `tunnel_lattice_core::Error`.
 
-This README describes the current repository checkout. The `recv_batch`
-implementation and shared backend support modules are unreleased; they
-are not part of the published 0.6 version.
+The `recv_batch` implementation and shared backend support modules are
+available starting with version 0.7.
 
 > Not used directly: the
 > [`tunnel-lattice`](https://crates.io/crates/tunnel-lattice) facade selects
@@ -99,10 +98,10 @@ if host.contains(Capability::TAP_DEVICES) {
 
 ```toml
 [dependencies]
-tunnel-lattice-backend-tunrs = "0.6"
+tunnel-lattice-backend-tunrs = "0.7"
 # or, with the native async path (mutually exclusive):
-tunnel-lattice-backend-tunrs = { version = "0.6", features = ["tokio"] }
-tunnel-lattice-backend-tunrs = { version = "0.6", features = ["async-io"] }
+tunnel-lattice-backend-tunrs = { version = "0.7", features = ["tokio"] }
+tunnel-lattice-backend-tunrs = { version = "0.7", features = ["async-io"] }
 ```
 
 `async-io` and `tokio` select `tun-rs`'s two async backends; enabling both

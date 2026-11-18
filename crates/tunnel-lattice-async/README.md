@@ -55,10 +55,10 @@ No Cargo features and no OS-specific code.
 
 ```toml
 [dependencies]
-tunnel-lattice-async = "0.6"
+tunnel-lattice-async = "0.7"
 # Used by the examples below
 futures = "0.3"
-tunnel-lattice-platform = { version = "0.6", features = ["async"] }
+tunnel-lattice-platform = { version = "0.7", features = ["async"] }
 ```
 
 ## 🎓 Quick Start

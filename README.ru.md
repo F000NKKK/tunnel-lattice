@@ -54,10 +54,8 @@ Lattice; адреса и маршруты настраиваются через
   [`tun-rs`](https://github.com/tun-rs/tun-rs); нативные бэкенды под каждую
   ОС встанут на его место без изменений в вашем коде.
 
-> **Статус:** опубликована `0.6.0`, идёт активная разработка. До `1.0` API
+> **Статус:** текущий выпуск — `0.7.0`, идёт активная разработка. До `1.0` API
 > не заморожен; см. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
-> README описывает текущий код репозитория. `recv_batch` относится к ещё
-> не выпущенным изменениям и отсутствует в опубликованном выпуске 0.6.
 
 ## 🌟 Ключевые возможности
 
@@ -207,13 +205,13 @@ cargo bench -p tunnel-lattice-async --bench pool   # накладные расх
 ```toml
 [dependencies]
 # Синхронный API, без async-рантайма
-tunnel-lattice = "0.6"
+tunnel-lattice = "0.7"
 
 # Асинхронный поток пакетов на Tokio (многопоточный рантайм)
-tunnel-lattice = { version = "0.6", features = ["tokio"] }
+tunnel-lattice = { version = "0.7", features = ["tokio"] }
 
 # Асинхронный поток пакетов на async-io (smol, async-std, ...)
-tunnel-lattice = { version = "0.6", features = ["async-io"] }
+tunnel-lattice = { version = "0.7", features = ["async-io"] }
 ```
 
 `tokio` и `async-io` взаимоисключающие.

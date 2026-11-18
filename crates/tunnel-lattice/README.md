@@ -31,8 +31,7 @@ Windows, and macOS with one typed API and one typed `Error`. It does not
 assign IP addresses; use [`net-lattice`](https://crates.io/crates/net-lattice)
 for that once a device exists.
 
-This README describes the current repository checkout. `recv_batch` and
-`recv_batch_async` are unreleased and are not present in version 0.6.
+`recv_batch` and `recv_batch_async` are available in the 0.7 release.
 
 Main surface:
 
@@ -71,9 +70,9 @@ async-io):
 
 ```toml
 [dependencies]
-tunnel-lattice = "0.6"                                          # sync only
-tunnel-lattice = { version = "0.6", features = ["tokio"] }     # or Tokio
-tunnel-lattice = { version = "0.6", features = ["async-io"] }  # or async-io
+tunnel-lattice = "0.7"                                          # sync only
+tunnel-lattice = { version = "0.7", features = ["tokio"] }     # or Tokio
+tunnel-lattice = { version = "0.7", features = ["async-io"] }  # or async-io
 ```
 
 - **`tun-rs`** (default) — selects `tunnel-lattice-backend-tunrs`.
