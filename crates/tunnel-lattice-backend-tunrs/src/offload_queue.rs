@@ -174,6 +174,23 @@ fn clear_offload_mask(fd: std::os::fd::RawFd) -> io::Result<()> {
 /// another queue.
 pub(crate) struct OffloadRx(engine::OffloadRx);
 
+#[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+pub(crate) trait AsyncReadQueue: Sync {
+    fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn readable(&self) -> impl std::future::Future<Output = io::Result<()>> + Send;
+}
+
+#[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+impl AsyncReadQueue for tun_rs::AsyncDevice {
+    fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        tun_rs::AsyncDevice::try_recv(self, buf)
+    }
+
+    async fn readable(&self) -> io::Result<()> {
+        tun_rs::AsyncDevice::readable(self).await
+    }
+}
+
 impl OffloadRx {
     /// A fresh staging buffer with nothing pending.
     pub(crate) fn new() -> Self {
@@ -233,11 +250,11 @@ impl OffloadRx {
     /// The `async-io` `recv`: a batch of one through
     /// [`Self::recv_batch_async_io`], which therefore never drains.
     #[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
-    pub(crate) async fn recv_async_io(
+    pub(crate) async fn recv_async_io<Q: AsyncReadQueue + ?Sized>(
         &self,
         os: HostOs,
         kind: DeviceKind,
-        handle: &tun_rs::AsyncDevice,
+        handle: &Q,
         out: &mut [u8],
     ) -> Result<usize> {
         let mut lens = [0];
@@ -258,11 +275,11 @@ impl OffloadRx {
     /// event, so waiting before every read would cost a reactor round trip
     /// per frame even while frames are queued.
     #[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
-    pub(crate) async fn recv_batch_async_io(
+    pub(crate) async fn recv_batch_async_io<Q: AsyncReadQueue + ?Sized>(
         &self,
         os: HostOs,
         kind: DeviceKind,
-        handle: &tun_rs::AsyncDevice,
+        handle: &Q,
         bufs: &mut [&mut [u8]],
         lens: &mut [usize],
     ) -> Result<usize> {
@@ -1294,25 +1311,52 @@ mod batch_tests {
     }
 }
 
-/// The batch send through real `tun-rs` handles over a datagram socket
-/// standing in for an offload-framed queue (one datagram per write, like a
-/// tun write).
+/// Batch send over a datagram socket standing in for an offload-framed
+/// queue (one datagram per write, like a TUN write). Real tun-rs devices
+/// are exercised separately by the privileged integration tests.
 #[cfg(all(test, target_os = "linux"))]
-mod batch_handle_tests {
-    use std::os::fd::IntoRawFd;
+mod batch_socket_tests {
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixDatagram;
 
     use super::test_frames::{split, tcp4_flow, udp4_packet};
     use super::*;
 
-    /// A datagram pair: ours is handed to `tun-rs`, the peer reads.
-    fn pair() -> (std::os::fd::RawFd, UnixDatagram) {
+    /// A datagram pair: ours writes a frame, the peer reads it.
+    fn pair() -> (UnixDatagram, UnixDatagram) {
         let (ours, theirs) = UnixDatagram::pair().expect("create a datagram pair");
         ours.set_nonblocking(true).expect("make it non-blocking");
         theirs
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("set a read timeout");
-        (ours.into_raw_fd(), theirs)
+        (ours, theirs)
+    }
+
+    fn write_frame(socket: &UnixDatagram, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        // SAFETY: IoSlice has the layout of iovec, and both the live socket
+        // and all supplied buffers outlive this synchronous call.
+        let n = unsafe {
+            libc::writev(
+                socket.as_raw_fd(),
+                bufs.as_ptr().cast(),
+                bufs.len() as libc::c_int,
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    #[cfg(feature = "async")]
+    struct SocketWriter(UnixDatagram);
+
+    #[cfg(feature = "async")]
+    impl AsyncGatherWrite for SocketWriter {
+        async fn write_gather(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            write_frame(&self.0, bufs)
+        }
     }
 
     /// A TCP run then a lone UDP packet: two writes, which the peer reads
@@ -1335,15 +1379,12 @@ mod batch_handle_tests {
 
     #[cfg(not(feature = "async"))]
     #[test]
-    fn a_sync_handle_writes_runs_and_singles() {
-        let (fd, peer) = pair();
-        // SAFETY: `fd` is an open descriptor whose sole ownership passes to
-        // the handle, which closes it when dropped.
-        let device = unsafe { tun_rs::SyncDevice::from_fd(fd) }.expect("wrap the descriptor");
+    fn sync_socket_writes_runs_and_singles() {
+        let (device, peer) = pair();
         let packets = batch();
         let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
         let sent = send_batch_blocking(HostOs::Linux, DeviceKind::Tun, &refs, true, |iov| {
-            device.send_vectored(iov)
+            write_frame(&device, iov)
         });
         assert_eq!(sent.unwrap(), packets.len());
         assert_received(&peer, &packets);
@@ -1351,13 +1392,11 @@ mod batch_handle_tests {
 
     #[cfg(feature = "async")]
     #[test]
-    fn an_async_handle_writes_runs_and_singles() {
-        let (fd, peer) = pair();
+    fn async_socket_writes_runs_and_singles() {
+        let (socket, peer) = pair();
         let packets = batch();
         let send = async {
-            // SAFETY: `fd` is an open descriptor whose sole ownership
-            // passes to the handle, which closes it when dropped.
-            let device = unsafe { tun_rs::AsyncDevice::from_fd(fd) }.expect("wrap the descriptor");
+            let device = SocketWriter(socket);
             let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
             send_batch_async(HostOs::Linux, DeviceKind::Tun, &refs, true, &device).await
         };
@@ -1378,7 +1417,6 @@ mod batch_handle_tests {
 /// offload-framed queue (one datagram per frame, like a tun read).
 #[cfg(all(test, target_os = "linux", feature = "async", not(feature = "tokio")))]
 mod async_io_tests {
-    use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixDatagram;
 
     use futures::FutureExt;
@@ -1389,17 +1427,26 @@ mod async_io_tests {
 
     /// A `tun-rs` async handle reading one end of a datagram pair, and the
     /// other end to send frames with.
-    fn queue() -> (tun_rs::AsyncDevice, UnixDatagram) {
+    struct SocketQueue(async_io::Async<UnixDatagram>);
+
+    impl AsyncReadQueue for SocketQueue {
+        fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.get_ref().recv(buf)
+        }
+
+        async fn readable(&self) -> io::Result<()> {
+            self.0.readable().await
+        }
+    }
+
+    fn queue() -> (SocketQueue, UnixDatagram) {
         let (ours, theirs) = UnixDatagram::pair().expect("create a datagram pair");
         ours.set_nonblocking(true).expect("make it non-blocking");
-        // SAFETY: `into_raw_fd` hands over sole ownership of an open,
-        // non-blocking descriptor; the handle closes it when dropped.
-        let device = unsafe { tun_rs::AsyncDevice::from_fd(ours.into_raw_fd()) }
-            .expect("wrap the descriptor");
+        let device = SocketQueue(async_io::Async::new(ours).expect("register the socket"));
         (device, theirs)
     }
 
-    fn recv(rx: &OffloadRx, device: &tun_rs::AsyncDevice, out: &mut [u8]) -> Result<usize> {
+    fn recv(rx: &OffloadRx, device: &SocketQueue, out: &mut [u8]) -> Result<usize> {
         block_on(rx.recv_async_io(HostOs::Linux, DeviceKind::Tun, device, out))
     }
 

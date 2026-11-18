@@ -96,5 +96,6 @@ windows-sys = { version = "0.61.2", features = [
 # builds, the thread bridge in the sync build) and delete or disable the
 # device underneath it.
 [dev-dependencies]
+async-io = "2.6"
 tunnel-lattice-async = { workspace = true }
 futures = { workspace = true }

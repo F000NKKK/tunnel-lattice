@@ -659,13 +659,18 @@ impl TunRsDevice {
         #[cfg(not(feature = "async"))]
         {
             #[cfg(target_os = "linux")]
-            self.deferred.take()?;
-            #[cfg(target_os = "linux")]
-            if let Some(rx) = &self.offload {
-                return rx.recv_blocking(open_contract::HOST_OS, self.kind, buf, |staging| {
-                    self.handle.recv(staging)
-                });
+            {
+                linux_blocking_recv(
+                    self.kind,
+                    self.offload.as_ref(),
+                    &self.deferred,
+                    buf,
+                    &|| self.oper_state(),
+                    |staging| self.handle.recv(staging),
+                    |buf| sentinel_recv(&self.handle, buf),
+                )
             }
+            #[cfg(not(target_os = "linux"))]
             recv_contract::recv_blocking(
                 open_contract::HOST_OS,
                 self.kind,
@@ -681,6 +686,10 @@ impl TunRsDevice {
     /// one (see `recv_contract::tap_abort_retries`): the same read as
     /// `snapshot`'s admin state. The contract never calls it on other
     /// hosts, where it reports `Unknown`.
+    #[cfg_attr(
+        all(target_os = "linux", feature = "async"),
+        expect(dead_code, reason = "Linux async receive uses the generic queue")
+    )]
     fn oper_state(&self) -> std::io::Result<tunnel_lattice_model::AdminState> {
         #[cfg(target_os = "windows")]
         {
@@ -723,8 +732,24 @@ impl TunRsDevice {
     /// handle.
     #[cfg(feature = "async")]
     async fn async_recv(&self, buf: &mut [u8]) -> Result<usize> {
-        #[cfg(target_os = "linux")]
-        self.deferred.take()?;
+        #[cfg(all(target_os = "linux", feature = "tokio"))]
+        return linux_tokio_recv(
+            self.kind,
+            self.offload.as_ref(),
+            &self.deferred,
+            &self.reader,
+            buf,
+        )
+        .await;
+        #[cfg(all(target_os = "linux", not(feature = "tokio")))]
+        return linux_asyncio_recv(
+            self.kind,
+            self.offload.as_ref(),
+            &self.deferred,
+            &self.handle,
+            buf,
+        )
+        .await;
         #[cfg(target_os = "macos")]
         if let Some(wait) = &self.tap_wait {
             let source = macos_tap::TapSource {
@@ -740,23 +765,9 @@ impl TunRsDevice {
             )
             .await;
         }
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
-        if let Some(rx) = &self.offload {
-            return self
-                .reader
-                .recv_offload(open_contract::HOST_OS, self.kind, rx, buf)
-                .await;
-        }
-        #[cfg(all(target_os = "linux", not(feature = "tokio")))]
-        if let Some(rx) = &self.offload {
-            return rx
-                .recv_async_io(open_contract::HOST_OS, self.kind, &self.handle, buf)
-                .await;
-        }
-        #[cfg(all(target_os = "linux", feature = "tokio"))]
-        let source = &self.reader;
-        #[cfg(not(all(target_os = "linux", feature = "tokio")))]
+        #[cfg(not(target_os = "linux"))]
         let source = &self.handle;
+        #[cfg(not(target_os = "linux"))]
         recv_contract::recv_async(
             open_contract::HOST_OS,
             self.kind,
@@ -785,34 +796,20 @@ impl TunRsDevice {
         #[cfg(not(feature = "async"))]
         {
             use std::os::fd::AsFd;
-
-            if recv_contract::batch_capacity(bufs, lens) == 0 {
-                return Ok(0);
-            }
-            self.deferred.take()?;
-            let os = open_contract::HOST_OS;
-            if let Some(rx) = &self.offload {
-                return rx.recv_batch_blocking(
-                    os,
-                    self.kind,
-                    bufs,
-                    lens,
-                    |staging| self.handle.recv(staging),
-                    |staging| {
-                        recv_contract::read_nowait(
-                            self.handle.as_fd(),
-                            &mut [std::io::IoSliceMut::new(staging)],
-                        )
-                    },
-                );
-            }
-            recv_contract::recv_batch_blocking(
-                os,
+            linux_blocking_recv_batch(
                 self.kind,
+                self.offload.as_ref(),
+                &self.deferred,
                 bufs,
                 lens,
-                &self.deferred,
                 &|| self.oper_state(),
+                |staging| self.handle.recv(staging),
+                |staging| {
+                    recv_contract::read_nowait(
+                        self.handle.as_fd(),
+                        &mut [std::io::IoSliceMut::new(staging)],
+                    )
+                },
                 |buf| sentinel_recv(&self.handle, buf),
                 |buf| recv_contract::sentinel_read_nowait(self.handle.as_fd(), buf),
             )
@@ -824,63 +821,27 @@ impl TunRsDevice {
     /// non-waiting reads (see [`TunRsDevice`], "Receiving a batch").
     #[cfg(all(target_os = "linux", feature = "async"))]
     async fn async_recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
-        if recv_contract::batch_capacity(bufs, lens) == 0 {
-            return Ok(0);
-        }
-        self.deferred.take()?;
-        let os = open_contract::HOST_OS;
         #[cfg(feature = "tokio")]
-        {
-            if let Some(rx) = &self.offload {
-                return self
-                    .reader
-                    .recv_offload_batch(os, self.kind, rx, bufs, lens)
-                    .await;
-            }
-            self.reader
-                .recv_batch_plain(
-                    os,
-                    self.kind,
-                    &|| self.oper_state(),
-                    bufs,
-                    lens,
-                    &self.deferred,
-                )
-                .await
-        }
+        return linux_tokio_recv_batch(
+            self.kind,
+            self.offload.as_ref(),
+            &self.deferred,
+            &self.reader,
+            bufs,
+            lens,
+        )
+        .await;
         #[cfg(not(feature = "tokio"))]
         {
-            if let Some(rx) = &self.offload {
-                return rx
-                    .recv_batch_async_io(os, self.kind, &self.handle, bufs, lens)
-                    .await;
-            }
-            let (Some(first), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
-                return Ok(0);
-            };
-            *len = recv_contract::recv_async(
-                os,
+            linux_asyncio_recv_batch(
                 self.kind,
+                self.offload.as_ref(),
+                &self.deferred,
                 &self.handle,
-                &|| self.oper_state(),
-                first,
-            )
-            .await?;
-            Ok(recv_contract::drain_plain(
-                os,
                 bufs,
                 lens,
-                1,
-                &self.deferred,
-                |buf| {
-                    use std::io::IoSliceMut;
-                    let mut sentinel = [0u8; 1];
-                    self.handle.try_recv_vectored(&mut [
-                        IoSliceMut::new(buf),
-                        IoSliceMut::new(&mut sentinel),
-                    ])
-                },
-            ))
+            )
+            .await
         }
     }
 
@@ -954,6 +915,205 @@ impl TunRsDevice {
         )
         .await
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+trait LinuxAsyncQueue: offload_queue::AsyncReadQueue + recv_contract::AsyncRecvSource + Sync {
+    fn try_recv_sentinel(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+impl LinuxAsyncQueue for tun_rs::AsyncDevice {
+    fn try_recv_sentinel(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut sentinel = [0u8; 1];
+        self.try_recv_vectored(&mut [
+            std::io::IoSliceMut::new(buf),
+            std::io::IoSliceMut::new(&mut sentinel),
+        ])
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+async fn linux_asyncio_recv<Q: LinuxAsyncQueue>(
+    kind: DeviceKind,
+    offload: Option<&offload_queue::OffloadRx>,
+    deferred: &recv_contract::DeferredTooSmall,
+    queue: &Q,
+    buf: &mut [u8],
+) -> Result<usize> {
+    deferred.take()?;
+    if let Some(rx) = offload {
+        return rx
+            .recv_async_io(open_contract::HOST_OS, kind, queue, buf)
+            .await;
+    }
+    recv_contract::recv_async(
+        open_contract::HOST_OS,
+        kind,
+        queue,
+        &|| Ok(tunnel_lattice_model::AdminState::Unknown),
+        buf,
+    )
+    .await
+}
+
+#[cfg(all(target_os = "linux", feature = "async", not(feature = "tokio")))]
+async fn linux_asyncio_recv_batch<Q: LinuxAsyncQueue>(
+    kind: DeviceKind,
+    offload: Option<&offload_queue::OffloadRx>,
+    deferred: &recv_contract::DeferredTooSmall,
+    queue: &Q,
+    bufs: &mut [&mut [u8]],
+    lens: &mut [usize],
+) -> Result<usize> {
+    if recv_contract::batch_capacity(bufs, lens) == 0 {
+        return Ok(0);
+    }
+    deferred.take()?;
+    if let Some(rx) = offload {
+        return rx
+            .recv_batch_async_io(open_contract::HOST_OS, kind, queue, bufs, lens)
+            .await;
+    }
+    let (Some(first), Some(len)) = (bufs.first_mut(), lens.first_mut()) else {
+        return Ok(0);
+    };
+    *len = recv_contract::recv_async(
+        open_contract::HOST_OS,
+        kind,
+        queue,
+        &|| Ok(tunnel_lattice_model::AdminState::Unknown),
+        first,
+    )
+    .await?;
+    Ok(recv_contract::drain_plain(
+        open_contract::HOST_OS,
+        bufs,
+        lens,
+        1,
+        deferred,
+        |buf| queue.try_recv_sentinel(buf),
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+async fn linux_tokio_recv(
+    kind: DeviceKind,
+    offload: Option<&offload_queue::OffloadRx>,
+    deferred: &recv_contract::DeferredTooSmall,
+    reader: &tokio_linux::ErrorAwareReader,
+    buf: &mut [u8],
+) -> Result<usize> {
+    deferred.take()?;
+    if let Some(rx) = offload {
+        return reader
+            .recv_offload(open_contract::HOST_OS, kind, rx, buf)
+            .await;
+    }
+    recv_contract::recv_async(
+        open_contract::HOST_OS,
+        kind,
+        reader,
+        &|| Ok(tunnel_lattice_model::AdminState::Unknown),
+        buf,
+    )
+    .await
+}
+
+#[cfg(all(target_os = "linux", feature = "tokio"))]
+async fn linux_tokio_recv_batch(
+    kind: DeviceKind,
+    offload: Option<&offload_queue::OffloadRx>,
+    deferred: &recv_contract::DeferredTooSmall,
+    reader: &tokio_linux::ErrorAwareReader,
+    bufs: &mut [&mut [u8]],
+    lens: &mut [usize],
+) -> Result<usize> {
+    if recv_contract::batch_capacity(bufs, lens) == 0 {
+        return Ok(0);
+    }
+    deferred.take()?;
+    if let Some(rx) = offload {
+        return reader
+            .recv_offload_batch(open_contract::HOST_OS, kind, rx, bufs, lens)
+            .await;
+    }
+    reader
+        .recv_batch_plain(
+            open_contract::HOST_OS,
+            kind,
+            &|| Ok(tunnel_lattice_model::AdminState::Unknown),
+            bufs,
+            lens,
+            deferred,
+        )
+        .await
+}
+
+/// Shared Linux blocking receive orchestration for a TUN queue or a test queue.
+#[cfg(all(target_os = "linux", not(feature = "async")))]
+fn linux_blocking_recv<R, P, O>(
+    kind: DeviceKind,
+    offload: Option<&offload_queue::OffloadRx>,
+    deferred: &recv_contract::DeferredTooSmall,
+    buf: &mut [u8],
+    oper: &O,
+    raw: R,
+    plain: P,
+) -> Result<usize>
+where
+    R: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    P: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    O: Fn() -> std::io::Result<tunnel_lattice_model::AdminState>,
+{
+    deferred.take()?;
+    if let Some(rx) = offload {
+        return rx.recv_blocking(open_contract::HOST_OS, kind, buf, raw);
+    }
+    recv_contract::recv_blocking(open_contract::HOST_OS, kind, buf, oper, plain)
+}
+
+#[cfg(all(target_os = "linux", not(feature = "async")))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the queue's blocking and nonblocking reads are supplied independently"
+)]
+fn linux_blocking_recv_batch<R, N, P, D, O>(
+    kind: DeviceKind,
+    offload: Option<&offload_queue::OffloadRx>,
+    deferred: &recv_contract::DeferredTooSmall,
+    bufs: &mut [&mut [u8]],
+    lens: &mut [usize],
+    oper: &O,
+    raw: R,
+    raw_nowait: N,
+    plain: P,
+    plain_nowait: D,
+) -> Result<usize>
+where
+    R: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    N: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    P: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    D: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    O: Fn() -> std::io::Result<tunnel_lattice_model::AdminState>,
+{
+    if recv_contract::batch_capacity(bufs, lens) == 0 {
+        return Ok(0);
+    }
+    deferred.take()?;
+    if let Some(rx) = offload {
+        return rx.recv_batch_blocking(open_contract::HOST_OS, kind, bufs, lens, raw, raw_nowait);
+    }
+    recv_contract::recv_batch_blocking(
+        open_contract::HOST_OS,
+        kind,
+        bufs,
+        lens,
+        deferred,
+        oper,
+        plain,
+        plain_nowait,
+    )
 }
 
 /// One plain packet as an offload-framed queue's `writev` takes it: an
@@ -1697,36 +1857,275 @@ mod io_error_tests {
 /// blocking path, and in the async builds also the async one.
 #[cfg(all(test, target_os = "linux"))]
 mod recv_batch_tests {
-    use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixDatagram;
 
     use super::offload_queue::test_frames::{assert_segment, udp4_frame};
     use super::*;
 
+    #[cfg(not(feature = "async"))]
+    #[test]
+    fn socket_queue_preserves_deferred_error_across_batch_and_recv() {
+        use std::io::IoSliceMut;
+        use std::os::fd::AsFd;
+        let (queue, peer) = UnixDatagram::pair().unwrap();
+        for packet in [&b"ok"[..], b"123456789", b"after"] {
+            peer.send(packet).unwrap();
+        }
+        let deferred = recv_contract::DeferredTooSmall::new();
+        let mut storage = [[0u8; 8]; 3];
+        let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|b| &mut b[..]).collect();
+        let mut lens = [0; 3];
+        let oper = || Ok(tunnel_lattice_model::AdminState::Unknown);
+        let count = linux_blocking_recv_batch(
+            DeviceKind::Tun,
+            None,
+            &deferred,
+            &mut bufs,
+            &mut lens,
+            &oper,
+            |buf| queue.recv(buf),
+            |buf| recv_contract::read_nowait(queue.as_fd(), &mut [IoSliceMut::new(buf)]),
+            |buf| recv_contract::sentinel_read_nowait(queue.as_fd(), buf),
+            |buf| recv_contract::sentinel_read_nowait(queue.as_fd(), buf),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(&bufs[0][..lens[0]], b"ok");
+        let mut buf = [0u8; 8];
+        let receive = |buf: &mut [u8]| {
+            linux_blocking_recv(
+                DeviceKind::Tun,
+                None,
+                &deferred,
+                buf,
+                &oper,
+                |buf| queue.recv(buf),
+                |buf| recv_contract::sentinel_read_nowait(queue.as_fd(), buf),
+            )
+        };
+        assert!(matches!(receive(&mut buf), Err(Error::BufferTooSmall)));
+        let n = receive(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"after");
+    }
+
     /// A device over one end of a datagram pair, and the other end to send
     /// packets with. Under `tokio` the caller has entered a runtime.
-    fn device(offload: bool) -> (TunRsDevice, UnixDatagram) {
-        let (ours, theirs) = UnixDatagram::pair().expect("create a datagram pair");
-        #[cfg(feature = "async")]
-        ours.set_nonblocking(true).expect("make it non-blocking");
-        let fd = ours.into_raw_fd();
-        // SAFETY: `into_raw_fd` hands over sole ownership of an open
-        // descriptor; the handle closes it when dropped.
-        #[cfg(feature = "async")]
-        let handle = unsafe { tun_rs::AsyncDevice::from_fd(fd) }.expect("wrap the descriptor");
-        // SAFETY: as above.
-        #[cfg(not(feature = "async"))]
-        let handle = unsafe { tun_rs::SyncDevice::from_fd(fd) }.expect("wrap the descriptor");
-        let device = TunRsDevice {
-            kind: DeviceKind::Tun,
-            id: DeviceId::new(1),
-            offload: offload.then(offload_queue::OffloadRx::new),
-            deferred: recv_contract::DeferredTooSmall::new(),
-            #[cfg(feature = "tokio")]
-            reader: tokio_linux::ErrorAwareReader::new(&*handle).expect("register the socket"),
-            handle,
-        };
-        (device, theirs)
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    struct AsyncIoSocketDevice {
+        queue: async_io::Async<std::fs::File>,
+        offload: Option<offload_queue::OffloadRx>,
+        deferred: recv_contract::DeferredTooSmall,
+    }
+
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    fn device(offload: bool) -> (AsyncIoSocketDevice, UnixDatagram) {
+        use std::os::fd::OwnedFd;
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let fd: OwnedFd = socket.into();
+        let queue = async_io::Async::new(std::fs::File::from(fd)).unwrap();
+        (
+            AsyncIoSocketDevice {
+                queue,
+                offload: offload.then(offload_queue::OffloadRx::new),
+                deferred: recv_contract::DeferredTooSmall::new(),
+            },
+            peer,
+        )
+    }
+
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    impl offload_queue::AsyncReadQueue for AsyncIoSocketDevice {
+        fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use std::io::Read;
+            self.queue.get_ref().read(buf)
+        }
+        async fn readable(&self) -> std::io::Result<()> {
+            self.queue.readable().await
+        }
+    }
+
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    impl LinuxAsyncQueue for AsyncIoSocketDevice {
+        fn try_recv_sentinel(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use std::io::{IoSliceMut, Read};
+            let mut sentinel = [0u8; 1];
+            self.queue
+                .get_ref()
+                .read_vectored(&mut [IoSliceMut::new(buf), IoSliceMut::new(&mut sentinel)])
+        }
+    }
+
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    impl recv_contract::AsyncRecvSource for AsyncIoSocketDevice {
+        async fn recv_native(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.queue.read_with(|_| self.try_recv_sentinel(buf)).await
+        }
+    }
+
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    impl PacketIo for AsyncIoSocketDevice {
+        fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            futures::executor::block_on(AsyncPacketIo::recv(self, buf))
+        }
+        fn send(&self, _: &[u8]) -> Result<usize> {
+            Err(Error::Unsupported)
+        }
+        fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+            futures::executor::block_on(AsyncPacketIo::recv_batch(self, bufs, lens))
+        }
+    }
+
+    #[cfg(all(feature = "async", not(feature = "tokio")))]
+    impl AsyncPacketIo for AsyncIoSocketDevice {
+        async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            linux_asyncio_recv(
+                DeviceKind::Tun,
+                self.offload.as_ref(),
+                &self.deferred,
+                self,
+                buf,
+            )
+            .await
+        }
+        async fn send(&self, _: &[u8]) -> Result<usize> {
+            Err(Error::Unsupported)
+        }
+        async fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+            linux_asyncio_recv_batch(
+                DeviceKind::Tun,
+                self.offload.as_ref(),
+                &self.deferred,
+                self,
+                bufs,
+                lens,
+            )
+            .await
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    struct TokioSocketDevice {
+        reader: tokio_linux::ErrorAwareReader,
+        offload: Option<offload_queue::OffloadRx>,
+        deferred: recv_contract::DeferredTooSmall,
+    }
+
+    #[cfg(feature = "tokio")]
+    fn device(offload: bool) -> (TokioSocketDevice, UnixDatagram) {
+        let (queue, peer) = UnixDatagram::pair().unwrap();
+        queue.set_nonblocking(true).unwrap();
+        let reader = tokio_linux::ErrorAwareReader::new(&queue).unwrap();
+        (
+            TokioSocketDevice {
+                reader,
+                offload: offload.then(offload_queue::OffloadRx::new),
+                deferred: recv_contract::DeferredTooSmall::new(),
+            },
+            peer,
+        )
+    }
+
+    #[cfg(feature = "tokio")]
+    impl PacketIo for TokioSocketDevice {
+        fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            tokio::runtime::Handle::current().block_on(AsyncPacketIo::recv(self, buf))
+        }
+        fn send(&self, _: &[u8]) -> Result<usize> {
+            Err(Error::Unsupported)
+        }
+        fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+            tokio::runtime::Handle::current().block_on(AsyncPacketIo::recv_batch(self, bufs, lens))
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    impl AsyncPacketIo for TokioSocketDevice {
+        async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            linux_tokio_recv(
+                DeviceKind::Tun,
+                self.offload.as_ref(),
+                &self.deferred,
+                &self.reader,
+                buf,
+            )
+            .await
+        }
+        async fn send(&self, _: &[u8]) -> Result<usize> {
+            Err(Error::Unsupported)
+        }
+        async fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+            linux_tokio_recv_batch(
+                DeviceKind::Tun,
+                self.offload.as_ref(),
+                &self.deferred,
+                &self.reader,
+                bufs,
+                lens,
+            )
+            .await
+        }
+    }
+
+    #[cfg(not(feature = "async"))]
+    struct SocketDevice {
+        queue: UnixDatagram,
+        offload: Option<offload_queue::OffloadRx>,
+        deferred: recv_contract::DeferredTooSmall,
+    }
+
+    #[cfg(not(feature = "async"))]
+    fn device(offload: bool) -> (SocketDevice, UnixDatagram) {
+        let (queue, peer) = UnixDatagram::pair().unwrap();
+        (
+            SocketDevice {
+                queue,
+                offload: offload.then(offload_queue::OffloadRx::new),
+                deferred: recv_contract::DeferredTooSmall::new(),
+            },
+            peer,
+        )
+    }
+
+    #[cfg(not(feature = "async"))]
+    impl PacketIo for SocketDevice {
+        fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            use std::os::fd::AsFd;
+            linux_blocking_recv(
+                DeviceKind::Tun,
+                self.offload.as_ref(),
+                &self.deferred,
+                buf,
+                &|| Ok(tunnel_lattice_model::AdminState::Unknown),
+                |buf| self.queue.recv(buf),
+                |buf| recv_contract::sentinel_read_nowait(self.queue.as_fd(), buf),
+            )
+        }
+
+        fn send(&self, buf: &[u8]) -> Result<usize> {
+            self.queue.send(buf).map_err(io_error)
+        }
+
+        fn recv_batch(&self, bufs: &mut [&mut [u8]], lens: &mut [usize]) -> Result<usize> {
+            use std::os::fd::AsFd;
+            linux_blocking_recv_batch(
+                DeviceKind::Tun,
+                self.offload.as_ref(),
+                &self.deferred,
+                bufs,
+                lens,
+                &|| Ok(tunnel_lattice_model::AdminState::Unknown),
+                |buf| self.queue.recv(buf),
+                |buf| {
+                    recv_contract::read_nowait(
+                        self.queue.as_fd(),
+                        &mut [std::io::IoSliceMut::new(buf)],
+                    )
+                },
+                |buf| recv_contract::sentinel_read_nowait(self.queue.as_fd(), buf),
+                |buf| recv_contract::sentinel_read_nowait(self.queue.as_fd(), buf),
+            )
+        }
     }
 
     /// Runs `f` inside the runtime the build needs: a multi-thread Tokio
@@ -1755,7 +2154,7 @@ mod recv_batch_tests {
             Self(vec![vec![0u8; len]; count])
         }
 
-        fn batch(&mut self, device: &TunRsDevice) -> Result<Vec<Vec<u8>>> {
+        fn batch(&mut self, device: &impl PacketIo) -> Result<Vec<Vec<u8>>> {
             let mut lens = vec![0; self.0.len()];
             let mut slices: Vec<&mut [u8]> = self.0.iter_mut().map(Vec::as_mut_slice).collect();
             let n = PacketIo::recv_batch(device, &mut slices, &mut lens)?;
@@ -1763,7 +2162,7 @@ mod recv_batch_tests {
         }
 
         #[cfg(feature = "async")]
-        fn batch_async(&mut self, device: &TunRsDevice) -> Result<Vec<Vec<u8>>> {
+        fn batch_async(&mut self, device: &(impl AsyncPacketIo + Sync)) -> Result<Vec<Vec<u8>>> {
             let mut lens = vec![0; self.0.len()];
             let mut slices: Vec<&mut [u8]> = self.0.iter_mut().map(Vec::as_mut_slice).collect();
             let call = AsyncPacketIo::recv_batch(device, &mut slices, &mut lens);
