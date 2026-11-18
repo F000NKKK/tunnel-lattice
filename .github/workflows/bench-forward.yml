@@ -52,7 +52,7 @@ jobs:
       # Registry/git sources only: the release builds use
       # `-C target-cpu=native`, so cached build output from another runner
       # CPU would not be valid.
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: bench-forward
           workspaces: bench/forwarder
