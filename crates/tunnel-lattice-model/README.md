@@ -69,6 +69,10 @@ contracts; it never inspects or changes the host system.
 
 ### The `backend` Feature (for Backend Authors)
 
+This feature is unreleased. The dependency example below describes the
+workspace manifest version in this checkout, not the published 0.6 crate;
+use the repository checkout until a release includes the feature.
+
 The non-default `backend` Cargo feature adds `tunnel_lattice_model::backend`,
 a support API for crates that implement Tunnel Lattice backends. It is not
 covered by any stability promise and may change in any minor release;

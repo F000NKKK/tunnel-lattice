@@ -12,7 +12,7 @@ tunnel-lattice-model             DeviceKind/DeviceConfig/Device/DeviceConfigPatc
 tunnel-lattice-platform          обобщённые provider-трейты + Capability — зависит только от core, никогда от model
 tunnel-lattice-backend-tunrs     реализация platform-трейтов поверх tun-rs
 tunnel-lattice-backend-linux     нативный Linux-backend (/dev/net/tun + синхронный rtnetlink) — в разработке, публичного API пока нет; вне Linux пустой
-tunnel-lattice-async             адаптер futures::Stream поверх синхронного PacketIo-устройства
+tunnel-lattice-async             адаптеры futures::Stream поверх асинхронного или синхронного packet I/O
 tunnel-lattice                   фасад: связывает platform-трейты с типами model, выбирает backend
 ```
 

@@ -89,12 +89,10 @@ crate** and pulls in no dependency beyond `tunnel-lattice-core`,
 `tunnel-lattice-model`, and `tunnel-lattice-platform`, so a
 cross-platform workspace can depend on it unconditionally.
 
-## 📦 Installation
+## 📦 Availability
 
-```toml
-[dependencies]
-tunnel-lattice-backend-linux = "0.1"
-```
+This crate is in development in the repository and exports no public API.
+Its manifest version does not imply that a usable release is available.
 
 There are no Cargo features yet. On Linux it depends on `libc` and the
 `netlink-packet-route`/`netlink-packet-core`/`netlink-sys` crates with

@@ -11,9 +11,7 @@ Before changing anything, read:
 4. the active work item in the YouTrack project `TL`
    (https://hush.youtrack.cloud/projects/TL) — its Epic (roadmap stage) and
    the current Task/Story, reached via the REST API per
-   `.codex/rules/youtrack.md`. **The `TL` project does not exist yet**; work
-   from `index.md`/`ARCHITECTURE.md` and the user's own instructions until
-   the user confirms it does.
+   `.codex/rules/youtrack.md`.
 
 The active Task/Story owns its description, comment-based audit trail, and
 any linked ADR Articles (under `TL-A-1`). Read them before implementation,

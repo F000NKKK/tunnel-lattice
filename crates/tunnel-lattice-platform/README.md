@@ -22,6 +22,12 @@ domain model and its platform backends: generic provider traits and the
 runtime `Capability` flags. It depends only on `tunnel-lattice-core`, never
 on `tunnel-lattice-model`.
 
+This README describes the current repository checkout. The `recv_batch`
+trait methods and the `backend` and `offload` support features are unreleased
+and are not present in version 0.6. The feature dependency examples below
+refer to the workspace manifest version; use the repository checkout until
+a release includes them.
+
 ### 🎯 Why This Crate Exists
 
 This boundary is what lets the current `tun-rs`-backed implementation

@@ -56,6 +56,8 @@ addresses and routes.
 
 > **Status:** `0.6.0` is published and development is active. Nothing is
 > API-frozen before `1.0`; see [ARCHITECTURE.md](ARCHITECTURE.md).
+> This README describes the repository checkout. `recv_batch` is in the
+> unreleased changes and is not part of the published 0.6 release.
 
 ## 🌟 Key Features
 
@@ -180,10 +182,10 @@ Lattice splits and coalesces super-packets itself, so the async offload
 rows are not bounded by `tun-rs`'s offload path and exceeded it in this
 run. The sync offload row receives one packet per call and sends each
 packet on its own, so nothing is coalesced on the way out; batched receive
-is not part of this release. The range in brackets is the spread over the
+was not part of the measured 0.5 release. The range in brackets is the spread over the
 repetitions of this one recorded run only; it says nothing about how much
 the ratio varies between runs or machines. Native per-OS backends are
-planned after this.
+under development; the native Linux backend is not yet exposed by the facade.
 `tun-rs`'s own published numbers come from different hardware, so they are
 not comparable with this table.
 
@@ -443,7 +445,7 @@ not have yet.
 | **Multi-queue (Linux)** | ✅ `additional_queue` | Inherited | ✅ |
 | **Batch send** | ✅ `send_batch`, every OS; coalesced only on a Linux TUN offload queue | Tunnel Lattice | ✅ Linux (`send_multiple`) |
 | **GSO/GRO offload** | ✅ Linux TUN, opt-in; one packet per `recv` | Tunnel Lattice (its own header parsing, segmentation, and coalescing) | ✅ Linux |
-| **Batch receive** | ❌ One packet per `recv` | — | ✅ Linux (`recv_multiple`) |
+| **Batch receive** | ✅ `recv_batch` in the current checkout (unreleased); Linux drains queued packets | Tunnel Lattice | ✅ Linux (`recv_multiple`) |
 | **Address and route setup** | ➖ Delegated to net-lattice | — | ✅ Built in |
 | **Throughput** | Measured against `tun-rs` in the same run; see [Benchmarks](#-benchmarks) | — | Baseline |
 | **Platforms** | Linux, Windows, macOS | — | 11+, including BSD, iOS, Android |

@@ -13,7 +13,7 @@ tunnel-lattice-model             DeviceKind/DeviceConfig/Device/DeviceConfigPatc
 tunnel-lattice-platform          generic provider traits + Capability — depends on core only, never on model
 tunnel-lattice-backend-tunrs     tun-rs-backed implementation of the platform traits
 tunnel-lattice-backend-linux     native Linux backend (/dev/net/tun + sync rtnetlink) — in development, no public API yet; empty off Linux
-tunnel-lattice-async             futures::Stream adapter over a synchronous PacketIo device
+tunnel-lattice-async             futures::Stream adapters over async or synchronous packet I/O
 tunnel-lattice                   facade: binds platform traits to model types, selects a backend
 ```
 

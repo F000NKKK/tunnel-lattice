@@ -31,6 +31,9 @@ Windows, and macOS with one typed API and one typed `Error`. It does not
 assign IP addresses; use [`net-lattice`](https://crates.io/crates/net-lattice)
 for that once a device exists.
 
+This README describes the current repository checkout. `recv_batch` and
+`recv_batch_async` are unreleased and are not present in version 0.6.
+
 Main surface:
 
 - `Tunnel::connect()` (default `tun-rs` backend) or `Tunnel::new(backend)`

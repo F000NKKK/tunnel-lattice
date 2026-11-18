@@ -22,12 +22,6 @@ available in the environment. Key endpoints:
 - Articles: `POST /api/articles?fields=...` (ADR records), parented under
   the "Architecture Decision Records (ADR Index)" article `TL-A-1`.
 
-This project's `TL` YouTrack project does not exist yet — the user will
-create it later. This file records the intended convention (mirroring
-`net-lattice`'s own `NL` project in the sibling Lattice ecosystem) to follow
-once it does; do not call the YouTrack REST API against `TL` until the user
-confirms the project exists.
-
 ## Issue hierarchy
 
 - `Epic` — one roadmap stage (0.1, 0.2, 0.3, ...).

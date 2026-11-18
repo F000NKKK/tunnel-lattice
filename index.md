@@ -3,7 +3,7 @@
 Cross-platform Rust library for TUN/TAP tunnel interfaces, designed to
 compose with the rest of the Lattice networking stack.
 
-`0.5.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
+`0.6.0` is published (see `SUPPORT.md`). `ARCHITECTURE.md`/`ARCHITECTURE.ru.md`
 describe the current crate design, but nothing in the workspace is
 API-frozen — do not assume any stability guarantee from this file.
 
@@ -16,6 +16,7 @@ tunnel-lattice/
 │   ├── tunnel-lattice-model/          DeviceKind/DeviceConfig/Device — no OS dependency
 │   ├── tunnel-lattice-platform/       generic provider traits + Capability
 │   ├── tunnel-lattice-backend-tunrs/  tun-rs-backed implementation
+│   ├── tunnel-lattice-backend-linux/  native Linux backend, internal and in development
 │   ├── tunnel-lattice-async/          futures::Stream adapter over PacketIo
 │   └── tunnel-lattice/                facade
 ├── bench/forwarder/            Standalone unpublished workspace: iperf3 forwarder
@@ -51,7 +52,7 @@ sdk-lattice      Application-facing SDK composing the crates above
 
 ## Current release and roadmap
 
-Published stage baseline: `tunnel-lattice 0.5.0` (see `SECURITY.md`'s
+Published stage baseline: `tunnel-lattice 0.6.0` (see `SECURITY.md`'s
 supported-version table). Read the current workspace version from
 `crates/tunnel-lattice/Cargo.toml`; do not duplicate a patch version here.
 Roadmap/version tracking lives in the YouTrack project `TL`
@@ -111,14 +112,13 @@ Roadmap/version tracking lives in the YouTrack project `TL`
   every OS, name and Wintun adoption semantics); device and iperf3
   forwarder benchmarks vs raw `tun-rs` (`bench/forwarder`); tun-rs-style
   READMEs (EN/RU). Epic `TL-7`.
-- **0.6 (planned):** batched I/O and GSO/GRO offload (`TL-38`).
-- **Unscheduled:** a hand-written per-OS TUN/TAP backend (`tunnel-lattice-
-  backend-linux`/`-windows`/`-darwin`, mirroring `net-lattice`'s split) to
-  eventually let `tun-rs` be dropped, per the original design goal recorded
-  in `ARCHITECTURE.md`, "Backend replacement plan." Deliberately not before
-  0.1's Cargo-feature-based backend selection has actually had a second
-  backend implemented against it — until then this stays a stated intent,
-  not a scheduled Sprint.
+- **0.6 (done, released):** batched send and Linux TUN GSO/GRO offload;
+  see the 0.6 entry in `CHANGELOG.md` for the released contract.
+- **0.7 (in development):** batched receive and a native Linux backend
+  (`TL-87`). The current checkout implements batch receive and the native
+  backend's internal synchronous core; the latter has no public API or
+  facade selection, async I/O, or segmentation offload yet. Consult
+  `CHANGELOG.md`'s Unreleased section and YouTrack for current slices.
 - **1.0 (unscheduled):** compatibility audit and API freeze, mirroring
   `net-lattice`'s 0.21 stage (`Error`/enum `#[non_exhaustive]` review, full
   rustdoc coverage, a "Frozen 1.0 Public API Surface" inventory). Not

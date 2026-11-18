@@ -29,6 +29,10 @@ The cross-platform TUN/TAP backend of
 2.8.11). It implements `tunnel-lattice-platform`'s provider traits and turns
 every `tun-rs`/OS error into a typed `tunnel_lattice_core::Error`.
 
+This README describes the current repository checkout. The `recv_batch`
+implementation and shared backend support modules are unreleased; they
+are not part of the published 0.6 version.
+
 > Not used directly: the
 > [`tunnel-lattice`](https://crates.io/crates/tunnel-lattice) facade selects
 > this backend by default through its `tun-rs` feature. Depend on it
