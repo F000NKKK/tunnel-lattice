@@ -69,9 +69,7 @@ contracts; it never inspects or changes the host system.
 
 ### The `backend` Feature (for Backend Authors)
 
-This feature is unreleased. The dependency example below describes the
-workspace manifest version in this checkout, not the published 0.6 crate;
-use the repository checkout until a release includes the feature.
+This feature is available starting with version 0.7.
 
 The non-default `backend` Cargo feature adds `tunnel_lattice_model::backend`,
 a support API for crates that implement Tunnel Lattice backends. It is not
@@ -91,7 +89,7 @@ shares, with no I/O and no `unsafe`:
 
 ```toml
 [dependencies]
-tunnel-lattice-model = { version = "0.6", features = ["backend"] }
+tunnel-lattice-model = { version = "0.7", features = ["backend"] }
 ```
 
 ### Out of Scope
@@ -106,9 +104,9 @@ tunnel-lattice-model = { version = "0.6", features = ["backend"] }
 
 ```toml
 [dependencies]
-tunnel-lattice-model = "0.6"
+tunnel-lattice-model = "0.7"
 # For `tunnel_lattice_core::Error`, used in the example below
-tunnel-lattice-core = "0.6"
+tunnel-lattice-core = "0.7"
 ```
 
 ## 🎓 Quick Start

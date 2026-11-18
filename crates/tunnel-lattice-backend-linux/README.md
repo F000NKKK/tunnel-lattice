@@ -91,8 +91,8 @@ cross-platform workspace can depend on it unconditionally.
 
 ## 📦 Availability
 
-This crate is in development in the repository and exports no public API.
-Its manifest version does not imply that a usable release is available.
+Version 0.1.0 is an initial development release and exports no public API.
+Use the `tun-rs`-backed facade for a usable device API.
 
 There are no Cargo features yet. On Linux it depends on `libc` and the
 `netlink-packet-route`/`netlink-packet-core`/`netlink-sys` crates with

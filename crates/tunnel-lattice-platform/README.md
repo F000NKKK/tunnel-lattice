@@ -22,11 +22,8 @@ domain model and its platform backends: generic provider traits and the
 runtime `Capability` flags. It depends only on `tunnel-lattice-core`, never
 on `tunnel-lattice-model`.
 
-This README describes the current repository checkout. The `recv_batch`
-trait methods and the `backend` and `offload` support features are unreleased
-and are not present in version 0.6. The feature dependency examples below
-refer to the workspace manifest version; use the repository checkout until
-a release includes them.
+The `recv_batch` trait methods and `backend` and `offload` support features
+are available starting with version 0.7.
 
 ### 🎯 Why This Crate Exists
 
@@ -97,10 +94,10 @@ public API. The workspace
 
 ```toml
 [dependencies]
-tunnel-lattice-platform = "0.6"
+tunnel-lattice-platform = "0.7"
 
 # With the native async packet I/O trait
-tunnel-lattice-platform = { version = "0.6", features = ["async"] }
+tunnel-lattice-platform = { version = "0.7", features = ["async"] }
 ```
 
 ### The `backend` Feature (for Backend Authors)
@@ -130,7 +127,7 @@ packet-path rules every backend shares, as safe Rust with no I/O, no
 
 ```toml
 [dependencies]
-tunnel-lattice-platform = { version = "0.6", features = ["backend"] }
+tunnel-lattice-platform = { version = "0.7", features = ["backend"] }
 ```
 
 The non-default `offload` feature (it implies `backend`) adds
@@ -146,7 +143,7 @@ keeps its own `unsafe` calls. Same support-API status as `backend`.
 
 ```toml
 [dependencies]
-tunnel-lattice-platform = { version = "0.6", features = ["offload"] }
+tunnel-lattice-platform = { version = "0.7", features = ["offload"] }
 ```
 
 ## 📐 Backend Contract
