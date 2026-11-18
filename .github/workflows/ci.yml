@@ -44,8 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.100
+        uses: dtolnay/rust-toolchain@1.100
         with:
           components: rustfmt, clippy
 

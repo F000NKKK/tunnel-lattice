@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the minimum supported Rust version to 1.100 for the workspace and
+  forwarder benchmark.
+
 ### Added
 
 - **Batch receive API: `recv_batch`.** `PacketIo::recv_batch(bufs, lens)`
