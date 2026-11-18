@@ -31,5 +31,5 @@ tunnel-lattice-platform = { workspace = true, features = ["backend"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.189"
 netlink-packet-core = { version = "0.9.0", default-features = false }
-netlink-packet-route = { version = "0.33.0", default-features = false }
+netlink-packet-route = { version = "0.34.0", default-features = false }
 netlink-sys = { version = "0.9.0", default-features = false }
