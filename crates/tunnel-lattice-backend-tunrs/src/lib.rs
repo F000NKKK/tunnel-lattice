@@ -540,7 +540,7 @@ impl DeviceProvider for TunRsBackend {
             #[cfg(all(test, target_os = "windows"))]
             if config.kind == DeviceKind::Tap
                 && config.name.is_some()
-                && err.kind() == io::ErrorKind::NotFound
+                && err.kind() == std::io::ErrorKind::NotFound
             {
                 eprintln!(
                     "named TAP build failed: kind={:?}, raw_os_error={:?}, error={err:?}",
