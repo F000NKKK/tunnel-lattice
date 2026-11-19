@@ -352,6 +352,13 @@ jobs:
         timeout-minutes: 10
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-linux --lib -- --ignored --test-threads=1 --nocapture
 
+      # The experimental Darwin backend uses a native utun control socket.
+      # Exercise its private lifecycle and snapshot tests once on macOS.
+      - name: Native Darwin backend real-device tests
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' && matrix.features.name == 'default' }}
+        timeout-minutes: 5
+        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-darwin --lib -- --ignored --test-threads=1 --nocapture
+
       # Every Linux TUN/TAP device the privileged tests create goes away
       # when its last handle drops (at the latest when the test process
       # exits), except the ones the persistence tests make persistent on

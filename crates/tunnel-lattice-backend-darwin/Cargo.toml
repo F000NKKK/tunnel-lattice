@@ -1,0 +1,17 @@
+[package]
+name = "tunnel-lattice-backend-darwin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experimental native macOS tunnel backend, under development"
+publish = false
+
+[dependencies]
+tunnel-lattice-core = { workspace = true }
+tunnel-lattice-model = { workspace = true, features = ["backend"] }
+tunnel-lattice-platform = { workspace = true, features = ["backend"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
