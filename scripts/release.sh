@@ -334,6 +334,12 @@ resolve_order() {
 
     for toml in "$WS"/crates/*/Cargo.toml; do
         local name
+        # Experimental workspace crates may explicitly forbid publication.
+        # Keep them out of the release graph rather than attempting to upload
+        # them as part of --publish-all.
+        if awk '/^\[/{in_package = ($0 == "[package]"); next} in_package && $0 ~ /^publish[[:space:]]*=[[:space:]]*false([[:space:]]*#.*)?[[:space:]]*$/ {found=1} END {exit !found}' "$toml"; then
+            continue
+        fi
         name="$(grep -m1 '^name *= *"' "$toml" | sed 's/.*"\([^"]*\)".*/\1/')"
         [[ -n "$name" ]] || continue
         names+=("$name")
