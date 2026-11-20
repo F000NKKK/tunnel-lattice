@@ -32,8 +32,17 @@ use tunnel_lattice_core::{Error, Result};
 use crate::errno::{self, Class, Op};
 use crate::tun::last_errno;
 
-/// Receives one packet into `buf`; see the module docs.
-pub(crate) fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize> {
+/// Result of trying one nonblocking packet operation without waiting.
+/// `WouldBlock` lets synchronous and future reactor-backed paths choose
+/// their own readiness mechanism while sharing exactly the same error map.
+pub(crate) enum Attempt {
+    Ready(Result<usize>),
+    WouldBlock,
+}
+
+/// Attempts to receive a packet without waiting. Interrupted syscalls are
+/// retried; no packet is retained across a readiness wait.
+pub(crate) fn try_recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Attempt {
     let mut sentinel = [0u8; 1];
     loop {
         let read = {
@@ -41,15 +50,41 @@ pub(crate) fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize> {
             readv(fd, &mut iov)
         };
         let code = match read {
-            Ok(len) if len > buf.len() => return Err(Error::BufferTooSmall),
-            Ok(len) => return Ok(len),
+            Ok(len) if len > buf.len() => return Attempt::Ready(Err(Error::BufferTooSmall)),
+            Ok(len) => return Attempt::Ready(Ok(len)),
             Err(code) => code,
         };
         match errno::classify(code, Op::Recv) {
             Class::Retry => {}
-            Class::WouldBlock => wait(fd, libc::POLLIN)?,
-            Class::Fail(error) => return Err(error),
-            _ => return Err(errno::platform(code)),
+            Class::WouldBlock => return Attempt::WouldBlock,
+            Class::Fail(error) => return Attempt::Ready(Err(error)),
+            _ => return Attempt::Ready(Err(errno::platform(code))),
+        }
+    }
+}
+
+/// Attempts to send one packet without waiting.
+pub(crate) fn try_send(fd: BorrowedFd<'_>, buf: &[u8]) -> Attempt {
+    loop {
+        let code = match write(fd, buf) {
+            Ok(len) => return Attempt::Ready(Ok(len)),
+            Err(code) => code,
+        };
+        match errno::classify(code, Op::Send) {
+            Class::Retry => {}
+            Class::WouldBlock => return Attempt::WouldBlock,
+            Class::Fail(error) => return Attempt::Ready(Err(error)),
+            _ => return Attempt::Ready(Err(errno::platform(code))),
+        }
+    }
+}
+
+/// Receives one packet into `buf`; see the module docs.
+pub(crate) fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize> {
+    loop {
+        match try_recv(fd, buf) {
+            Attempt::Ready(result) => return result,
+            Attempt::WouldBlock => wait(fd, libc::POLLIN)?,
         }
     }
 }
@@ -57,15 +92,9 @@ pub(crate) fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize> {
 /// Sends one packet from `buf`; see the module docs.
 pub(crate) fn send(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize> {
     loop {
-        let code = match write(fd, buf) {
-            Ok(len) => return Ok(len),
-            Err(code) => code,
-        };
-        match errno::classify(code, Op::Send) {
-            Class::Retry => {}
-            Class::WouldBlock => wait(fd, libc::POLLOUT)?,
-            Class::Fail(error) => return Err(error),
-            _ => return Err(errno::platform(code)),
+        match try_send(fd, buf) {
+            Attempt::Ready(result) => return result,
+            Attempt::WouldBlock => wait(fd, libc::POLLOUT)?,
         }
     }
 }
@@ -137,6 +166,80 @@ mod tests {
         device.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         (device, peer)
+    }
+
+    #[test]
+    fn nonblocking_attempts_report_readiness_and_consume_one_packet() {
+        let (device, peer) = pair();
+        let mut buf = [0u8; 2];
+        assert!(matches!(
+            try_recv(device.as_fd(), &mut buf),
+            Attempt::WouldBlock
+        ));
+        peer.send(b"long").unwrap();
+        peer.send(b"ok").unwrap();
+        assert!(matches!(
+            try_recv(device.as_fd(), &mut buf),
+            Attempt::Ready(Err(Error::BufferTooSmall))
+        ));
+        assert!(matches!(
+            try_recv(device.as_fd(), &mut buf),
+            Attempt::Ready(Ok(2))
+        ));
+        assert_eq!(&buf, b"ok");
+        assert!(matches!(
+            try_send(device.as_fd(), b"hi"),
+            Attempt::Ready(Ok(2))
+        ));
+        assert_eq!(peer.recv(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"hi");
+    }
+
+    #[test]
+    fn nonblocking_send_reports_a_full_queue_and_recovers_after_drain() {
+        let (device, peer) = pair();
+        let packet = [0x5a; 512];
+        let mut filled = false;
+        for _ in 0..10_000 {
+            match try_send(device.as_fd(), &packet) {
+                Attempt::Ready(Ok(n)) => assert_eq!(n, packet.len()),
+                Attempt::WouldBlock => {
+                    filled = true;
+                    break;
+                }
+                Attempt::Ready(Err(error)) => panic!("unexpected send failure: {error:?}"),
+            }
+        }
+        assert!(filled, "datagram queue did not fill");
+
+        let mut buf = [0; 512];
+        loop {
+            match peer.recv(&mut buf) {
+                Ok(n) => assert_eq!(n, packet.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("unexpected receive failure: {error}"),
+            }
+        }
+        assert!(matches!(
+            try_send(device.as_fd(), &packet),
+            Attempt::Ready(Ok(512))
+        ));
+        assert_eq!(peer.recv(&mut buf).unwrap(), packet.len());
+        assert_eq!(buf, packet);
+    }
+
+    #[test]
+    fn nonblocking_attempts_preserve_native_errors() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut buf = [0; 4];
+        assert!(matches!(
+            try_recv(writer.as_fd(), &mut buf),
+            Attempt::Ready(Err(Error::Platform(PlatformErrorCode::Linux(libc::EBADF))))
+        ));
+        assert!(matches!(
+            try_send(reader.as_fd(), b"x"),
+            Attempt::Ready(Err(Error::Platform(PlatformErrorCode::Linux(libc::EBADF))))
+        ));
     }
 
     #[test]
