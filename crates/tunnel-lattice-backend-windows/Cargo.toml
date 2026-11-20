@@ -1,0 +1,12 @@
+[package]
+name = "tunnel-lattice-backend-windows"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experimental native Windows tunnel backend, under development"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8.9"
