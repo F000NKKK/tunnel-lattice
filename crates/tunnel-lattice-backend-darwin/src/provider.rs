@@ -1,21 +1,21 @@
 //! Private, incomplete TUN-only provider boundary.
 //!
-//! Mutation is intentionally not implemented. The native observation path
-//! must be validated on macOS before the backend is exposed.
+//! Native observation and mutation must be validated on macOS before the
+//! backend is exposed.
 
 use std::io;
 
 use crate::utun_frame::BufferTooSmall;
 use tunnel_lattice_core::{Error, PlatformErrorCode, Result};
 use tunnel_lattice_model::{
-    DeviceConfig, DeviceKind,
-    backend::{HostOs, precheck_open},
+    DeviceConfig, DeviceConfigPatch, DeviceId, DeviceKind,
+    backend::{ApplySteps, ApplyTarget, HostOs, apply_patch, precheck_open},
 };
 use tunnel_lattice_platform::backend::errno::darwin::ENXIO;
 
 #[cfg(target_os = "macos")]
 use tunnel_lattice_platform::{
-    Capability, CapabilityProvider, DeviceObserver, DeviceProvider, PacketIo,
+    Capability, CapabilityProvider, DeviceMutator, DeviceObserver, DeviceProvider, PacketIo,
 };
 
 #[cfg(target_os = "macos")]
@@ -99,6 +99,19 @@ fn snapshot_by_name(
     ))
 }
 
+/// Share exactly the model's precondition and compensation contract.
+fn apply_tun(steps: &mut impl ApplySteps, id: DeviceId, patch: &DeviceConfigPatch) -> Result<()> {
+    apply_patch(
+        steps,
+        ApplyTarget {
+            id,
+            kind: DeviceKind::Tun,
+            mac_mutation: false,
+        },
+        patch,
+    )
+}
+
 #[cfg(target_os = "macos")]
 struct DarwinBackend;
 
@@ -106,6 +119,7 @@ struct DarwinBackend;
 struct DarwinDevice {
     utun: Utun,
     id: tunnel_lattice_model::DeviceId,
+    control: std::sync::Mutex<()>,
 }
 
 #[cfg(target_os = "macos")]
@@ -121,6 +135,7 @@ impl DeviceProvider for DarwinBackend {
         Ok(DarwinDevice {
             utun,
             id: tunnel_lattice_model::DeviceId::new(u64::from(index)),
+            control: std::sync::Mutex::new(()),
         })
     }
 }
@@ -128,14 +143,14 @@ impl DeviceProvider for DarwinBackend {
 #[cfg(target_os = "macos")]
 impl CapabilityProvider for DarwinBackend {
     fn capabilities(&self) -> Capability {
-        Capability::empty()
+        Capability::DEVICE_MUTATION
     }
 }
 
 #[cfg(target_os = "macos")]
 impl CapabilityProvider for DarwinDevice {
     fn capabilities(&self) -> Capability {
-        Capability::empty()
+        Capability::DEVICE_MUTATION
     }
 }
 
@@ -163,14 +178,146 @@ impl DeviceObserver for DarwinDevice {
     }
 
     fn snapshot(&self) -> Result<Self::Device> {
+        let _guard = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = self.utun.name().map_err(snapshot_error)?;
         snapshot_by_name(self.id, name, crate::observe::index, crate::observe::state)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct DarwinSteps<'a>(&'a DarwinDevice);
+
+#[cfg(target_os = "macos")]
+impl DarwinSteps<'_> {
+    /// Check identity immediately before a name-based operation. Darwin's
+    /// ioctl API cannot make this check atomic with mutation.
+    fn name(&self) -> Result<String> {
+        let name = self.0.utun.name().map_err(snapshot_error)?;
+        let index = crate::observe::index(&name).map_err(snapshot_error)?;
+        if u64::from(index) != self.0.id.value() {
+            return Err(Error::NotFound);
+        }
+        Ok(name)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ApplySteps for DarwinSteps<'_> {
+    fn mtu(&mut self) -> Result<u16> {
+        let name = self.name()?;
+        let (mtu, _) = crate::observe::state(&name).map_err(snapshot_error)?;
+        u16::try_from(mtu).map_err(|_| Error::InvalidState)
+    }
+
+    fn set_mtu(&mut self, mtu: u16) -> Result<()> {
+        let name = self.name()?;
+        crate::observe::set_mtu(&name, mtu).map_err(snapshot_error)
+    }
+
+    fn mac(&mut self) -> Result<tunnel_lattice_model::MacAddress> {
+        Err(Error::Unsupported)
+    }
+
+    fn set_mac(&mut self, _mac: tunnel_lattice_model::MacAddress) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    fn set_up(&mut self, up: bool) -> Result<()> {
+        let name = self.name()?;
+        crate::observe::set_up(&name, up).map_err(snapshot_error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl DeviceMutator for DarwinDevice {
+    type DeviceConfigPatch = DeviceConfigPatch;
+
+    fn apply(&self, patch: Self::DeviceConfigPatch) -> Result<()> {
+        let _guard = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        apply_tun(&mut DarwinSteps(self), self.id, &patch)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeSteps {
+        calls: Vec<String>,
+        fail_up: bool,
+    }
+
+    impl ApplySteps for FakeSteps {
+        fn mtu(&mut self) -> Result<u16> {
+            self.calls.push("read_mtu".into());
+            Ok(1500)
+        }
+        fn set_mtu(&mut self, mtu: u16) -> Result<()> {
+            self.calls.push(format!("mtu={mtu}"));
+            Ok(())
+        }
+        fn mac(&mut self) -> Result<tunnel_lattice_model::MacAddress> {
+            panic!("TUN must not read MAC")
+        }
+        fn set_mac(&mut self, _: tunnel_lattice_model::MacAddress) -> Result<()> {
+            panic!("TUN must not write MAC")
+        }
+        fn set_up(&mut self, up: bool) -> Result<()> {
+            self.calls.push(format!("up={up}"));
+            if self.fail_up {
+                Err(Error::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_rejects_invalid_patches_before_any_native_step() {
+        use tunnel_lattice_model::{DesiredAdminState, MacAddress};
+        let id = DeviceId::new(7);
+        let mut steps = FakeSteps::default();
+        let wrong_id =
+            DeviceConfigPatch::new(DeviceId::new(8), Some(DesiredAdminState::Up), None).unwrap();
+        assert!(matches!(
+            apply_tun(&mut steps, id, &wrong_id),
+            Err(Error::InvalidState)
+        ));
+        let big_mtu = DeviceConfigPatch::new(id, None, Some(65536)).unwrap();
+        assert!(matches!(
+            apply_tun(&mut steps, id, &big_mtu),
+            Err(Error::InvalidState)
+        ));
+        let mac = DeviceConfigPatch::new_mac(id, MacAddress::new([2, 0, 0, 0, 0, 1]));
+        assert!(matches!(
+            apply_tun(&mut steps, id, &mac),
+            Err(Error::InvalidState)
+        ));
+        assert!(steps.calls.is_empty());
+    }
+
+    #[test]
+    fn failed_admin_change_compensates_mtu_and_returns_original_error() {
+        use tunnel_lattice_model::DesiredAdminState;
+        let id = DeviceId::new(7);
+        let mut steps = FakeSteps {
+            fail_up: true,
+            ..Default::default()
+        };
+        let patch = DeviceConfigPatch::new(id, Some(DesiredAdminState::Up), Some(1400)).unwrap();
+        assert!(matches!(
+            apply_tun(&mut steps, id, &patch),
+            Err(Error::PermissionDenied)
+        ));
+        assert_eq!(steps.calls, ["read_mtu", "mtu=1400", "up=true", "mtu=1500"]);
+    }
 
     #[test]
     fn snapshot_enxio_is_not_found_but_open_preserves_platform_error() {
@@ -247,7 +394,30 @@ mod tests {
         assert!(first.name.starts_with("utun"));
         assert!(first.mtu > 0);
         assert!(first.mac.is_none());
-        assert!(!device.capabilities().contains(Capability::DEVICE_MUTATION));
+        assert!(device.capabilities().contains(Capability::DEVICE_MUTATION));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "opens and mutates a real utun interface and requires macOS privileges"]
+    fn real_tun_mtu_and_admin_patches_are_observable() {
+        use tunnel_lattice_model::{AdminState, DesiredAdminState};
+        let device = DarwinBackend
+            .open(DeviceConfig::new(DeviceKind::Tun))
+            .unwrap();
+        let id = device.id();
+        device
+            .apply(DeviceConfigPatch::new(id, None, Some(1300)).unwrap())
+            .unwrap();
+        assert_eq!(device.snapshot().unwrap().mtu, 1300);
+        device
+            .apply(DeviceConfigPatch::new(id, Some(DesiredAdminState::Up), None).unwrap())
+            .unwrap();
+        assert_eq!(device.snapshot().unwrap().admin_state, AdminState::Up);
+        device
+            .apply(DeviceConfigPatch::new(id, Some(DesiredAdminState::Down), None).unwrap())
+            .unwrap();
+        assert_eq!(device.snapshot().unwrap().admin_state, AdminState::Down);
     }
 
     #[test]
