@@ -46,6 +46,14 @@ impl<A: Lifecycle> Session<A> {
     pub(crate) unsafe fn from_handle(adapter: Arc<Adapter<A>>, handle: NonNull<c_void>) -> Self {
         Self { adapter, handle }
     }
+
+    pub(crate) fn api(&self) -> &A {
+        &self.adapter.api
+    }
+
+    pub(crate) fn handle(&self) -> NonNull<c_void> {
+        self.handle
+    }
 }
 
 impl<A: Lifecycle> Drop for Session<A> {
