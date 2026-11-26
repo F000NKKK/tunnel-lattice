@@ -26,6 +26,7 @@ mod errno;
 #[cfg(test)]
 mod golden_tests;
 mod io;
+mod offload;
 #[cfg(feature = "async")]
 mod reactor;
 mod tun;

@@ -9,11 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.0] - 2026-11-18
 
-### Changed
-
-- Raised the minimum supported Rust version to 1.100 for the workspace and
-  forwarder benchmark.
-
 ### Added
 
 - **Batch receive API: `recv_batch`.** `PacketIo::recv_batch(bufs, lens)`
@@ -125,8 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the backend obligation that a future dropped while waiting loses no
   packet, and that a backend which cannot guarantee this on some OS
   documents what a dropped receive may lose there.
-- **MSRV raised from Rust 1.93 to 1.99** (`rust-version` in the workspace
-  and the benchmark crate); the code was swept with the 1.99 `rustfmt` and
+- **MSRV raised from Rust 1.93 to 1.100** (`rust-version` in the workspace
+  and the benchmark crate); the code was swept with the 1.100 `rustfmt` and
   `clippy`. No public API change.
 
 ## [0.6.0]

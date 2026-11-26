@@ -20,7 +20,7 @@ async = ["tunnel-lattice-platform/async"]
 [dependencies]
 tunnel-lattice-core = { workspace = true }
 tunnel-lattice-model = { workspace = true, features = ["backend"] }
-tunnel-lattice-platform = { workspace = true, features = ["backend"] }
+tunnel-lattice-platform = { workspace = true, features = ["backend", "offload"] }
 
 # Everything native is Linux-only: `src/lib.rs` is `#![cfg(target_os =
 # "linux")]`, so on Windows and macOS this crate compiles empty and pulls in
