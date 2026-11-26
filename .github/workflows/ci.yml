@@ -352,6 +352,21 @@ jobs:
         timeout-minutes: 10
         run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-linux --lib -- --ignored --test-threads=1 --nocapture
 
+      # Exercise cancellation and deletion with the runtime-independent
+      # reactor on real TUN devices; Tokio is used by these tests only.
+      - name: Native Linux async real-device tests
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' && matrix.features.name == 'default' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/native-linux-async-tests.log"
+          sudo env "PATH=$PATH" "HOME=$HOME" cargo test -p tunnel-lattice-backend-linux --features async --lib -- --ignored privileged_tests::async_ --test-threads=1 --nocapture 2>&1 | tee "$log"
+          if ! grep -Eq '^test result: ok\. 2 passed;' "$log"; then
+            echo '::error::Expected both native Linux async TUN tests to run and pass'
+            exit 1
+          fi
+
       # The experimental Darwin backend uses a native utun control socket.
       # Exercise its private lifecycle and snapshot tests once on macOS.
       - name: Native Darwin backend real-device tests

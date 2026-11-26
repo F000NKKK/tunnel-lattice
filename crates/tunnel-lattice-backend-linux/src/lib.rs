@@ -26,6 +26,8 @@ mod errno;
 #[cfg(test)]
 mod golden_tests;
 mod io;
+#[cfg(feature = "async")]
+mod reactor;
 mod tun;
 
 use std::ffi::c_int;
@@ -133,6 +135,10 @@ impl LinuxBackend {
 /// queue descriptor and is unaffected by a move.
 #[derive(Debug)]
 struct LinuxDevice {
+    /// Per-queue registration with the process-wide runtime-independent
+    /// readiness driver. Dropped before the original descriptor.
+    #[cfg(feature = "async")]
+    reactor: reactor::Queue,
     /// The queue's `/dev/net/tun` descriptor, `O_NONBLOCK` from creation and
     /// never toggled.
     queue: OwnedFd,
@@ -179,6 +185,8 @@ impl DeviceProvider for LinuxBackend {
         }
 
         Ok(LinuxDevice {
+            #[cfg(feature = "async")]
+            reactor: reactor::Queue::new(),
             queue,
             kind: config.kind,
             index: link.index,
@@ -242,6 +250,17 @@ impl PacketIo for LinuxDevice {
 
     fn send(&self, buf: &[u8]) -> Result<usize> {
         io::send(self.queue.as_fd(), buf)
+    }
+}
+
+#[cfg(feature = "async")]
+impl tunnel_lattice_platform::AsyncPacketIo for LinuxDevice {
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        self.reactor.recv(self.queue.as_fd(), buf).await
+    }
+
+    async fn send(&self, buf: &[u8]) -> Result<usize> {
+        self.reactor.send(self.queue.as_fd(), buf).await
     }
 }
 
@@ -329,6 +348,8 @@ impl MultiQueueProvider for LinuxDevice {
         let flags = read_back.flags();
         tun::check_framing(flags)?;
         Ok(Self {
+            #[cfg(feature = "async")]
+            reactor: reactor::Queue::new(),
             queue,
             kind: self.kind,
             index: self.index,
@@ -344,7 +365,12 @@ impl MultiQueueProvider for LinuxDevice {
 const HOST_CAPABILITIES: Capability = Capability::DEVICE_MUTATION
     .union(Capability::PERSISTENT_DEVICES)
     .union(Capability::TAP_DEVICES)
-    .union(Capability::MULTI_QUEUE);
+    .union(Capability::MULTI_QUEUE)
+    .union(if cfg!(feature = "async") {
+        Capability::NATIVE_ASYNC
+    } else {
+        Capability::empty()
+    });
 
 impl CapabilityProvider for LinuxBackend {
     fn capabilities(&self) -> Capability {
@@ -403,16 +429,21 @@ mod tests {
                 | Capability::PERSISTENT_DEVICES
                 | Capability::TAP_DEVICES
                 | Capability::MULTI_QUEUE
+                | if cfg!(feature = "async") {
+                    Capability::NATIVE_ASYNC
+                } else {
+                    Capability::empty()
+                }
         );
-        assert!(!host.intersects(
-            Capability::MAC_MUTATION | Capability::SEGMENTATION_OFFLOAD | Capability::NATIVE_ASYNC
-        ));
+        assert!(!host.intersects(Capability::MAC_MUTATION | Capability::SEGMENTATION_OFFLOAD));
     }
 
     /// A device over `/dev/null`, for checks that make no native call on
     /// the queue.
     fn fake_device(kind: DeviceKind, flags: c_int) -> LinuxDevice {
         LinuxDevice {
+            #[cfg(feature = "async")]
+            reactor: reactor::Queue::new(),
             queue: std::fs::File::open("/dev/null").unwrap().into(),
             kind,
             index: 7,
@@ -728,6 +759,62 @@ mod privileged_tests {
         ip(&["link", "set", name, "up"]);
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(10, octet, 0, 1), 0)).unwrap();
         (socket, SocketAddrV4::new(Ipv4Addr::new(10, octet, 0, 2), 9))
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN and the ip tool"]
+    async fn async_cancelled_receive_leaves_next_tun_packet_available() {
+        let name = unique_name("ac");
+        let _cleanup = Cleanup(name.clone());
+        let device = open(DeviceConfig::new(DeviceKind::Tun).with_name(&name));
+        let mut buf = [0u8; 1500];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                tunnel_lattice_platform::AsyncPacketIo::recv(&device, &mut buf)
+            )
+            .await
+            .is_err()
+        );
+        let octet = 200 + u8::try_from(std::process::id() % 50).unwrap();
+        let (socket, peer) = route_into(&name, octet);
+        socket.send_to(&[0xAB; 100], peer).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let len = tunnel_lattice_platform::AsyncPacketIo::recv(&device, &mut buf)
+                    .await
+                    .unwrap();
+                if len == 128 && buf[0] >> 4 == 4 {
+                    break len;
+                }
+            }
+        })
+        .await
+        .expect("packet not received after cancellation");
+        assert_eq!(received, 128);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN and the ip tool"]
+    async fn async_pending_receive_wakes_when_tun_is_deleted() {
+        let name = unique_name("ad");
+        let _cleanup = Cleanup(name.clone());
+        let device = open(DeviceConfig::new(DeviceKind::Tun).with_name(&name));
+        let mut buf = [0u8; 1500];
+        let receive = tunnel_lattice_platform::AsyncPacketIo::recv(&device, &mut buf);
+        tokio::pin!(receive);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut receive)
+                .await
+                .is_err()
+        );
+        ip(&["link", "delete", &name]);
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut receive)
+            .await
+            .expect("receive did not wake after device deletion");
+        assert!(result.is_err_and(|error| error.is_disconnected()));
     }
 
     #[test]

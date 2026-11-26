@@ -13,6 +13,10 @@ keywords = ["linux", "tun", "tap", "netlink", "tunnel"]
 description = "Native Linux TUN/TAP backend for Tunnel Lattice, built directly on /dev/net/tun and a synchronous rtnetlink socket. Compiles to an empty crate on other targets."
 readme = "README.md"
 
+[features]
+# Runtime-independent native async packet I/O. Tokio below is test-only.
+async = ["tunnel-lattice-platform/async"]
+
 [dependencies]
 tunnel-lattice-core = { workspace = true }
 tunnel-lattice-model = { workspace = true, features = ["backend"] }
@@ -33,3 +37,8 @@ libc = "0.2.189"
 netlink-packet-core = { version = "0.9.0", default-features = false }
 netlink-packet-route = { version = "0.34.0", default-features = false }
 netlink-sys = { version = "0.9.0", default-features = false }
+
+[dev-dependencies]
+async-io = "2.6"
+futures-lite = "2.6"
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
