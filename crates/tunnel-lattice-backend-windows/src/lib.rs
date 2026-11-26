@@ -10,6 +10,10 @@ mod contract;
 #[allow(dead_code)] // Internal code is not exposed before backend integration.
 mod lifecycle;
 
+#[cfg(any(windows, test))]
+#[allow(dead_code)] // Internal code is not exposed before backend integration.
+mod packet;
+
 #[cfg(windows)]
 #[allow(dead_code)] // Internal code is not exposed before backend integration.
 mod wintun;

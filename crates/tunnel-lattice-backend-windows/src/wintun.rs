@@ -10,6 +10,7 @@ use libloading::Library;
 
 use crate::contract::{valid_ring_capacity, wide_name};
 use crate::lifecycle::{Adapter, Lifecycle, Session};
+use crate::packet::PacketApi;
 
 type CreateAdapter =
     unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> *mut c_void;
@@ -17,6 +18,10 @@ type OpenAdapter = unsafe extern "system" fn(*const u16) -> *mut c_void;
 type CloseAdapter = unsafe extern "system" fn(*mut c_void);
 type StartSession = unsafe extern "system" fn(*mut c_void, u32) -> *mut c_void;
 type EndSession = unsafe extern "system" fn(*mut c_void);
+type ReceivePacket = unsafe extern "system" fn(*mut c_void, *mut u32) -> *mut u8;
+type ReleaseReceivePacket = unsafe extern "system" fn(*mut c_void, *const u8);
+type AllocateSendPacket = unsafe extern "system" fn(*mut c_void, u32) -> *mut u8;
+type SendPacket = unsafe extern "system" fn(*mut c_void, *const u8);
 
 /// Keeps the DLL loaded while any adapter or session may call its functions.
 struct Api {
@@ -25,6 +30,10 @@ struct Api {
     close_adapter: CloseAdapter,
     start_session: StartSession,
     end_session: EndSession,
+    receive_packet: ReceivePacket,
+    release_receive_packet: ReleaseReceivePacket,
+    allocate_send_packet: AllocateSendPacket,
+    send_packet: SendPacket,
     _library: Library,
 }
 
@@ -66,9 +75,49 @@ impl Api {
                 end_session: *library
                     .get(b"WintunEndSession\0")
                     .map_err(io::Error::other)?,
+                receive_packet: *library
+                    .get(b"WintunReceivePacket\0")
+                    .map_err(io::Error::other)?,
+                release_receive_packet: *library
+                    .get(b"WintunReleaseReceivePacket\0")
+                    .map_err(io::Error::other)?,
+                allocate_send_packet: *library
+                    .get(b"WintunAllocateSendPacket\0")
+                    .map_err(io::Error::other)?,
+                send_packet: *library
+                    .get(b"WintunSendPacket\0")
+                    .map_err(io::Error::other)?,
                 _library: library,
             }))
         }
+    }
+}
+
+// SAFETY: a caller of Api::load guarantees that the DLL implements Wintun
+// 0.14.1, including buffer lifetime and send/receive ownership semantics.
+unsafe impl PacketApi for Api {
+    unsafe fn receive(&self, session: NonNull<c_void>) -> io::Result<(NonNull<u8>, usize)> {
+        let mut size = 0u32;
+        // SAFETY: caller provides a live session and size is writable.
+        let packet = unsafe { (self.receive_packet)(session.as_ptr(), &mut size) };
+        let packet = NonNull::new(packet).ok_or_else(io::Error::last_os_error)?;
+        Ok((packet, size as usize))
+    }
+
+    unsafe fn release(&self, session: NonNull<c_void>, packet: NonNull<u8>) {
+        // SAFETY: caller owns this received packet for this live session.
+        unsafe { (self.release_receive_packet)(session.as_ptr(), packet.as_ptr()) };
+    }
+
+    unsafe fn allocate(&self, session: NonNull<c_void>, len: u32) -> io::Result<NonNull<u8>> {
+        // SAFETY: caller provides a live session and a validated length.
+        let packet = unsafe { (self.allocate_send_packet)(session.as_ptr(), len) };
+        NonNull::new(packet).ok_or_else(io::Error::last_os_error)
+    }
+
+    unsafe fn commit(&self, session: NonNull<c_void>, packet: NonNull<u8>) {
+        // SAFETY: caller owns this allocated send packet for this session.
+        unsafe { (self.send_packet)(session.as_ptr(), packet.as_ptr()) };
     }
 }
 
